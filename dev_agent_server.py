@@ -457,16 +457,35 @@ def _dispatch_tool(app_dir, target_app, name, args):
 
 
 def _run_coding_loop(target_app, work_item_description, agent_config):
-    """The agent's own bounded tool-calling loop. Returns (final_text,
-    iterations_used, hit_limit). Every decision here is the model's — this
-    function only wires its tool calls to the filesystem and feeds results
-    back, exactly as a human would relay a tool's output."""
+    """The agent's own bounded tool-calling loop. Returns a dict: final_text,
+    iterations_used, hit_limit, usage (accumulated token counts across every
+    turn — Processa has no other way to see what this loop actually cost,
+    since it runs entirely outside Frappe), tool_calls (names, in call
+    order), started_at/ended_at (unix seconds). Every decision here is the
+    model's — this function only wires its tool calls to the filesystem and
+    feeds results back, exactly as a human would relay a tool's output."""
     app_dir = f"{BENCH_DIR}/apps/{target_app}"
     client = anthropic.Anthropic(api_key=agent_config["api_key"])
     model = agent_config["model"]
     system_prompt = agent_config["system_prompt"]
 
     messages = [{"role": "user", "content": work_item_description}]
+
+    usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+    tool_calls = []
+    started_at = time.time()
+
+    def _accumulate(u):
+        # Every turn bills separately — a 30-iteration loop is 30 separate
+        # API calls, not one, so this has to sum across all of them rather
+        # than take the last response's usage as the total.
+        for field in usage:
+            usage[field] += getattr(u, field, 0) or 0
 
     for iteration in range(1, MAX_AGENT_ITERATIONS + 1):
         response = client.messages.create(
@@ -476,16 +495,26 @@ def _run_coding_loop(target_app, work_item_description, agent_config):
             tools=_TOOL_SCHEMAS,
             max_tokens=AGENT_MAX_TOKENS,
         )
+        _accumulate(response.usage)
 
         if response.stop_reason != "tool_use":
             final_text = "".join(block.text for block in response.content if block.type == "text")
-            return final_text, iteration, False
+            return {
+                "final_text": final_text,
+                "iterations": iteration,
+                "hit_limit": False,
+                "usage": usage,
+                "tool_calls": tool_calls,
+                "started_at": started_at,
+                "ended_at": time.time(),
+            }
 
         messages.append({"role": "assistant", "content": response.content})
         tool_results = []
         for block in response.content:
             if block.type != "tool_use":
                 continue
+            tool_calls.append(block.name)
             result = _dispatch_tool(app_dir, target_app, block.name, block.input or {})
             tool_results.append(
                 {
@@ -496,12 +525,18 @@ def _run_coding_loop(target_app, work_item_description, agent_config):
             )
         messages.append({"role": "user", "content": tool_results})
 
-    return (
-        f"Stopped after {MAX_AGENT_ITERATIONS} tool-calling turns without finishing — "
-        "reporting whatever state the working tree is currently in.",
-        MAX_AGENT_ITERATIONS,
-        True,
-    )
+    return {
+        "final_text": (
+            f"Stopped after {MAX_AGENT_ITERATIONS} tool-calling turns without finishing — "
+            "reporting whatever state the working tree is currently in."
+        ),
+        "iterations": MAX_AGENT_ITERATIONS,
+        "hit_limit": True,
+        "usage": usage,
+        "tool_calls": tool_calls,
+        "started_at": started_at,
+        "ended_at": time.time(),
+    }
 
 
 def _sign(body_bytes):
@@ -566,7 +601,10 @@ def run_job(payload):
 
     _set_status(correlation_id, state="coding")
     try:
-        agent_report, iterations, hit_limit = _run_coding_loop(target_app, work_item_description, agent_config)
+        loop_result = _run_coding_loop(target_app, work_item_description, agent_config)
+        agent_report = loop_result["final_text"]
+        iterations = loop_result["iterations"]
+        hit_limit = loop_result["hit_limit"]
     except Exception as exc:  # noqa: BLE001 — reported to the caller, not raised here
         err = f"coding loop failed: {exc}"
         _set_status(correlation_id, state="failed", error=err)
@@ -585,6 +623,11 @@ def run_job(payload):
         "agent_report": agent_report,
         "agent_iterations": iterations,
         "agent_hit_iteration_limit": hit_limit,
+        "agent_model": agent_config["model"],
+        "agent_usage": loop_result["usage"],
+        "agent_tool_calls": loop_result["tool_calls"],
+        "agent_started_at": loop_result["started_at"],
+        "agent_ended_at": loop_result["ended_at"],
     }
     if passed:
         # Only ever open a PR on a genuine pass — a failing change must
