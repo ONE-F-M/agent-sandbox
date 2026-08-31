@@ -1,17 +1,66 @@
-# dev-agent-sandbox
+# agent-sandbox
 
-A disposable, config-free Cloud Run sandbox for the "AI Dev Agent" feature in
-`one_bpmn`. It carries no agent identity of its own — every piece of behavior
-(system prompt, tools, skills) is resolved by Processa's `dev_agent_sandbox_ops`
-connector at dispatch time and handed over as a request payload. This
-document is the full runbook: GitHub PAT → local bake → Cloud Run deploy →
-IAM wiring → Processa Settings, in the order you actually run them.
+A disposable Cloud Run sandbox for the "Dev Agent" feature in `one_bpmn`
+(Processa). It **is** the coding agent: given a work order, a model, a live
+API key, and a GitHub token — all supplied fresh in the request that
+dispatches it — it checks out the target app's branch, runs its own bounded
+read/write/test tool-calling loop against that model, and, on a passing
+test run, opens the pull request itself, directly against GitHub. It carries
+no system prompt, model choice, or credential of its own; everything arrives
+per-dispatch from Processa's `dev_agent_sandbox_ops` connector.
+
+This document is the full runbook: GitHub PAT → local bake → Cloud Run
+deploy → IAM wiring → Processa Settings, in the order you actually run them.
 
 Forked from `~/Desktop/onefm-ai-agent`'s infrastructure pattern (same
 single-container bench-in-a-box mechanism, same build/deploy scripting
 style) — but a completely separate project: separate service, separate
 Artifact Registry repo, separate secrets, separate GCP service account.
 Nothing here reads or writes anything belonging to `onefm-ai-agent`.
+
+## How a dispatch actually works
+
+1. Processa's `dispatch_to_sandbox` connector resolves `agent_config`
+   (`system_prompt`, `model`, a live `api_key` — from the "Dev Agent" AI
+   Agent Configuration and its linked AI Provider) and `github_token` (from
+   Processa Settings), and POSTs all of it, plus `target_app` / `git_branch`
+   / `work_item_description`, to `/run`.
+2. `/run` validates the payload, returns `202` immediately, and does the
+   actual work in a background thread:
+   - `git fetch` + checkout the target branch, `bench migrate`.
+   - Run the coding loop (`_run_coding_loop` in `dev_agent_server.py`): a
+     bounded (30-turn) tool-calling loop against the given model, with four
+     tools scoped to the checked-out working tree — `read_file`,
+     `write_file`, `list_files`, `run_tests`. The model decides what to
+     read, what to change, and when to test; nothing here plans on its
+     behalf.
+   - A final, mandatory `bench run-tests` pass — independent of whatever the
+     loop did internally — is what actually decides pass/fail.
+   - On a pass with real changes, `_open_pr` commits every changed file via
+     GitHub's Contents API and opens a PR directly (see "Two GitHub tokens"
+     below) — no push credentials or local git state needed for this part.
+3. The sandbox POSTs an HMAC-signed callback back to Processa with the
+   outcome (`tests_passed` / `tests_failed` / `tests_passed_no_changes`),
+   the agent's own final report, and `pr_url` on success.
+
+The sandbox never plans a change in advance and never sees the "shape" of a
+work order beyond its own text — every decision (what to read, what to
+write, when it's done) is the model's, made live, inside the loop.
+
+## Two GitHub tokens — don't confuse them
+
+- **`dev-agent-github-token`** (Secret Manager, wired at deploy time,
+  injected as `GITHUB_TOKEN`) — used to clone the private `ONE-F-M` repos
+  when the image is baked, and by the running container's own `git fetch`
+  against those same repos on each dispatch. Needs **read-only** access.
+- **`github_token`** (sent fresh in every dispatch payload, from `Processa
+  Settings.github_token`) — used only by `_open_pr` to commit files and open
+  a pull request via the GitHub REST API. Needs **read + write** (`repo`
+  scope, or fine-grained Contents + Pull requests).
+
+These are deliberately separate credentials with separate scopes — the
+build/runtime clone identity should never be able to open a PR, and vice
+versa.
 
 ## 0. Prerequisites
 
@@ -29,7 +78,7 @@ Nothing here reads or writes anything belonging to `onefm-ai-agent`.
 - Docker installed and running locally (used for the bake — never for the actual deploy target, which is Cloud Run).
 - A GCP project already hosting `onefm-agent`/`onefm-agent-v2` (or any project) — same project is fine, since every resource below uses names that never collide with those services.
 
-## 1. Create a dedicated GitHub PAT
+## 1. Create a dedicated GitHub PAT (clone token)
 
 Don't reuse `onefm-ai-agent`'s token or any personal PAT used elsewhere — a
 compromised sandbox should only ever expose what it strictly needs.
@@ -39,21 +88,21 @@ compromised sandbox should only ever expose what it strictly needs.
 3. **Repository access**: select only the repos `02_clone_apps.sh` actually clones:
    `one_fm`, `onefm_sso`, `one_fm_password_management` (repo name `password_management`),
    `one_bpmn`, `onefm_mcp`, `frappe_agile`.
-4. **Permissions → Repository permissions → Contents: Read-only.** Nothing else. The
-   sandbox only clones; it never pushes (PRs are opened by Processa's
-   `dev_agent_callback.py` via `open_customization_pr()`, using a *different*,
-   already-existing GitHub token from `Processa Settings.github_token` — not
-   this one).
+4. **Permissions → Repository permissions → Contents: Read-only.** Nothing else. This
+   token only ever clones/fetches — it is never the one used to open a PR (see
+   "Two GitHub tokens" above; that's a separate credential, configured in
+   Processa Settings, not here).
 5. Copy the token now — GitHub won't show it again. Don't paste it into any chat or commit it anywhere.
 
 ## 2. Local `.env` for the bake
 
 ```bash
-cd ~/Desktop/dev-agent-sandbox && cp .env.example .env
+cd ~/Desktop/agent-sandbox && cp .env.example .env
 ```
 Open `.env` and set `GITHUB_TOKEN=` to the PAT from step 1. This copy is only
 ever used locally to clone the private repos during the bake — it's separate
-from the copy that ends up in Secret Manager in step 3.
+from the copy that ends up in Secret Manager in step 3. **Never commit this
+file** — it's already in `.gitignore`.
 
 ## 3. Create the two Secret Manager secrets
 
@@ -71,6 +120,13 @@ If either command says the secret already exists (e.g. from a prior attempt), us
 gcloud secrets versions add dev-agent-github-token --data-file=- --project=<PROJECT_ID>
 ```
 
+**Note on `openssl rand -hex 32`:** it prints a trailing newline, which gets
+stored as part of the secret's bytes if you pipe it straight in. Both sides
+of the HMAC check (`dev_agent_server.py` and `dev_agent_callback.py` in
+Processa) `.strip()` defensively, so this is no longer a live footgun — but
+if you ever need to update the value from a shell one-liner, strip it
+yourself to be safe: `printf '%s' "$SECRET" | gcloud secrets versions add ...`.
+
 ## 4. Grant the Cloud Run runtime identity access to both secrets
 
 ```bash
@@ -87,15 +143,18 @@ gcloud secrets add-iam-policy-binding dev-agent-callback-secret --member="servic
 ## 5. Bake the image
 
 ```bash
-cd ~/Desktop/dev-agent-sandbox && ENV=production ./bake_image.sh
+cd ~/Desktop/agent-sandbox && ENV=production ./bake_image.sh
 ```
 
-Expect ~40 minutes on a clean run — this clones and pins all 15 apps, installs
-dependencies, and boots a throwaway site to prove the whole thing works before
-committing the image. The build is split into three separate Docker layers
-(`01_init_bench.sh` → `02_clone_apps.sh` → `03_install_requirements.sh`)
-specifically so a failure late in the process doesn't force re-cloning
-everything on retry — only the layer that actually changed re-runs.
+Expect 40–75 minutes on a clean run (Docker layer caching makes every rebake
+after the first noticeably faster, as long as only late layers like
+`dev_agent_server.py`/`entrypoint.sh` changed) — this clones and pins all 15
+apps, installs dependencies, and boots a throwaway site to prove the whole
+thing works before committing the image. The build is split into three
+separate Docker layers (`01_init_bench.sh` → `02_clone_apps.sh` →
+`03_install_requirements.sh`) specifically so a failure late in the process
+doesn't force re-cloning everything on retry — only the layer that actually
+changed re-runs.
 
 Use `ENV=beta` instead everywhere in this doc for a beta deploy — see
 "Beta vs. production" below.
@@ -109,7 +168,7 @@ Deploy with: python3 deploy.py --env production --use-baked
 ## 6. Deploy to Cloud Run
 
 ```bash
-cd ~/Desktop/dev-agent-sandbox && python3 deploy.py --env production --project <PROJECT_ID> --use-baked
+cd ~/Desktop/agent-sandbox && python3 deploy.py --env production --project <PROJECT_ID> --use-baked
 ```
 
 This pushes the baked image to Artifact Registry and runs `gcloud run deploy
@@ -122,16 +181,17 @@ gates every call — nothing reaches `/run` without a valid identity token.
 It also deploys with `--min-instances=1` — one instance is kept warm at all
 times (a small standing cost), rather than scaling to zero. This is required,
 not optional: `/run` returns `202` immediately and keeps doing the actual
-work (checkout/migrate/run-tests, often 10+ minutes) in a background thread
-Cloud Run can't see. With `min-instances=0` the autoscaler reclaims the
-"idle" instance mid-job — this is exactly what killed run `DAS-91629` on
-2026-08-25 (dispatched 15:24:35Z, instance torn down 15:39:42Z, every later
-`/status` check 404'd against a fresh cold instance with no memory of the
-job). See the comment above `CLOUD_RUN_MIN_INST` in `deploy.py` for the full
-trace. If you ever redeploy an older revision or hand-edit the Cloud Run
-service outside this script, make sure min-instances stays at 1.
+work (checkout/migrate/coding-loop/run-tests, often 10+ minutes) in a
+background thread Cloud Run can't see. With `min-instances=0` the autoscaler
+reclaims the "idle" instance mid-job — this is exactly what killed an early
+real run (dispatched, then the instance was torn down ~15 minutes later,
+every subsequent `/status` check 404'ing against a fresh cold instance with
+no memory of the job). See the comment above `CLOUD_RUN_MIN_INST` in
+`deploy.py` for the full trace. If you ever redeploy an older revision or
+hand-edit the Cloud Run service outside this script, make sure
+min-instances stays at 1.
 
-Note the printed **Service URL** — you'll need it in step 9.
+Note the printed **Service URL** — you'll need it in step 10.
 
 ## 7. Create the service account the connector authenticates as
 
@@ -168,14 +228,27 @@ gcloud iam service-accounts keys create ~/dev-agent-caller-key.json --iam-accoun
 bench --site <your-site> set-config dev_agent_gcp_service_account_key_path ~/dev-agent-caller-key.json
 ```
 
-Then, in the desk UI, open **Processa Settings** → **Dev Agent Sandbox** section:
+Then, in the desk UI, open **Processa Settings**:
 
-- **Sandbox URL**: the Service URL printed in step 6 (e.g. `https://dev-agent-sandbox-<hash>.<region>.run.app`)
-- **Callback Secret**: run this and paste the output:
+- **Dev Agent Sandbox → Sandbox URL**: the Service URL printed in step 6 (e.g. `https://dev-agent-sandbox-<hash>.<region>.run.app`)
+- **Dev Agent Sandbox → Callback Secret**: run this and paste the output:
   ```bash
   gcloud secrets versions access latest --secret=dev-agent-callback-secret --project=<PROJECT_ID>
   ```
   Must be the *exact* value from Secret Manager — the sandbox signs callbacks with this same secret, and a mismatch means every callback gets silently rejected.
+- **GitHub Integration → GitHub Access Token**: a *separate* PAT with `repo`
+  (read + write) scope — this is the one `_open_pr` uses to actually commit
+  files and open the PR. Sent fresh with every dispatch; the sandbox never
+  stores it. This field is hidden by default behind the **Connect to
+  Production** checkbox on Processa Settings — check that first if you don't
+  see the GitHub Integration section (note: that checkbox also gates whether
+  process-map changes require an Active Production Process Implementation —
+  know what else you're turning on before you flip it).
+- The "Dev Agent" **AI Agent Configuration**'s `ai_model` field decides which
+  model the coding loop runs — the credential for it is resolved
+  automatically from that model's linked **AI Provider**, the same
+  credential store every other in-Processa agent already uses. Nothing
+  sandbox-specific to configure here beyond picking the right model.
 
 ## 11. Verify
 
@@ -201,7 +274,9 @@ bench --site <your-site> set-config host_name https://<your-ngrok-subdomain>.ngr
 
 `host_name` is what `frappe.utils.get_url()` resolves against outside of a
 live web request (i.e. from a background job) — without it, the callback URL
-the connector builds won't point anywhere reachable.
+the connector builds won't point anywhere reachable. Note ngrok's free tier
+issues a new random subdomain every time it restarts — update `host_name`
+again whenever that happens, or the callback will silently fail to reach you.
 
 ## Beta vs. production
 
@@ -215,22 +290,34 @@ production or vice versa. `deploy.py` and `bake_image.sh` both default to
 production always has to be requested explicitly with `--env production` /
 `ENV=production`.
 
-## What this doesn't do yet
+## Rebaking after a code change
 
-- **The coding-agent loop itself** — `dev_agent_server.py`'s `run_job()` still
-  runs the target app's *existing* test suite unmodified; the actual
-  code-writing logic is stubbed.
-- **The "Dev Agent" BPMN diagram** — has to be authored by hand in `/spiff`;
-  it's not something a patch can seed (same convention the Connector Agent's
-  own map follows).
-- **Reviewer feedback loop** — a PR comment currently reaches nobody. See
-  "Phase 3" in the project plan for the sketched design (a GitHub webhook
-  re-dispatching to the same branch, not a new PR).
-- **`min-instances=1` is a cost/simplicity trade-off, not the only fix** for
-  the background-thread-survives-the-response problem above. The more robust
-  alternative — moving `dispatch()`'s outbound call off the live web request
-  via `frappe.enqueue` on the `bpmn_ai_agent` queue, and making `/run` block
-  until the job finishes instead of firing an async callback — would remove
-  the standing cost and the callback/HMAC-signing mechanism entirely, but is
-  a materially bigger change to already-tested code. Worth revisiting if the
-  standing cost becomes a concern.
+`entrypoint.sh`, `dev_agent_server.py`, and the Dockerfile are all baked into
+the image at build time — a change to any of them needs a fresh
+`./bake_image.sh` + `deploy.py --use-baked` cycle before it takes effect.
+Nothing about the running container watches these files for changes.
+
+## Known gaps
+
+- **Tests need `allow_tests` on the sandboxed site.** Without it, `bench
+  run-tests` prints "Testing is disabled for the site!" and exits `0`
+  without running anything — every dispatch would silently report
+  `tests_passed` regardless of what changed. This is set during site
+  creation in `entrypoint.sh`'s `create_and_install_site()` — confirm it's
+  still there if you ever touch that function.
+- **`erpnext`'s global `before_tests` hook** creates a default Company (and,
+  via ERPNext core, default Warehouses) the first time any test suite runs
+  on a fresh site — for *any* target app, not just the one being tested.
+  If any installed app's own Warehouse customization depends on a field
+  that isn't packaged as a fixture, this crashes before a single real test
+  runs. Confirmed live via a missing `one_fm` custom field; fix belongs in
+  that app's own repo (export the field as a fixture), not here.
+- **No coverage/lint step.** The coding loop's only signal is
+  pass/fail from the target app's existing test suite — it doesn't run a
+  linter or report coverage.
+- **Retry-on-failure is available but unproven end-to-end.** The coding
+  loop's tools let the model call `run_tests`, see a failure, revise a
+  file, and retry — all within one dispatch — but every real failure seen
+  in testing so far has been a pre-existing, unrelated environment issue
+  the model correctly declined to "fix." The fail → revise → pass cycle is
+  architecturally sound but hasn't been observed completing for real yet.
