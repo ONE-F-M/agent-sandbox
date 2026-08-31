@@ -139,16 +139,41 @@ def _run(cmd, **kwargs):
 
 
 def _checkout_target_branch(target_app, git_branch):
+    # 02_clone_apps.sh strips every private repo's remote URL back to a
+    # credential-free https://github.com/... form right after the bake-time
+    # clone (see its own header for why: a token embedded in the URL would
+    # otherwise sit in plaintext in a committed image layer forever). That
+    # means this runtime fetch has nothing to authenticate with unless it
+    # re-embeds a credential itself — mirror the bake-time pattern: embed
+    # GITHUB_TOKEN in the URL only for the fetch, then always restore the
+    # clean URL afterward, whether the fetch/checkout succeeded or not.
     app_dir = f"{BENCH_DIR}/apps/{target_app}"
-    fetch = _run(f"cd {app_dir} && git fetch origin {git_branch}")
-    if fetch.returncode != 0:
-        return False, f"git fetch failed: {fetch.stderr}"
-    checkout = _run(
-        f"cd {app_dir} && git checkout {git_branch} || git checkout -b {git_branch} origin/{git_branch}"
-    )
-    if checkout.returncode != 0:
-        return False, f"git checkout failed: {checkout.stderr}"
-    return True, None
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+
+    def _scrub(text):
+        # git prints the remote URL (credential embedded) in its own stderr
+        # on an auth failure — this text flows into the callback body and
+        # gets stored on the AI Agent Run, so the token must never reach it.
+        return text.replace(github_token, "***") if github_token else text
+
+    clean_url = _run(f"cd {app_dir} && git remote get-url origin").stdout.strip()
+    authed = bool(github_token) and clean_url.startswith("https://github.com/")
+    if authed:
+        authed_url = clean_url.replace("https://github.com/", f"https://{github_token}@github.com/", 1)
+        _run(f"cd {app_dir} && git remote set-url origin {authed_url}")
+    try:
+        fetch = _run(f"cd {app_dir} && git fetch origin {git_branch}")
+        if fetch.returncode != 0:
+            return False, f"git fetch failed: {_scrub(fetch.stderr)}"
+        checkout = _run(
+            f"cd {app_dir} && git checkout {git_branch} || git checkout -b {git_branch} origin/{git_branch}"
+        )
+        if checkout.returncode != 0:
+            return False, f"git checkout failed: {_scrub(checkout.stderr)}"
+        return True, None
+    finally:
+        if authed:
+            _run(f"cd {app_dir} && git remote set-url origin {clean_url}")
 
 
 def _migrate_site():
@@ -160,8 +185,18 @@ def _migrate_site():
 
 
 def _run_tests(target_app):
+    # --skip-before-tests: erpnext's before_tests hook creates a default
+    # Company on any fresh site, which cascades into Warehouse creation and
+    # a genuine, pre-existing one_fm bug (before_insert_warehouse assumes a
+    # Custom Field — one_fm_project — that only exists as live, un-exported
+    # data, not a fixture) — crashing every test run on a fresh site
+    # regardless of what the actual change touches. Confirmed live: a real
+    # dispatch whose only change was adding a docstring to one_bpmn/utils.py
+    # still failed here. This is a workaround for that unrelated fixture
+    # gap, not a fix for it — one_fm's own bug is untouched and would still
+    # break a real Company/Warehouse creation anywhere else it happens.
     result = _run(
-        f"cd {BENCH_DIR} && bench --site {SITE_NAME} run-tests --app {target_app}",
+        f"cd {BENCH_DIR} && bench --site {SITE_NAME} run-tests --app {target_app} --skip-before-tests",
         timeout=1800,
     )
     return result.returncode == 0, result.stdout[-4000:], result.stderr[-4000:]
@@ -228,7 +263,7 @@ def _repo_for_local_clone(target_app):
     return match.group(1) if match else None
 
 
-def _open_pr(target_app, git_branch, work_item_description, files, github_token, correlation_id):
+def _open_pr(target_app, git_branch, work_item_description, files, github_token, correlation_id, agent_report):
     """Create a branch off git_branch, commit every changed file via the
     Contents API, and open a PR. Returns (pr_url, None) on success or
     (None, error_message) on failure — never raises, so a PR-delivery
@@ -239,9 +274,13 @@ def _open_pr(target_app, git_branch, work_item_description, files, github_token,
 
     head_branch = f"dev-agent/{correlation_id.lower()}"
     title = f"Dev Agent: {work_item_description[:72]}"
+    file_list = "\n".join(f"- `{path}`" for path in sorted(files))
     body = (
         f"Opened automatically by the Dev Agent sandbox ({correlation_id}).\n\n"
-        f"Work order:\n\n{work_item_description}\n\n"
+        f"## Work order\n\n{work_item_description}\n\n"
+        f"## What changed\n\n{agent_report.strip() or '(the agent finished without a summary)'}\n\n"
+        f"## Files changed\n\n{file_list}\n\n"
+        "## Testing\n\n"
         "The target app's real test suite passed in an isolated, disposable "
         "sandbox before this PR was opened. Review as you would any other PR."
     )
@@ -556,7 +595,9 @@ def run_job(payload):
         else:
             body["files"] = files
             _set_status(correlation_id, state="opening_pr")
-            pr_url, pr_error = _open_pr(target_app, git_branch, work_item_description, files, github_token, correlation_id)
+            pr_url, pr_error = _open_pr(
+                target_app, git_branch, work_item_description, files, github_token, correlation_id, agent_report
+            )
             if pr_url:
                 body["pr_url"] = pr_url
             else:
