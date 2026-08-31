@@ -1,0 +1,85 @@
+# Start from Ubuntu 22.04
+FROM ubuntu:22.04
+
+# NOTE: GITHUB_TOKEN is passed via BuildKit --secret at build time.
+# It is available to RUN commands via --mount=type=secret,id=github_token
+# and is NEVER baked into image layers.
+
+# Accept organization name (default: ONE-F-M)
+ARG HUB_ORG=ONE-F-M
+ENV HUB_ORG=${HUB_ORG}
+
+# Install all dependencies and clear apt/pip cache
+RUN rm -rf /var/lib/apt/lists/* && apt-get clean && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing \
+    python3.11 python3.11-venv python3.11-dev python3-pip \
+    mariadb-server \
+    redis-server \
+    curl gnupg2 \
+    sudo git && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python3 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    pip cache purge || true
+
+# Install Node.js 20 (LTS) and npm — 18 is NOT enough: helpdesk's frontend
+# needs >=20.19.0, and apps/one_bpmn's own CLAUDE.md states 20.x as its
+# stack requirement. onefm-ai-agent's Dockerfile uses 18 safely only because
+# it never installs either of those two apps.
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    npm install -g yarn
+
+# Install wkhtmltopdf and tree utility
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y xfonts-base xfonts-75dpi tree wkhtmltopdf && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install bench CLI globally (not with --user) and verify install
+RUN python3.11 -m pip install --no-cache-dir frappe-bench && ls -l /usr/local/bin/bench
+
+# dev_agent_server.py's own coding loop calls the Anthropic API directly —
+# it runs via system python3 (see entrypoint.sh), not the bench's own venv,
+# so this must be installed here, not via any app's requirements.txt.
+RUN python3.11 -m pip install --no-cache-dir anthropic
+
+# Copy the three build stages + their shared pinning library separately, and
+# fix Windows line endings on each (CRLF -> LF). Kept as distinct COPY/RUN
+# pairs deliberately: Docker's cache is per-layer, so a change to a later
+# stage's script never invalidates an earlier stage's already-cached layer —
+# see each script's own header for why that matters (a single-script version
+# of this cost two full ~45-minute re-clones to recover from a late failure).
+COPY lib_pin_apps.sh 01_init_bench.sh 02_clone_apps.sh 03_install_requirements.sh /
+RUN sed -i 's/\r$//' /lib_pin_apps.sh /01_init_bench.sh /02_clone_apps.sh /03_install_requirements.sh && \
+    chmod +x /01_init_bench.sh /02_clone_apps.sh /03_install_requirements.sh
+
+# Create frappe user and bench directory
+RUN useradd -ms /bin/bash frappe && mkdir -p /home/frappe/frappe-bench && chown -R frappe:frappe /home/frappe
+
+USER frappe
+WORKDIR /home/frappe
+
+# Only set up bench and clone app code, not DB-dependent steps (site creation
+# happens per run, at container start — see entrypoint.sh). Each stage that
+# needs to clone the private ONE-F-M repos gets its own --secret mount.
+RUN --mount=type=secret,id=github_token,mode=0444 \
+    GITHUB_TOKEN=$(cat /run/secrets/github_token) \
+    /01_init_bench.sh /home/frappe/frappe-bench version-15 version-15
+
+RUN --mount=type=secret,id=github_token,mode=0444 \
+    GITHUB_TOKEN=$(cat /run/secrets/github_token) \
+    /02_clone_apps.sh /home/frappe/frappe-bench
+
+RUN /03_install_requirements.sh /home/frappe/frappe-bench
+
+WORKDIR /home/frappe/frappe-bench
+
+USER root
+COPY entrypoint.sh /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
+
+# Generic driver — copied in, config-free (see dev_agent_server.py).
+COPY dev_agent_server.py /home/frappe/dev_agent_server.py
+RUN chown frappe:frappe /home/frappe/dev_agent_server.py
+
+ENTRYPOINT ["/entrypoint.sh"]
