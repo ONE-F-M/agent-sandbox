@@ -283,7 +283,17 @@ def _open_pr(
     if not repo:
         return None, f"Could not determine the GitHub repository for {target_app!r} from its local clone."
 
-    head_branch = f"dev-agent/{correlation_id.lower()}"
+    # Derived from the work order's own content, not correlation_id — every
+    # dispatch creates a brand-new Agent Sandbox Run with its own unique
+    # correlation_id, so keying the branch to it meant a model that calls
+    # dispatch_to_sandbox more than once for the same brief (confirmed
+    # happening live) left one PR behind per attempt. This converges
+    # retries of the same work order onto the same branch, and the PR
+    # creation below is made idempotent to match.
+    work_hash = hashlib.sha256(
+        f"{target_app}:{git_branch}:{work_item_description}".encode("utf-8")
+    ).hexdigest()[:16]
+    head_branch = f"dev-agent/{work_hash}"
     title_prefix = "" if tests_passed else "⚠️ Tests failed: "
     title = f"{title_prefix}Dev Agent: {work_item_description[:72]}"
     file_list = "\n".join(f"- `{path}`" for path in sorted(files))
@@ -340,9 +350,28 @@ def _open_pr(
             "POST",
             f"{_GITHUB_API}/repos/{repo}/pulls",
             github_token,
+            ok=(200, 201, 422),  # 422: a PR for this branch already exists — a retry, not a failure
             json_body={"title": title, "head": head_branch, "base": git_branch, "body": body},
         )
-        return pr.get("html_url", ""), None
+        pr_url, pr_number = pr.get("html_url", ""), pr.get("number")
+        if not pr_url:
+            # Find the existing one instead of treating this as a failure —
+            # the commit above already updated its files to this attempt's.
+            owner = repo.split("/")[0]
+            existing = _github_request(
+                "GET", f"{_GITHUB_API}/repos/{repo}/pulls?head={owner}:{head_branch}&state=open", github_token,
+            )
+            if existing:
+                pr_url, pr_number = existing[0].get("html_url", ""), existing[0].get("number")
+        if pr_number:
+            # Keep title/body in sync with the latest attempt — e.g. a
+            # retry that now passes must not leave the "Tests failed"
+            # prefix from an earlier attempt sitting on the PR.
+            _github_request(
+                "PATCH", f"{_GITHUB_API}/repos/{repo}/pulls/{pr_number}", github_token,
+                json_body={"title": title, "body": body},
+            )
+        return (pr_url or None), (None if pr_url else "A pull request for this work already existed but its URL could not be resolved.")
     except Exception as exc:  # noqa: BLE001 — reported to the caller, not raised
         return None, str(exc)[:500]
 
