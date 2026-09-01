@@ -263,26 +263,50 @@ def _repo_for_local_clone(target_app):
     return match.group(1) if match else None
 
 
-def _open_pr(target_app, git_branch, work_item_description, files, github_token, correlation_id, agent_report):
+def _open_pr(
+    target_app, git_branch, work_item_description, files, github_token, correlation_id, agent_report,
+    tests_passed=True, stderr_tail="",
+):
     """Create a branch off git_branch, commit every changed file via the
     Contents API, and open a PR. Returns (pr_url, None) on success or
     (None, error_message) on failure — never raises, so a PR-delivery
-    problem is reported back like any other outcome, not a crash."""
+    problem is reported back like any other outcome, not a crash.
+
+    Opens regardless of tests_passed — a failing run's own real test output
+    is repeatedly environment/fixture noise unrelated to the change itself
+    (see the Warehouse fixture history), and discarding a genuinely good
+    change over that cost more than the old all-or-nothing gate protected.
+    The title/body make the outcome impossible to miss instead: a failing
+    PR still reads as failing to whoever reviews it, it just isn't thrown
+    away before a person ever sees it."""
     repo = _repo_for_local_clone(target_app)
     if not repo:
         return None, f"Could not determine the GitHub repository for {target_app!r} from its local clone."
 
     head_branch = f"dev-agent/{correlation_id.lower()}"
-    title = f"Dev Agent: {work_item_description[:72]}"
+    title_prefix = "" if tests_passed else "⚠️ Tests failed: "
+    title = f"{title_prefix}Dev Agent: {work_item_description[:72]}"
     file_list = "\n".join(f"- `{path}`" for path in sorted(files))
+    if tests_passed:
+        testing_section = (
+            "The target app's real test suite passed in an isolated, disposable "
+            "sandbox before this PR was opened. Review as you would any other PR."
+        )
+    else:
+        testing_section = (
+            "**⚠️ The target app's real test suite FAILED in the sandbox "
+            "for this change.** It's opened anyway so the diff isn't lost to a "
+            "failure that may be unrelated to it (a fresh-site fixture gap, for "
+            "example) — but treat this as unverified, not as a normal passing PR. "
+            "Confirm the failure's actual cause before merging.\n\n"
+            f"```\n{(stderr_tail or '(no output captured)')[-3000:]}\n```"
+        )
     body = (
         f"Opened automatically by the Dev Agent sandbox ({correlation_id}).\n\n"
         f"## Work order\n\n{work_item_description}\n\n"
         f"## What changed\n\n{agent_report.strip() or '(the agent finished without a summary)'}\n\n"
         f"## Files changed\n\n{file_list}\n\n"
-        "## Testing\n\n"
-        "The target app's real test suite passed in an isolated, disposable "
-        "sandbox before this PR was opened. Review as you would any other PR."
+        f"## Testing\n\n{testing_section}"
     )
 
     try:
@@ -629,22 +653,26 @@ def run_job(payload):
         "agent_started_at": loop_result["started_at"],
         "agent_ended_at": loop_result["ended_at"],
     }
-    if passed:
-        # Only ever open a PR on a genuine pass — a failing change must
-        # never reach GitHub at all.
-        files = _collect_changed_files(target_app)
-        if not files:
+    files = _collect_changed_files(target_app)
+    if not files:
+        if passed:
             status = body["status"] = "tests_passed_no_changes"
+        # else: status stays "tests_failed" — no files means nothing to
+        # open a PR for regardless of the test outcome.
+    else:
+        # A PR now opens whether or not tests passed — see _open_pr()'s own
+        # docstring for why. It still clearly marks a failure as a failure;
+        # this only changes whether the diff reaches GitHub at all.
+        body["files"] = files
+        _set_status(correlation_id, state="opening_pr")
+        pr_url, pr_error = _open_pr(
+            target_app, git_branch, work_item_description, files, github_token, correlation_id, agent_report,
+            tests_passed=passed, stderr_tail=stderr,
+        )
+        if pr_url:
+            body["pr_url"] = pr_url
         else:
-            body["files"] = files
-            _set_status(correlation_id, state="opening_pr")
-            pr_url, pr_error = _open_pr(
-                target_app, git_branch, work_item_description, files, github_token, correlation_id, agent_report
-            )
-            if pr_url:
-                body["pr_url"] = pr_url
-            else:
-                body["pr_error"] = pr_error
+            body["pr_error"] = pr_error
 
     _set_status(correlation_id, state="done", result=status)
     _post_callback(callback_url, body)
