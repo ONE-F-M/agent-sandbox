@@ -233,5 +233,222 @@ class TestLastOpenPrResult(unittest.TestCase):
         self.assertEqual(srv._last_open_pr_result(trace), {"pr_url": "https://x"})
 
 
+class TestHeadBranchFor(unittest.TestCase):
+    def test_deterministic_across_calls(self):
+        a = srv._head_branch_for("one_bpmn", "staging", "Fix the thing.")
+        b = srv._head_branch_for("one_bpmn", "staging", "Fix the thing.")
+        self.assertEqual(a, b)
+        self.assertTrue(a.startswith("dev-agent/"))
+
+    def test_differs_when_any_input_differs(self):
+        base = srv._head_branch_for("one_bpmn", "staging", "Fix the thing.")
+        self.assertNotEqual(base, srv._head_branch_for("one_fm", "staging", "Fix the thing."))
+        self.assertNotEqual(base, srv._head_branch_for("one_bpmn", "main", "Fix the thing."))
+        self.assertNotEqual(base, srv._head_branch_for("one_bpmn", "staging", "Fix another thing."))
+
+
+class _FakeCompletedProcess:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class TestCheckoutOrCreateHeadBranch(unittest.TestCase):
+    def test_head_branch_already_exists_remotely(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if "git remote get-url origin" in cmd:
+                return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
+            if f"git fetch origin dev-agent/abc" in cmd:
+                return _FakeCompletedProcess(0)
+            if "git checkout dev-agent/abc" in cmd:
+                return _FakeCompletedProcess(0)
+            return _FakeCompletedProcess(0)
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "dev-agent/abc")
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        # Never fell through to creating/pushing a new branch off the base.
+        self.assertFalse(any("git push" in c for c in calls))
+
+    def test_head_branch_missing_creates_and_pushes(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if "git remote get-url origin" in cmd:
+                return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
+            if "git fetch origin dev-agent/abc" in cmd:
+                return _FakeCompletedProcess(1, stderr="couldn't find remote ref")
+            return _FakeCompletedProcess(0)
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "dev-agent/abc")
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        self.assertTrue(any("git checkout -B dev-agent/abc" in c for c in calls))
+        self.assertTrue(any("git push -u origin dev-agent/abc" in c for c in calls))
+
+    def test_base_branch_fetch_failure_is_reported(self):
+        def fake_run(cmd, **kwargs):
+            if "git remote get-url origin" in cmd:
+                return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
+            if "git fetch origin dev-agent/abc" in cmd:
+                return _FakeCompletedProcess(1, stderr="no such ref")
+            if "git fetch origin staging" in cmd:
+                return _FakeCompletedProcess(1, stderr="network error")
+            return _FakeCompletedProcess(0)
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "dev-agent/abc")
+        self.assertFalse(ok)
+        self.assertIn("network error", err)
+
+    def test_github_token_never_appears_in_a_reported_error(self):
+        # Both fetches fail (a total auth failure, not just "branch doesn't
+        # exist yet") so the function actually returns an error to check —
+        # a fetch_head failure alone falls through to the base-branch path,
+        # same as a genuine "branch not created yet" case would.
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "super-secret-token"}):
+            def fake_run(cmd, **kwargs):
+                if "git remote get-url origin" in cmd:
+                    return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
+                if "git fetch origin dev-agent/abc" in cmd:
+                    return _FakeCompletedProcess(1, stderr="fatal: could not read from super-secret-token@github.com")
+                if "git fetch origin staging" in cmd:
+                    return _FakeCompletedProcess(1, stderr="fatal: could not read from super-secret-token@github.com")
+                return _FakeCompletedProcess(0)
+
+            with patch.object(srv, "_run", side_effect=fake_run):
+                ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "dev-agent/abc")
+        self.assertFalse(ok)
+        self.assertNotIn("super-secret-token", err)
+        self.assertIn("***", err)
+
+
+class TestValidateToolCallPayload(unittest.TestCase):
+    def _payload(self, **overrides):
+        payload = {
+            "action": "read_file",
+            "target_app": "one_bpmn",
+            "git_branch": "staging",
+            "work_item_description": "Fix the thing.",
+            "github_token": "gh-token",
+            "args": {"path": "a.py"},
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_valid_payload_passes(self):
+        self.assertIsNone(srv._validate_tool_call_payload(self._payload()))
+
+    def test_missing_field_rejected(self):
+        payload = self._payload()
+        del payload["target_app"]
+        self.assertIn("target_app", srv._validate_tool_call_payload(payload))
+
+    def test_slow_action_rejected_here(self):
+        error = srv._validate_tool_call_payload(self._payload(action="run_tests"))
+        self.assertIn("run_tests", error)
+        self.assertIn("not valid for /tool_call", error)
+
+    def test_args_must_be_an_object(self):
+        error = srv._validate_tool_call_payload(self._payload(args="not-a-dict"))
+        self.assertIn("args must be an object", error)
+
+
+class TestValidatePayloadActionBranch(unittest.TestCase):
+    def _action_payload(self, **overrides):
+        payload = {
+            "correlation_id": "corr-1",
+            "action": "run_tests",
+            "target_app": "one_bpmn",
+            "git_branch": "staging",
+            "work_item_description": "Fix the thing.",
+            "github_token": "gh-token",
+            "callback_url": "https://processa.example.com/api/method/one_bpmn.api.agent_callback.report_result",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_valid_action_payload_passes(self):
+        self.assertIsNone(srv._validate_payload(self._action_payload()))
+        self.assertIsNone(srv._validate_payload(self._action_payload(action="open_pull_request")))
+
+    def test_fast_action_rejected_on_run(self):
+        error = srv._validate_payload(self._action_payload(action="read_file"))
+        self.assertIn("not valid for /run", error)
+
+    def test_missing_field_rejected(self):
+        payload = self._action_payload()
+        del payload["github_token"]
+        self.assertIn("github_token", srv._validate_payload(payload))
+
+    def test_does_not_require_agent_config_or_tools(self):
+        payload = self._action_payload()
+        self.assertNotIn("agent_config", payload)
+        self.assertNotIn("tools", payload)
+        self.assertIsNone(srv._validate_payload(payload))
+
+
+class TestHandleToolCall(unittest.TestCase):
+    def setUp(self):
+        # A fresh BENCH_DIR per test (not a shared /tmp root) with a real
+        # apps/one_bpmn directory — no symlink needed, and no risk of one
+        # test's directory colliding with another's.
+        self.bench_dir = os.path.realpath(tempfile.mkdtemp())
+        self.app_dir = os.path.join(self.bench_dir, "apps", "one_bpmn")
+        os.makedirs(self.app_dir)
+        self.bench_dir_patch = patch.object(srv, "BENCH_DIR", self.bench_dir)
+        self.bench_dir_patch.start()
+
+    def tearDown(self):
+        self.bench_dir_patch.stop()
+        shutil.rmtree(self.bench_dir, ignore_errors=True)
+
+    def _payload(self, action, args):
+        return {
+            "action": action, "target_app": "one_bpmn", "git_branch": "staging",
+            "work_item_description": "Fix the thing.", "args": args, "github_token": "gh-token",
+        }
+
+    def test_checkout_failure_short_circuits_before_touching_files(self):
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(False, "branch trouble")):
+            result = srv._handle_tool_call(self._payload("read_file", {"path": "a.py"}))
+        self.assertEqual(result, {"error": "branch trouble"})
+
+    def test_read_file_after_successful_checkout(self):
+        with open(os.path.join(self.app_dir, "a.py"), "w") as fh:
+            fh.write("hello")
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)):
+            result = srv._handle_tool_call(self._payload("read_file", {"path": "a.py"}))
+        self.assertEqual(result, {"found": True, "content": "hello"})
+
+    def test_write_file_commits_and_pushes_on_success(self):
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
+            srv, "_commit_and_push", return_value=(True, None)
+        ) as mock_commit:
+            result = srv._handle_tool_call(self._payload("write_file", {"path": "a.py", "content": "x"}))
+        self.assertEqual(result, {"written": True, "path": "a.py"})
+        mock_commit.assert_called_once()
+
+    def test_write_file_surfaces_a_commit_error_without_failing_the_write(self):
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
+            srv, "_commit_and_push", return_value=(False, "push rejected")
+        ):
+            result = srv._handle_tool_call(self._payload("write_file", {"path": "a.py", "content": "x"}))
+        self.assertTrue(result["written"])
+        self.assertEqual(result["commit_error"], "push rejected")
+
+    def test_unknown_action_is_a_structured_error(self):
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)):
+            result = srv._handle_tool_call(self._payload("delete_everything", {}))
+        self.assertIn("error", result)
+
+
 if __name__ == "__main__":
     unittest.main()

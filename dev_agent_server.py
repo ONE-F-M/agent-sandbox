@@ -37,11 +37,13 @@ this container's own deployment.
 """
 
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
 import os
 import re
+import shlex
 import subprocess
 import threading
 import time
@@ -128,7 +130,48 @@ def _set_status(correlation_id, **fields):
         job["updated_at"] = time.time()
 
 
+_SLOW_ACTIONS = frozenset({"run_tests", "open_pull_request"})
+_FAST_ACTIONS = frozenset({"read_file", "write_file", "edit_file", "list_files"})
+
+REQUIRED_ACTION_FIELDS = (
+    "correlation_id", "action", "target_app", "git_branch", "work_item_description",
+    "github_token", "callback_url",
+)
+
+
+def _validate_callback_url(payload):
+    callback_url = payload["callback_url"]
+    parsed = urllib.parse.urlparse(callback_url)
+    if parsed.scheme != "https":
+        return "callback_url must be https"
+    if ALLOWED_CALLBACK_HOST and parsed.hostname != ALLOWED_CALLBACK_HOST:
+        return f"callback_url host must be {ALLOWED_CALLBACK_HOST}"
+    return None
+
+
 def _validate_payload(payload):
+    """POST /run's payload is one of two shapes now:
+
+    - The original bundled dispatch (agent_config + tools) — dispatch_to_sandbox's
+      own shape, kept working exactly as before while its fate is undecided.
+    - A single slow action (run_tests/open_pull_request), each now its own
+      real, directly-callable BPMN tool that dispatches independently
+      (fast actions — read_file/write_file/edit_file/list_files — go
+      through POST /tool_call instead, synchronously; see
+      _validate_tool_call_payload)."""
+    if "action" in payload:
+        missing = [f for f in REQUIRED_ACTION_FIELDS if f not in payload]
+        if missing:
+            return f"Missing required field(s): {', '.join(missing)}"
+        if payload["action"] not in _SLOW_ACTIONS:
+            return (
+                f"action {payload['action']!r} is not valid for /run. "
+                f"Known slow actions: {', '.join(sorted(_SLOW_ACTIONS))}."
+            )
+        if not (payload.get("github_token") or "").strip():
+            return "github_token must be a non-empty string"
+        return _validate_callback_url(payload)
+
     missing = [f for f in REQUIRED_FIELDS if f not in payload]
     if missing:
         return f"Missing required field(s): {', '.join(missing)}"
@@ -158,13 +201,24 @@ def _validate_payload(payload):
     if not (payload.get("github_token") or "").strip():
         return "github_token must be a non-empty string"
 
-    callback_url = payload["callback_url"]
-    parsed = urllib.parse.urlparse(callback_url)
-    if parsed.scheme != "https":
-        return "callback_url must be https"
-    if ALLOWED_CALLBACK_HOST and parsed.hostname != ALLOWED_CALLBACK_HOST:
-        return f"callback_url host must be {ALLOWED_CALLBACK_HOST}"
+    return _validate_callback_url(payload)
 
+
+def _validate_tool_call_payload(payload):
+    """POST /tool_call's payload — one fast, synchronous action against an
+    already-(or newly-)cloned working tree. No callback_url/correlation_id:
+    this answers inline, there's nothing to park or call back to."""
+    required = ("action", "target_app", "git_branch", "work_item_description", "github_token")
+    missing = [f for f in required if not str(payload.get(f) or "").strip()]
+    if missing:
+        return f"Missing required field(s): {', '.join(missing)}"
+    if payload["action"] not in _FAST_ACTIONS:
+        return (
+            f"action {payload['action']!r} is not valid for /tool_call. "
+            f"Known fast actions: {', '.join(sorted(_FAST_ACTIONS))}."
+        )
+    if not isinstance(payload.get("args") or {}, dict):
+        return "args must be an object"
     return None
 
 
@@ -208,6 +262,101 @@ def _checkout_target_branch(target_app, git_branch):
     finally:
         if authed:
             _run(f"cd {app_dir} && git remote set-url origin {clean_url}")
+
+
+@contextlib.contextmanager
+def _authed_remote(app_dir, github_token):
+    """Temporarily embeds github_token in origin's URL for the duration of
+    the block, then always restores the credential-free URL — mirrors
+    02_clone_apps.sh's own bake-time remote-scrubbing (a token left in
+    .git/config would otherwise persist on disk between calls)."""
+    clean_url = _run(f"cd {app_dir} && git remote get-url origin").stdout.strip()
+    authed = bool(github_token) and clean_url.startswith("https://github.com/")
+    if authed:
+        authed_url = clean_url.replace("https://github.com/", f"https://{github_token}@github.com/", 1)
+        _run(f"cd {app_dir} && git remote set-url origin {authed_url}")
+    try:
+        yield
+    finally:
+        if authed:
+            _run(f"cd {app_dir} && git remote set-url origin {clean_url}")
+
+
+def _head_branch_for(target_app, git_branch, work_item_description):
+    """Deterministic per-work-order branch name — same formula _open_pr has
+    always used, so retries of the same work order (same three inputs)
+    always converge on the same branch, whether they land on this container
+    instance or a fresh one."""
+    work_hash = hashlib.sha256(
+        f"{target_app}:{git_branch}:{work_item_description}".encode("utf-8")
+    ).hexdigest()[:16]
+    return f"dev-agent/{work_hash}"
+
+
+def _checkout_or_create_head_branch(target_app, git_branch, head_branch):
+    """Like _checkout_target_branch, but for a branch that may not exist
+    remotely yet: every one of the 6 sandbox tools is now its own,
+    independently-dispatched call (no shared session), so the FIRST call
+    for a work order has to create the working branch, and every call after
+    it just needs to find it already there. Pushing it immediately (not
+    just committing locally) is what makes that durable across calls that
+    might land on a different container instance — the git branch itself
+    is the shared state between calls, not this instance's local disk."""
+    app_dir = f"{BENCH_DIR}/apps/{target_app}"
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+
+    def _scrub(text):
+        return text.replace(github_token, "***") if github_token else text
+
+    with _authed_remote(app_dir, github_token):
+        fetch_head = _run(f"cd {app_dir} && git fetch origin {head_branch}")
+        if fetch_head.returncode == 0:
+            checkout = _run(
+                f"cd {app_dir} && git checkout {head_branch} || git checkout -b {head_branch} origin/{head_branch}"
+            )
+            if checkout.returncode != 0:
+                return False, f"git checkout of {head_branch} failed: {_scrub(checkout.stderr)}"
+            return True, None
+
+        fetch_base = _run(f"cd {app_dir} && git fetch origin {git_branch}")
+        if fetch_base.returncode != 0:
+            return False, f"git fetch of base branch {git_branch} failed: {_scrub(fetch_base.stderr)}"
+        checkout_base = _run(
+            f"cd {app_dir} && git checkout {git_branch} || git checkout -b {git_branch} origin/{git_branch}"
+        )
+        if checkout_base.returncode != 0:
+            return False, f"git checkout of base branch {git_branch} failed: {_scrub(checkout_base.stderr)}"
+        new_branch = _run(f"cd {app_dir} && git checkout -B {head_branch}")
+        if new_branch.returncode != 0:
+            return False, f"git checkout -B {head_branch} failed: {_scrub(new_branch.stderr)}"
+        push = _run(f"cd {app_dir} && git push -u origin {head_branch}")
+        if push.returncode != 0:
+            return False, f"git push of {head_branch} failed: {_scrub(push.stderr)}"
+        return True, None
+
+
+def _commit_and_push(target_app, head_branch, path, message):
+    """Durably records a write_file/edit_file change on the head branch
+    immediately — not left as a local, uncommitted change — so the NEXT
+    tool call for this work order (run_tests, open_pull_request, or even
+    another write_file) sees it regardless of which container instance
+    serves that call."""
+    app_dir = f"{BENCH_DIR}/apps/{target_app}"
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    with _authed_remote(app_dir, github_token):
+        _run(f"cd {app_dir} && git add -- {shlex.quote(path)}")
+        commit = _run(
+            f"cd {app_dir} && git -c user.email=dev-agent@sandbox -c user.name='Dev Agent' "
+            f"commit -q -m {shlex.quote(message)}"
+        )
+        if commit.returncode != 0:
+            # Nothing to commit (e.g. a write_file that produced identical
+            # content) isn't a failure worth surfacing to the model.
+            return True, None
+        push = _run(f"cd {app_dir} && git push origin {head_branch}")
+        if push.returncode != 0:
+            return False, push.stderr[-1000:]
+        return True, None
 
 
 def _migrate_site():
@@ -575,6 +724,115 @@ def _dispatch_tool(app_dir, target_app, name, args, run_ctx):
     return {"error": f"unknown tool {name!r} — the sandbox has no implementation for it"}
 
 
+def _handle_tool_call(payload):
+    """POST /tool_call's synchronous handler — one fast action
+    (read_file/write_file/edit_file/list_files) against the work order's
+    own deterministic head branch, answered inline. Each call independently
+    ensures the branch exists (creating it off git_branch on the very first
+    call for a work order) since there's no shared session between calls —
+    the git branch itself is what carries state from one call to the next,
+    not this container instance's local disk."""
+    action = payload["action"]
+    target_app = payload["target_app"]
+    git_branch = payload["git_branch"]
+    work_item_description = payload["work_item_description"]
+    args = payload.get("args") or {}
+
+    head_branch = _head_branch_for(target_app, git_branch, work_item_description)
+    ok, err = _checkout_or_create_head_branch(target_app, git_branch, head_branch)
+    if not ok:
+        return {"error": err}
+
+    app_dir = f"{BENCH_DIR}/apps/{target_app}"
+    if action == "read_file":
+        return _tool_read_file(app_dir, args)
+    if action == "list_files":
+        return _tool_list_files(app_dir, args)
+    if action == "write_file":
+        result = _tool_write_file(app_dir, args)
+        if result.get("written"):
+            ok, err = _commit_and_push(target_app, head_branch, args.get("path") or "", "write_file via Dev Agent")
+            if not ok:
+                result["commit_error"] = err
+        return result
+    if action == "edit_file":
+        result = _tool_edit_file(app_dir, args)
+        if result.get("edited"):
+            ok, err = _commit_and_push(target_app, head_branch, args.get("path") or "", "edit_file via Dev Agent")
+            if not ok:
+                result["commit_error"] = err
+        return result
+    # _validate_tool_call_payload already restricts action to _FAST_ACTIONS —
+    # reaching this means that set and this dispatcher drifted apart.
+    return {"error": f"unknown fast tool action {action!r}"}
+
+
+def run_single_action_job(payload):
+    """Background job for POST /run's action-based shape (run_tests /
+    open_pull_request) — the two sandbox tools slow enough to need the same
+    accept-then-callback shape run_job already uses, just for one action
+    instead of a whole bundled coding session."""
+    correlation_id = payload["correlation_id"]
+    action = payload["action"]
+    target_app = payload["target_app"]
+    git_branch = payload["git_branch"]
+    work_item_description = payload["work_item_description"]
+    github_token = payload["github_token"]
+    args = payload.get("args") or {}
+    callback_url = payload["callback_url"]
+
+    head_branch = _head_branch_for(target_app, git_branch, work_item_description)
+
+    _set_status(correlation_id, state="checking_out_branch")
+    ok, err = _checkout_or_create_head_branch(target_app, git_branch, head_branch)
+    if not ok:
+        _set_status(correlation_id, state="failed", error=err)
+        _post_callback(callback_url, {"correlation_id": correlation_id, "status": "failed", "error": err})
+        return
+
+    _set_status(correlation_id, state="migrating")
+    ok, mig_out, mig_err = _migrate_site()
+    if not ok:
+        _set_status(correlation_id, state="failed", error=mig_err)
+        _post_callback(
+            callback_url,
+            {"correlation_id": correlation_id, "status": "failed", "error": mig_err, "stdout_tail": mig_out},
+        )
+        return
+
+    if action == "run_tests":
+        _set_status(correlation_id, state="running_tests")
+        passed, stdout, stderr = _run_tests(target_app)
+        body = {
+            "correlation_id": correlation_id,
+            "status": "tests_passed" if passed else "tests_failed",
+            "stdout_tail": stdout,
+            "stderr_tail": stderr,
+        }
+    elif action == "open_pull_request":
+        run_ctx = {
+            "git_branch": git_branch,
+            "work_item_description": work_item_description,
+            "github_token": github_token,
+            "correlation_id": correlation_id,
+        }
+        _set_status(correlation_id, state="opening_pr")
+        result = _tool_open_pull_request(target_app, args, run_ctx)
+        status = "tests_passed" if result.get("pr_url") else "tests_failed"
+        body = {"correlation_id": correlation_id, "status": status}
+        if result.get("pr_url"):
+            body["pr_url"] = result["pr_url"]
+        if result.get("error"):
+            body["pr_error"] = result["error"]
+    else:
+        # _validate_payload already restricts action to _SLOW_ACTIONS for
+        # /run — reaching this means that set and this branch drifted apart.
+        body = {"correlation_id": correlation_id, "status": "failed", "error": f"unknown action {action!r}"}
+
+    _set_status(correlation_id, state="done", result=body.get("status"))
+    _post_callback(callback_url, body)
+
+
 def _turn_usage_fields(usage):
     return {
         "prompt_tokens": getattr(usage, "input_tokens", 0) or 0,
@@ -856,15 +1114,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json(404, {"error": "not found"})
 
+    def _read_json_body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b""
+        return json.loads(raw or b"{}")
+
     def do_POST(self):
+        if self.path == "/tool_call":
+            self._handle_tool_call_request()
+            return
         if self.path != "/run":
             self._send_json(404, {"error": "not found"})
             return
 
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length) if length else b""
         try:
-            payload = json.loads(raw or b"{}")
+            payload = self._read_json_body()
         except json.JSONDecodeError:
             self._send_json(400, {"error": "invalid JSON body"})
             return
@@ -876,8 +1140,35 @@ class Handler(BaseHTTPRequestHandler):
 
         correlation_id = payload.get("correlation_id") or str(uuid.uuid4())
         _set_status(correlation_id, state="accepted")
-        threading.Thread(target=run_job, args=(payload,), daemon=True).start()
+        # action present -> one of the 6 tools' own slow (run_tests/
+        # open_pull_request) dispatch; absent -> dispatch_to_sandbox's
+        # original bundled coding session.
+        target = run_single_action_job if "action" in payload else run_job
+        threading.Thread(target=target, args=(payload,), daemon=True).start()
         self._send_json(202, {"correlation_id": correlation_id, "status": "accepted"})
+
+    def _handle_tool_call_request(self):
+        # Synchronous by design — read_file/write_file/edit_file/list_files
+        # are seconds-scale (a git fetch against an already-locally-cloned
+        # repo, plus a local file op), so there's nothing worth an
+        # accept-then-callback round trip over.
+        try:
+            payload = self._read_json_body()
+        except json.JSONDecodeError:
+            self._send_json(400, {"error": "invalid JSON body"})
+            return
+
+        error = _validate_tool_call_payload(payload)
+        if error:
+            self._send_json(422, {"error": error})
+            return
+
+        try:
+            result = _handle_tool_call(payload)
+        except Exception as exc:  # noqa: BLE001 — reported to the caller, not a 500
+            self._send_json(200, {"error": f"tool_call failed: {exc}"})
+            return
+        self._send_json(200, result)
 
     def log_message(self, fmt, *args):
         print(f"[dev_agent_server] {self.address_string()} - {fmt % args}")
