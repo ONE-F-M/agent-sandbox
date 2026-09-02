@@ -5,23 +5,28 @@ Generic, config-free driver for the dev-agent sandbox container.
 This process IS the coding agent. It carries no system prompt, no model
 choice, no tool list, and no credential of its own — every one of those
 arrives fresh in the POST /run body's "agent_config" (system_prompt, model,
-api_key), resolved by Processa from the "Dev Agent" AI Agent Configuration
-and its linked AI Provider on every dispatch. This process never invents
-behavior or a credential the caller didn't supply.
+api_key) and "tools" (Anthropic-format schemas), resolved by Processa on
+every dispatch: agent_config from the "Dev Agent" AI Agent Configuration and
+its linked AI Model, tools from the shapes of the BPMN map's own
+"sandbox_tool_defs" ad-hoc sub-process (see one_bpmn's
+agent_sandbox_ops.py::dispatch and api/compilation.py::_resolve_sandbox_tool_shapes).
+This process never invents behavior, a tool set, or a credential the caller
+didn't supply — only WHICH tools exist is decided elsewhere; EXECUTING each
+one, against the model it was told to use, deciding what to read, what to
+change, and when it's done, all still happens entirely here.
 
-Given a work order (target_app, git_branch, work_item_description) and that
-agent_config, it runs its own bounded tool-calling loop against the model it
-was told to use — read_file / write_file / list_files against the checked-out
-working tree, plus run_tests — deciding what to read, what to change, and
-when it's done. Processa never sees the file plan in advance; it only gets
-the sandbox's own final report and the actual diff, in the callback.
+Given a work order (target_app, git_branch, work_item_description), that
+agent_config, and that tools list, it runs its own bounded tool-calling loop.
+Processa never sees the file plan in advance; it only gets the sandbox's own
+turn-by-turn trace and the actual diff, in the callback.
 
 Stdlib plus the anthropic SDK (installed at image-build time — see
 Dockerfile.frappe_runtime; dev_agent_server.py runs via system python3, not
 the bench's own venv, per entrypoint.sh).
 
-On a pass, this process delivers the change itself: it opens the pull
-request directly against GitHub's REST API (see _open_pr below) — the same
+PR-opening is one of the tools the model can choose to call (open_pull_request,
+see _tool_open_pull_request below), not automatic post-loop logic — it opens
+the pull request directly against GitHub's REST API (see _open_pr), the same
 Contents-API mechanism api/github_sync.py's open_customization_pr() already
 uses on the Processa side for other PR-opening flows, just run from here
 instead. Processa's callback handler only ever records the result (the PR
@@ -91,10 +96,24 @@ REQUIRED_FIELDS = (
     "git_branch",
     "work_item_description",
     "agent_config",
+    "tools",
     "github_token",
     "callback_url",
 )
 REQUIRED_AGENT_CONFIG_FIELDS = ("system_prompt", "model", "api_key")
+REQUIRED_TOOL_FIELDS = ("name", "description", "input_schema")
+
+# Every tool name this process actually knows how to execute. The tool SET
+# itself is no longer fixed here — it arrives per-dispatch in payload["tools"],
+# defined as real shapes in the "sandbox_tool_defs" ad-hoc sub-process on the
+# Dev Agent BPMN map (see one_bpmn's api/compilation.py::_resolve_sandbox_tool_shapes
+# and agent_sandbox_ops.py::dispatch). This set exists purely so a diagram
+# that names a tool this process has no implementation for fails the dispatch
+# loudly at validation time, rather than the model discovering it mid-loop as
+# a silent per-call "unknown tool" error.
+_KNOWN_TOOL_NAMES = frozenset({
+    "read_file", "write_file", "edit_file", "list_files", "run_tests", "open_pull_request",
+})
 
 # In-memory job status, keyed by correlation_id. Fine for one-instance-per-run
 # (Cloud Run --concurrency=1) — no shared state needed across instances.
@@ -120,6 +139,21 @@ def _validate_payload(payload):
     missing_ac = [f for f in REQUIRED_AGENT_CONFIG_FIELDS if not (agent_config.get(f) or "").strip()]
     if missing_ac:
         return f"agent_config missing required non-empty field(s): {', '.join(missing_ac)}"
+
+    tools = payload["tools"]
+    if not isinstance(tools, list) or not tools:
+        return "tools must be a non-empty list — Dev Agent's sandbox_tool_defs sub-process supplied none"
+    for i, tool in enumerate(tools):
+        if not isinstance(tool, dict):
+            return f"tools[{i}] must be an object"
+        missing_tf = [f for f in REQUIRED_TOOL_FIELDS if f not in tool]
+        if missing_tf:
+            return f"tools[{i}] missing required field(s): {', '.join(missing_tf)}"
+        if tool["name"] not in _KNOWN_TOOL_NAMES:
+            return (
+                f"tools[{i}] names {tool['name']!r}, which this sandbox has no implementation for. "
+                f"Known tools: {', '.join(sorted(_KNOWN_TOOL_NAMES))}."
+            )
 
     if not (payload.get("github_token") or "").strip():
         return "github_token must be a non-empty string"
@@ -185,6 +219,22 @@ def _migrate_site():
 
 
 def _run_tests(target_app):
+    # mobile_app_ionic isn't a Frappe app — no bench run-tests target exists
+    # for it at all. Scope deliberately kept to build+unit-tests only:
+    # yarn build (catches TS/template errors, matches CI) + vitest unit
+    # tests. Cypress e2e is out of scope on purpose — it needs a running
+    # app + backend to hit, which this sandbox has no business standing up
+    # for a single dispatched change.
+    if target_app == "mobile_app_ionic":
+        app_dir = f"{BENCH_DIR}/apps/{target_app}"
+        build = _run(f"cd {app_dir} && yarn build", timeout=900)
+        if build.returncode != 0:
+            return False, build.stdout[-4000:], build.stderr[-4000:]
+        test = _run(f"cd {app_dir} && yarn test:unit", timeout=900)
+        stdout = (build.stdout + test.stdout)[-4000:]
+        stderr = (build.stderr + test.stderr)[-4000:]
+        return test.returncode == 0, stdout, stderr
+
     # --skip-before-tests: erpnext's before_tests hook creates a default
     # Company on any fresh site, which cascades into Warehouse creation and
     # a genuine, pre-existing one_fm bug (before_insert_warehouse assumes a
@@ -422,6 +472,40 @@ def _tool_write_file(app_dir, args):
     return {"written": True, "path": path}
 
 
+def _tool_edit_file(app_dir, args):
+    """Targeted search/replace, complementing write_file's full overwrite —
+    mirrors the familiar old_string/new_string Edit-tool convention. Requires
+    old_string to match EXACTLY once: zero matches means the model's premise
+    about the file's current content is wrong (stale read), and more than one
+    means the replacement location is ambiguous — both are reported back as
+    errors rather than guessed at, same reasoning as any editor tool that
+    works this way."""
+    path = args.get("path") or ""
+    old_string = args.get("old_string")
+    new_string = args.get("new_string")
+    if old_string is None or new_string is None:
+        return {"error": "old_string and new_string are both required"}
+    try:
+        abs_path = _safe_path(app_dir, path)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    try:
+        with open(abs_path, "r", encoding="utf-8") as fh:
+            content = fh.read()
+    except FileNotFoundError:
+        return {"error": f"{path!r} does not exist — use write_file to create it"}
+    except (OSError, UnicodeDecodeError) as exc:
+        return {"error": str(exc)}
+    count = content.count(old_string)
+    if count == 0:
+        return {"error": "old_string not found in the file — it may have changed since you last read it"}
+    if count > 1:
+        return {"error": f"old_string appears {count} times — include more surrounding context to make it unique"}
+    with open(abs_path, "w", encoding="utf-8") as fh:
+        fh.write(content.replace(old_string, new_string, 1))
+    return {"edited": True, "path": path}
+
+
 _LIST_FILES_MAX = 500
 
 
@@ -447,76 +531,79 @@ def _tool_run_tests(target_app, args):
     return {"passed": passed, "stdout_tail": stdout[-2000:], "stderr_tail": stderr[-2000:]}
 
 
-_TOOL_SCHEMAS = [
-    {
-        "name": "read_file",
-        "description": "Read one file's current content from the target app's working tree.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"path": {"type": "string", "description": "Repo-relative file path."}},
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "write_file",
-        "description": (
-            "Write a file's COMPLETE content into the target app's working tree, creating it if "
-            "it does not exist. Overwrites the whole file — always include every line, not a diff."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Repo-relative file path."},
-                "content": {"type": "string", "description": "The file's full new content."},
-            },
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "name": "list_files",
-        "description": "List file paths in the target app's working tree, optionally scoped to a prefix.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path_prefix": {
-                    "type": "string",
-                    "description": "Optional repo-relative prefix to narrow the listing.",
-                }
-            },
-        },
-    },
-    {
-        "name": "run_tests",
-        "description": (
-            "Run the target app's real test suite against the working tree as it currently stands. "
-            "Use this to check your own work before you finish — a final run happens after you stop "
-            "regardless, but that one only decides pass/fail, it doesn't help you fix anything."
-        ),
-        "input_schema": {"type": "object", "properties": {}},
-    },
-]
+def _tool_open_pull_request(target_app, args, run_ctx):
+    """PR-creation as something the model explicitly decides to call, rather
+    than automatic post-loop logic (run_job no longer calls _open_pr itself —
+    see its own docstring). Re-runs the real test suite HERE, independent of
+    whatever the model last saw from its own run_tests calls, so the PR's
+    pass/fail flagging is always accurate to the working tree's current state
+    at the moment of opening — not dependent on the model remembering to
+    re-test after its last edit before calling this."""
+    summary = (args.get("summary") or "").strip()
+    files = _collect_changed_files(target_app)
+    if not files:
+        return {"error": "no changes to commit yet — nothing to open a pull request for"}
+    passed, _stdout, stderr = _run_tests(target_app)
+    pr_url, pr_error = _open_pr(
+        target_app, run_ctx["git_branch"], run_ctx["work_item_description"], files,
+        run_ctx["github_token"], run_ctx["correlation_id"], summary,
+        tests_passed=passed, stderr_tail=stderr,
+    )
+    if pr_url:
+        return {"pr_url": pr_url, "tests_passed": passed}
+    return {"error": pr_error, "tests_passed": passed}
 
 
-def _dispatch_tool(app_dir, target_app, name, args):
+def _dispatch_tool(app_dir, target_app, name, args, run_ctx):
     if name == "read_file":
         return _tool_read_file(app_dir, args)
     if name == "write_file":
         return _tool_write_file(app_dir, args)
+    if name == "edit_file":
+        return _tool_edit_file(app_dir, args)
     if name == "list_files":
         return _tool_list_files(app_dir, args)
     if name == "run_tests":
         return _tool_run_tests(target_app, args)
-    return {"error": f"unknown tool {name!r}"}
+    if name == "open_pull_request":
+        return _tool_open_pull_request(target_app, args, run_ctx)
+    # _validate_payload already rejects a dispatch naming an unimplemented
+    # tool before the loop ever starts (see _KNOWN_TOOL_NAMES) — reaching
+    # this means _KNOWN_TOOL_NAMES and this dispatcher drifted apart, not a
+    # normal runtime outcome. Reported to the model like any other tool
+    # error rather than crashing the loop.
+    return {"error": f"unknown tool {name!r} — the sandbox has no implementation for it"}
 
 
-def _run_coding_loop(target_app, work_item_description, agent_config):
+def _turn_usage_fields(usage):
+    return {
+        "prompt_tokens": getattr(usage, "input_tokens", 0) or 0,
+        "completion_tokens": getattr(usage, "output_tokens", 0) or 0,
+        "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+        "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+    }
+
+
+def _run_coding_loop(target_app, work_item_description, agent_config, tools, run_ctx):
     """The agent's own bounded tool-calling loop. Returns a dict: final_text,
     iterations_used, hit_limit, usage (accumulated token counts across every
     turn — Processa has no other way to see what this loop actually cost,
-    since it runs entirely outside Frappe), tool_calls (names, in call
-    order), started_at/ended_at (unix seconds). Every decision here is the
-    model's — this function only wires its tool calls to the filesystem and
-    feeds results back, exactly as a human would relay a tool's output."""
+    since it runs entirely outside Frappe), trace (one entry per turn —
+    {role, content, tool_calls: [{name, arguments, result, status}], token/
+    latency fields — matching the shape one_bpmn's own step-driven loop
+    already produces, so Processa can turn each turn into a real AI Agent
+    Step via record_ai_step() without any new shape to reconcile), started_at/
+    ended_at (unix seconds).
+
+    ``tools`` (Anthropic-format schemas) and the tool SET they represent are
+    no longer fixed here — they arrive fresh from the BPMN map on every
+    dispatch (see agent_sandbox_ops.py::_sandbox_tools). This function's job
+    is unchanged either way: wire whatever tool calls the model makes to the
+    filesystem/GitHub and feed results back, exactly as a human would relay
+    a tool's output. ``run_ctx`` (git_branch, work_item_description,
+    github_token, correlation_id) is what open_pull_request needs that no
+    other tool does — bundled here rather than widening every tool's own
+    signature for the one that's different."""
     app_dir = f"{BENCH_DIR}/apps/{target_app}"
     client = anthropic.Anthropic(api_key=agent_config["api_key"])
     model = agent_config["model"]
@@ -530,7 +617,7 @@ def _run_coding_loop(target_app, work_item_description, agent_config):
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0,
     }
-    tool_calls = []
+    trace = []
     started_at = time.time()
 
     def _accumulate(u):
@@ -541,34 +628,43 @@ def _run_coding_loop(target_app, work_item_description, agent_config):
             usage[field] += getattr(u, field, 0) or 0
 
     for iteration in range(1, MAX_AGENT_ITERATIONS + 1):
+        turn_started = time.time()
         response = client.messages.create(
             model=model,
             system=system_prompt,
             messages=messages,
-            tools=_TOOL_SCHEMAS,
+            tools=tools,
             max_tokens=AGENT_MAX_TOKENS,
         )
+        latency_ms = int((time.time() - turn_started) * 1000)
         _accumulate(response.usage)
+        text = "".join(block.text for block in response.content if block.type == "text")
 
         if response.stop_reason != "tool_use":
-            final_text = "".join(block.text for block in response.content if block.type == "text")
+            trace.append({
+                "role": "assistant", "content": text, "tool_calls": [],
+                "latency_ms": latency_ms, **_turn_usage_fields(response.usage),
+            })
             return {
-                "final_text": final_text,
+                "final_text": text,
                 "iterations": iteration,
                 "hit_limit": False,
                 "usage": usage,
-                "tool_calls": tool_calls,
+                "trace": trace,
                 "started_at": started_at,
                 "ended_at": time.time(),
             }
 
         messages.append({"role": "assistant", "content": response.content})
         tool_results = []
+        turn_calls = []
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            tool_calls.append(block.name)
-            result = _dispatch_tool(app_dir, target_app, block.name, block.input or {})
+            args = block.input or {}
+            result = _dispatch_tool(app_dir, target_app, block.name, args, run_ctx)
+            status = "Error" if isinstance(result, dict) and result.get("error") else "Success"
+            turn_calls.append({"name": block.name, "arguments": args, "result": result, "status": status})
             tool_results.append(
                 {
                     "type": "tool_result",
@@ -576,6 +672,10 @@ def _run_coding_loop(target_app, work_item_description, agent_config):
                     "content": json.dumps(result, default=str),
                 }
             )
+        trace.append({
+            "role": "assistant", "content": text, "tool_calls": turn_calls,
+            "latency_ms": latency_ms, **_turn_usage_fields(response.usage),
+        })
         messages.append({"role": "user", "content": tool_results})
 
     return {
@@ -586,7 +686,7 @@ def _run_coding_loop(target_app, work_item_description, agent_config):
         "iterations": MAX_AGENT_ITERATIONS,
         "hit_limit": True,
         "usage": usage,
-        "tool_calls": tool_calls,
+        "trace": trace,
         "started_at": started_at,
         "ended_at": time.time(),
     }
@@ -626,12 +726,27 @@ def _post_callback(callback_url, body):
     return None
 
 
+def _last_open_pr_result(trace):
+    """The result dict of the LAST open_pull_request call in the trace, or
+    None if the model never called it. run_job uses this to report what
+    happened instead of auto-opening a PR itself — open_pull_request is now
+    the model's own tool call, not automatic post-loop logic (see its own
+    docstring)."""
+    result = None
+    for turn in trace:
+        for call in turn["tool_calls"]:
+            if call["name"] == "open_pull_request":
+                result = call["result"]
+    return result
+
+
 def run_job(payload):
     correlation_id = payload["correlation_id"]
     target_app = payload["target_app"]
     git_branch = payload["git_branch"]
     work_item_description = payload["work_item_description"]
     agent_config = payload["agent_config"]
+    tools = payload["tools"]
     github_token = payload["github_token"]
     callback_url = payload["callback_url"]
 
@@ -653,8 +768,14 @@ def run_job(payload):
         return
 
     _set_status(correlation_id, state="coding")
+    run_ctx = {
+        "git_branch": git_branch,
+        "work_item_description": work_item_description,
+        "github_token": github_token,
+        "correlation_id": correlation_id,
+    }
     try:
-        loop_result = _run_coding_loop(target_app, work_item_description, agent_config)
+        loop_result = _run_coding_loop(target_app, work_item_description, agent_config, tools, run_ctx)
         agent_report = loop_result["final_text"]
         iterations = loop_result["iterations"]
         hit_limit = loop_result["hit_limit"]
@@ -664,6 +785,10 @@ def run_job(payload):
         _post_callback(callback_url, {"correlation_id": correlation_id, "status": "failed", "error": err})
         return
 
+    # Authoritative, independent of whatever the model's own last run_tests
+    # or open_pull_request call happened to see — the working tree may have
+    # changed since either of those, and status/callback must reflect the
+    # tree as it actually stands right now, not a possibly-stale self-report.
     _set_status(correlation_id, state="running_tests")
     passed, stdout, stderr = _run_tests(target_app)
 
@@ -678,7 +803,7 @@ def run_job(payload):
         "agent_hit_iteration_limit": hit_limit,
         "agent_model": agent_config["model"],
         "agent_usage": loop_result["usage"],
-        "agent_tool_calls": loop_result["tool_calls"],
+        "agent_trace": loop_result["trace"],
         "agent_started_at": loop_result["started_at"],
         "agent_ended_at": loop_result["ended_at"],
     }
@@ -689,19 +814,19 @@ def run_job(payload):
         # else: status stays "tests_failed" — no files means nothing to
         # open a PR for regardless of the test outcome.
     else:
-        # A PR now opens whether or not tests passed — see _open_pr()'s own
-        # docstring for why. It still clearly marks a failure as a failure;
-        # this only changes whether the diff reaches GitHub at all.
         body["files"] = files
-        _set_status(correlation_id, state="opening_pr")
-        pr_url, pr_error = _open_pr(
-            target_app, git_branch, work_item_description, files, github_token, correlation_id, agent_report,
-            tests_passed=passed, stderr_tail=stderr,
-        )
-        if pr_url:
-            body["pr_url"] = pr_url
+        pr_result = _last_open_pr_result(loop_result["trace"])
+        if pr_result and pr_result.get("pr_url"):
+            body["pr_url"] = pr_result["pr_url"]
+        elif pr_result and pr_result.get("error"):
+            body["pr_error"] = pr_result["error"]
         else:
-            body["pr_error"] = pr_error
+            # The model made real changes but never called open_pull_request
+            # at all — a real prompt-reliability gap this design accepts
+            # (see agent_sandbox_ops.py's module docstring): flagged clearly
+            # rather than silently leaving the diff undelivered with no trace
+            # of why.
+            body["pr_error"] = "The agent made changes but never called open_pull_request."
 
     _set_status(correlation_id, state="done", result=status)
     _post_callback(callback_url, body)
