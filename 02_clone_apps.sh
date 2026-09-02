@@ -107,6 +107,44 @@ clone_app() {
     fi
 }
 
+# clone_plain_repo() — for a target_app that isn't a Frappe app at all (no
+# hooks.py, never bench-installed): mobile_app_ionic is a standalone Vue/
+# Ionic/Capacitor project. `bench get-app` would fail on it (it expects a
+# real Frappe app to register), so this does a plain `git clone` into the
+# same apps/<name> path instead — _checkout_target_branch/_collect_changed_
+# files/_open_pr in dev_agent_server.py all just operate on that directory
+# as a git repo, so nothing about them needs to know or care that this one
+# was never bench-installed. pin_app/_normalize_remote are the same
+# mechanism either way, since they too just operate on the directory.
+clone_plain_repo() {
+    local app_name=$1
+    local repo_url=$2
+    local branch=$3
+    local clean_url=${4:-$repo_url}
+    local max_retries=3
+    local attempt=1
+
+    if [ ! -d "apps/$app_name" ]; then
+        echo "Cloning $app_name (plain, non-Frappe) from $repo_url (branch: $branch)..."
+        until [ $attempt -gt $max_retries ]
+        do
+            echo "Attempt $attempt of $max_retries..."
+            rm -rf "apps/$app_name"
+            if git clone --branch "$branch" --single-branch "$repo_url" "apps/$app_name"; then
+                echo "Successfully cloned $app_name."
+                pin_app "$app_name"
+                _normalize_remote "$app_name" "$clean_url"
+                return 0
+            fi
+            echo "Failed to clone $app_name. Retrying in 5 seconds..."
+            attempt=$((attempt + 1))
+            sleep 5
+        done
+        echo "ERROR: Failed to clone $app_name after $max_retries attempts."
+        exit 1
+    fi
+}
+
 # --- frappe/frappe-maintained apps (public) ---
 clone_app telephony https://github.com/frappe/telephony.git develop
 clone_app helpdesk https://github.com/frappe/helpdesk main
@@ -115,6 +153,10 @@ clone_app wiki https://github.com/frappe/wiki master
 clone_app payments https://github.com/frappe/payments version-15
 clone_app twilio_integration https://github.com/frappe/twilio-integration.git master
 clone_app lending https://github.com/frappe/lending version-15
+# lms — cloned here (before the ONE-F-M private apps below) because
+# one_lms directly imports it (`from lms import plugins`); must be
+# installed before one_lms in entrypoint.sh's INSTALL_APPS too.
+clone_app lms https://github.com/frappe/lms develop
 
 # --- ONE-F-M org apps (private — GITHUB_TOKEN required to clone; the
 # remote is rewritten to a credential-free URL immediately after, so the
@@ -125,3 +167,7 @@ clone_app onefm_sso https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/onefm_sso.g
 clone_app one_bpmn https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/one_bpmn.git staging https://github.com/${GITHUB_ORG}/one_bpmn.git
 clone_app onefm_mcp https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/onefm_mcp.git staging https://github.com/${GITHUB_ORG}/onefm_mcp.git
 clone_app frappe_agile https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/frappe_agile.git staging https://github.com/${GITHUB_ORG}/frappe_agile.git
+clone_app one_lms https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/one_lms.git version-15 https://github.com/${GITHUB_ORG}/one_lms.git
+
+# --- Non-Frappe target apps (plain git clone, never bench-installed) ---
+clone_plain_repo mobile_app_ionic https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/mobile_app_ionic.git version-15 https://github.com/${GITHUB_ORG}/mobile_app_ionic.git

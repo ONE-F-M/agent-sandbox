@@ -26,6 +26,19 @@ declare -A PINNED_SHA=(
     [one_bpmn]="2dd3c7cdeaf3c8f86879810e40e551ab7cd4eec2"
     [onefm_mcp]="f83812cd07bfa3e51966c4d2c5ef94fc9fff6b6a"
     [frappe_agile]="79ca4b3c4f4504aeb1589987b3f441d431727ae9"
+    # Captured 2026-09-01, branch tip at the time these apps were first
+    # added to the sandbox — not "what this bench was running" like the
+    # others above, since none of them were ever installed here.
+    [one_lms]="bb501383b9f6b1c6baa590b3005ded599661886d"
+    [mobile_app_ionic]="c7dfa063fe88533cc18469a4c54ce0f2678b9dcc"
+    # one_lms's own pyproject.toml describes it as extending Frappe LMS, and
+    # its __init__.py does `from lms import plugins` — a real Python-level
+    # dependency on frappe/lms that one_lms's hooks.py required_apps never
+    # declared (confirmed the hard way: a bake failed with ModuleNotFoundError:
+    # No module named 'lms' before this was added). frappe/lms has no
+    # version-15 branch (unlike most ONE-F-M apps here) — only a rolling
+    # `develop` branch, same situation as `wiki`/`master` above.
+    [lms]="13d2114dac424fca0fed6c7516bd6f9773e55b1b"
 )
 
 # Checks out $1's pinned commit. A shallow clone (bench's default) may not

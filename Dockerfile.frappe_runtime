@@ -59,6 +59,22 @@ RUN useradd -ms /bin/bash frappe && mkdir -p /home/frappe/frappe-bench && chown 
 USER frappe
 WORKDIR /home/frappe
 
+# frappe/lms (a real dependency of one_lms — see lib_pin_apps.sh's `lms`
+# entry) declares engines.node >=22 in its package.json, which yarn
+# enforces as a hard error during `bench get-app`'s clone-time
+# `yarn install` — confirmed live, it aborts the whole clone before
+# --skip-assets even gets a chance to matter. Not worth bumping the whole
+# image to Node 22 over one dependency-of-a-dependency's frontend tooling
+# that this sandbox never builds or serves (lms is only here so one_lms's
+# Python import resolves) — ignore-engines just turns that check back into
+# a warning, same as it is for any app that doesn't declare an upper bound.
+# Must run as the `frappe` user (after USER frappe above, not before) —
+# yarn config writes to $HOME/.yarnrc, and the clone/install RUN steps
+# below all run as frappe (HOME=/home/frappe), not root: confirmed the
+# hard way, setting this as root before the USER switch left frappe's own
+# yarn reads seeing no override at all.
+RUN yarn config set ignore-engines true
+
 # Only set up bench and clone app code, not DB-dependent steps (site creation
 # happens per run, at container start — see entrypoint.sh). Each stage that
 # needs to clone the private ONE-F-M repos gets its own --secret mount.

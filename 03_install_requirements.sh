@@ -30,6 +30,26 @@ cd "$BENCH_PATH"
 echo "Installing pip/node requirements for all pinned apps..."
 bench setup requirements
 
+# mobile_app_ionic isn't a Frappe app (no hooks.py, never bench-installed —
+# see entrypoint.sh's INSTALL_APPS comment), so `bench setup requirements`
+# above never touches it: that command walks Frappe apps, not arbitrary
+# directories under apps/. Its own package.json needs its own yarn install
+# so a coding-loop run targeting it can run `yarn build`/`yarn test:unit`
+# without a from-scratch install eating into the run's time budget.
+#
+# No --frozen-lockfile: confirmed at bake time that this app's yarn.lock,
+# at the pinned commit, is already out of sync with its own package.json
+# (it also carries a stray package-lock.json from a prior npm run upstream)
+# — --frozen-lockfile fails outright on that mismatch. The git-level pin
+# in lib_pin_apps.sh already gives us a reproducible source commit; a plain
+# install just resolves node_modules against package.json like any other
+# fresh clone would, which is the best available given upstream's lockfile
+# drift.
+if [ -d "apps/mobile_app_ionic" ]; then
+    echo "Installing node dependencies for mobile_app_ionic..."
+    (cd apps/mobile_app_ionic && yarn install)
+fi
+
 # Fix OpenSSL/Cryptography compatibility issue known to cause "module 'lib' has no attribute 'GEN_EMAIL'" during bench setup
 echo "Upgrading pyopenssl and cryptography..."
 ./env/bin/pip install --upgrade pyopenssl cryptography

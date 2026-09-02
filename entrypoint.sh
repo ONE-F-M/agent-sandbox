@@ -25,11 +25,22 @@ MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-root}"
 
 # Apps installed onto SITE_NAME, in dependency order (erpnext before
 # hrms/lending; telephony before helpdesk; one_bpmn before onefm_mcp;
-# one_fm last — it depends on erpnext). See each app's hooks.py
-# required_apps for the source of this ordering.
+# lms before one_lms — one_lms imports it directly, confirmed by a real
+# bake failure (ModuleNotFoundError: No module named 'lms') before this
+# was added; one_fm last — it depends on erpnext). See each app's
+# hooks.py required_apps for the source of this ordering, though note
+# one_lms's own required_apps is empty/stale — its real dependency on lms
+# only showed up as a Python import, not a declared one.
+#
+# mobile_app_ionic is deliberately NOT in this list — it's a standalone
+# Vue/Ionic project with no hooks.py, so bench install-app would fail on
+# it outright. It's cloned into apps/ (see 02_clone_apps.sh's
+# clone_plain_repo) purely so it can be a target_app for the coding loop;
+# it never gets installed onto SITE_NAME.
 INSTALL_APPS=(
   erpnext hrms lending telephony helpdesk payments wiki twilio_integration
-  one_fm_password_management onefm_sso frappe_agile one_bpmn onefm_mcp one_fm
+  one_fm_password_management onefm_sso frappe_agile one_bpmn onefm_mcp
+  lms one_lms one_fm
 )
 
 # Start Redis
