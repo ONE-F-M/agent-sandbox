@@ -227,9 +227,10 @@ def _run(cmd, **kwargs):
 
 
 def _checkout_target_branch(target_app, git_branch):
-    # 02_clone_apps.sh strips every private repo's remote URL back to a
-    # credential-free https://github.com/... form right after the bake-time
-    # clone (see its own header for why: a token embedded in the URL would
+    # The bake-time clone stages (02a-02d, via lib_clone_functions.sh) strip
+    # every private repo's remote URL back to a credential-free
+    # https://github.com/... form right after cloning (see that file's
+    # header for why: a token embedded in the URL would
     # otherwise sit in plaintext in a committed image layer forever). That
     # means this runtime fetch has nothing to authenticate with unless it
     # re-embeds a credential itself — mirror the bake-time pattern: embed
@@ -267,9 +268,10 @@ def _checkout_target_branch(target_app, git_branch):
 @contextlib.contextmanager
 def _authed_remote(app_dir, github_token):
     """Temporarily embeds github_token in origin's URL for the duration of
-    the block, then always restores the credential-free URL — mirrors
-    02_clone_apps.sh's own bake-time remote-scrubbing (a token left in
-    .git/config would otherwise persist on disk between calls)."""
+    the block, then always restores the credential-free URL — mirrors the
+    bake-time clone stages' own remote-scrubbing (lib_clone_functions.sh's
+    _normalize_remote; a token left in .git/config would otherwise persist
+    on disk between calls)."""
     clean_url = _run(f"cd {app_dir} && git remote get-url origin").stdout.strip()
     authed = bool(github_token) and clean_url.startswith("https://github.com/")
     if authed:

@@ -1,4 +1,5 @@
-# lib_pin_apps.sh — sourced by 01_init_bench.sh and 02_clone_apps.sh.
+# lib_pin_apps.sh — sourced by 01_init_bench.sh and each of the 02a-02d
+# clone stages.
 #
 # Kept as its own file, not folded into either stage script, so editing a
 # pinned commit invalidates exactly the Docker layers that need to re-clone

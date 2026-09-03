@@ -34,9 +34,9 @@ MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-root}"
 #
 # mobile_app_ionic is deliberately NOT in this list — it's a standalone
 # Vue/Ionic project with no hooks.py, so bench install-app would fail on
-# it outright. It's cloned into apps/ (see 02_clone_apps.sh's
-# clone_plain_repo) purely so it can be a target_app for the coding loop;
-# it never gets installed onto SITE_NAME.
+# it outright. It's cloned into apps/ (see 02d_clone_lms_and_mobile.sh's
+# use of lib_clone_functions.sh's clone_plain_repo) purely so it can be a
+# target_app for the coding loop; it never gets installed onto SITE_NAME.
 INSTALL_APPS=(
   erpnext hrms lending telephony helpdesk payments wiki twilio_integration
   one_fm_password_management onefm_sso frappe_agile one_bpmn onefm_mcp

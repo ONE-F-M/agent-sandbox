@@ -43,15 +43,28 @@ RUN python3.11 -m pip install --no-cache-dir frappe-bench && ls -l /usr/local/bi
 # so this must be installed here, not via any app's requirements.txt.
 RUN python3.11 -m pip install --no-cache-dir anthropic
 
-# Copy the three build stages + their shared pinning library separately, and
-# fix Windows line endings on each (CRLF -> LF). Kept as distinct COPY/RUN
+# Copy the build stages + their shared libraries separately, and fix
+# Windows line endings on each (CRLF -> LF). Kept as distinct COPY/RUN
 # pairs deliberately: Docker's cache is per-layer, so a change to a later
 # stage's script never invalidates an earlier stage's already-cached layer —
 # see each script's own header for why that matters (a single-script version
 # of this cost two full ~45-minute re-clones to recover from a late failure).
-COPY lib_pin_apps.sh 01_init_bench.sh 02_clone_apps.sh 03_install_requirements.sh /
-RUN sed -i 's/\r$//' /lib_pin_apps.sh /01_init_bench.sh /02_clone_apps.sh /03_install_requirements.sh && \
-    chmod +x /01_init_bench.sh /02_clone_apps.sh /03_install_requirements.sh
+#
+# The clone stage is 4 scripts (02a/02b/02c/02d), not 1 — see
+# lib_clone_functions.sh's own header: one RUN cloning all 18 apps produced
+# a single ~6.4GB layer that a connection drop (Docker Desktop's own
+# internal proxy killing long-lived large uploads, not a bandwidth problem)
+# forced restarting from zero, repeatedly, with no way to land a full push.
+COPY lib_pin_apps.sh lib_clone_functions.sh 01_init_bench.sh \
+     02a_clone_public_apps.sh 02b_clone_onefm_apps_1.sh \
+     02c_clone_onefm_apps_2.sh 02d_clone_lms_and_mobile.sh \
+     03_install_requirements.sh /
+RUN sed -i 's/\r$//' /lib_pin_apps.sh /lib_clone_functions.sh /01_init_bench.sh \
+        /02a_clone_public_apps.sh /02b_clone_onefm_apps_1.sh \
+        /02c_clone_onefm_apps_2.sh /02d_clone_lms_and_mobile.sh \
+        /03_install_requirements.sh && \
+    chmod +x /01_init_bench.sh /02a_clone_public_apps.sh /02b_clone_onefm_apps_1.sh \
+        /02c_clone_onefm_apps_2.sh /02d_clone_lms_and_mobile.sh /03_install_requirements.sh
 
 # Create frappe user and bench directory
 RUN useradd -ms /bin/bash frappe && mkdir -p /home/frappe/frappe-bench && chown -R frappe:frappe /home/frappe
@@ -82,9 +95,25 @@ RUN --mount=type=secret,id=github_token,mode=0444 \
     GITHUB_TOKEN=$(cat /run/secrets/github_token) \
     /01_init_bench.sh /home/frappe/frappe-bench version-15 version-15
 
+# Four separate clone stages, four separate layers — see
+# lib_clone_functions.sh's header for why: keeping each one's upload small
+# means a dropped connection only costs that one stage's retry, not a
+# ~6.4GB all-18-apps blob starting over from zero every time.
 RUN --mount=type=secret,id=github_token,mode=0444 \
     GITHUB_TOKEN=$(cat /run/secrets/github_token) \
-    /02_clone_apps.sh /home/frappe/frappe-bench
+    /02a_clone_public_apps.sh /home/frappe/frappe-bench
+
+RUN --mount=type=secret,id=github_token,mode=0444 \
+    GITHUB_TOKEN=$(cat /run/secrets/github_token) \
+    /02b_clone_onefm_apps_1.sh /home/frappe/frappe-bench
+
+RUN --mount=type=secret,id=github_token,mode=0444 \
+    GITHUB_TOKEN=$(cat /run/secrets/github_token) \
+    /02c_clone_onefm_apps_2.sh /home/frappe/frappe-bench
+
+RUN --mount=type=secret,id=github_token,mode=0444 \
+    GITHUB_TOKEN=$(cat /run/secrets/github_token) \
+    /02d_clone_lms_and_mobile.sh /home/frappe/frappe-bench
 
 RUN /03_install_requirements.sh /home/frappe/frappe-bench
 

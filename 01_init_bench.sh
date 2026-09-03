@@ -1,5 +1,5 @@
 #!/bin/bash
-# 01_init_bench.sh — stage 1 of 3 (see 02_clone_apps.sh, 03_install_requirements.sh).
+# 01_init_bench.sh — stage 1 (see the 02a-02d clone stages and 03_install_requirements.sh).
 #
 # Split into its own Docker layer deliberately: this is the fast, low-risk
 # part. When something breaks later in stage 2 or 3, a rebuild reuses this

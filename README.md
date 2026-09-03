@@ -85,9 +85,10 @@ compromised sandbox should only ever expose what it strictly needs.
 
 1. GitHub → **Settings → Developer settings → Fine-grained tokens → Generate new token**.
 2. **Resource owner**: `ONE-F-M`.
-3. **Repository access**: select only the repos `02_clone_apps.sh` actually clones:
-   `one_fm`, `onefm_sso`, `one_fm_password_management` (repo name `password_management`),
-   `one_bpmn`, `onefm_mcp`, `frappe_agile`.
+3. **Repository access**: select only the private repos the 02a-02d clone stages
+   actually clone: `one_fm`, `onefm_sso`, `one_fm_password_management` (repo name
+   `password_management`), `one_bpmn`, `onefm_mcp`, `frappe_agile`, `one_lms`,
+   `mobile_app_ionic`.
 4. **Permissions → Repository permissions → Contents: Read-only.** Nothing else. This
    token only ever clones/fetches — it is never the one used to open a PR (see
    "Two GitHub tokens" above; that's a separate credential, configured in
@@ -148,13 +149,15 @@ cd ~/Desktop/agent-sandbox && ENV=production ./bake_image.sh
 
 Expect 40–75 minutes on a clean run (Docker layer caching makes every rebake
 after the first noticeably faster, as long as only late layers like
-`dev_agent_server.py`/`entrypoint.sh` changed) — this clones and pins all 15
+`dev_agent_server.py`/`entrypoint.sh` changed) — this clones and pins all 18
 apps, installs dependencies, and boots a throwaway site to prove the whole
-thing works before committing the image. The build is split into three
-separate Docker layers (`01_init_bench.sh` → `02_clone_apps.sh` →
-`03_install_requirements.sh`) specifically so a failure late in the process
-doesn't force re-cloning everything on retry — only the layer that actually
-changed re-runs.
+thing works before committing the image. The build is split into six
+separate Docker layers (`01_init_bench.sh` → `02a_clone_public_apps.sh` →
+`02b_clone_onefm_apps_1.sh` → `02c_clone_onefm_apps_2.sh` →
+`02d_clone_lms_and_mobile.sh` → `03_install_requirements.sh`) — the four
+clone stages specifically so a dropped connection while pushing the built
+image only costs re-uploading whichever one stage's layer failed, not a
+single ~6.4GB all-apps layer starting over from zero.
 
 Use `ENV=beta` instead everywhere in this doc for a beta deploy — see
 "Beta vs. production" below.

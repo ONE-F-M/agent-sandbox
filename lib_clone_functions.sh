@@ -1,35 +1,21 @@
-#!/bin/bash
-# 02_clone_apps.sh — stage 2 of 3 (see 01_init_bench.sh, 03_install_requirements.sh).
+# lib_clone_functions.sh — sourced by every 02*_clone_*.sh stage script.
 #
-# The slow, network-bound stage — this is the ~40-minute part. Split into its
-# own layer so a failure in stage 3 (bench setup requirements) doesn't force
-# re-cloning all 15 apps to retry; only a change to this script, lib_pin_apps.sh,
-# or an earlier layer invalidates it.
+# Split out of the original single 02_clone_apps.sh so each clone stage
+# (now 4 separate scripts, each its own Docker layer — see the 02a/02b/02c/02d
+# scripts and Dockerfile.frappe_runtime's 4 RUN instructions) shares one
+# definition of clone_app/clone_plain_repo/_normalize_remote instead of
+# duplicating them. The split itself exists to keep any single layer's
+# upload small: the original one-RUN-clones-everything design produced a
+# single ~6.4GB layer that a dropped connection (Docker Desktop's own
+# internal proxy killing long-lived large uploads — confirmed, not a real
+# bandwidth problem) would force restarting from zero, over and over, with
+# no way to land a full push. Four smaller layers means a drop only costs
+# that one layer's retry.
 #
-# PINNING: every app is checked out to the exact commit this bench (the real
-# frappe-bench, not a branch tip) was actually running at capture time, not
-# just cloned by branch name. Tracking a branch means the sandbox drifts from
-# what's actually deployed as upstream commits land — confirmed the hard way:
-# a fresh `frappe`@version-15 tip no longer exported a name `one_fm`'s pinned
-# commit imports, breaking `bench build --app one_fm` with an ImportError
-# that has nothing to do with any real work item. Pinning eliminates that
-# whole class of false failures.
-#
-# `--skip-assets` on every clone defers the pip/yarn build to stage 3 —
-# otherwise `bench get-app` builds against the branch tip's code before we
-# get a chance to check out the pinned commit.
-#
-# Usage: ./02_clone_apps.sh /path/to/bench
-
-set -e
-
-BENCH_PATH=${1:-/home/frappe/frappe-bench}
-GITHUB_ORG=${HUB_ORG:-ONE-F-M}
-
-export UV_HTTP_TIMEOUT=300
-
-source /lib_pin_apps.sh
-cd "$BENCH_PATH"
+# The git buffer/timeout tuning here is `git config --global`, which
+# persists in the image's filesystem once set — applying it again in each
+# stage script (this file gets sourced by all four) is harmless
+# idempotent repetition, not wasted work.
 
 git config --global http.postBuffer 524288000
 git config --global http.lowSpeedLimit 0
@@ -144,30 +130,3 @@ clone_plain_repo() {
         exit 1
     fi
 }
-
-# --- frappe/frappe-maintained apps (public) ---
-clone_app telephony https://github.com/frappe/telephony.git develop
-clone_app helpdesk https://github.com/frappe/helpdesk main
-clone_app hrms https://github.com/frappe/hrms.git version-15
-clone_app wiki https://github.com/frappe/wiki master
-clone_app payments https://github.com/frappe/payments version-15
-clone_app twilio_integration https://github.com/frappe/twilio-integration.git master
-clone_app lending https://github.com/frappe/lending version-15
-# lms — cloned here (before the ONE-F-M private apps below) because
-# one_lms directly imports it (`from lms import plugins`); must be
-# installed before one_lms in entrypoint.sh's INSTALL_APPS too.
-clone_app lms https://github.com/frappe/lms develop
-
-# --- ONE-F-M org apps (private — GITHUB_TOKEN required to clone; the
-# remote is rewritten to a credential-free URL immediately after, so the
-# token itself never lands in the image — see _normalize_remote above) ---
-clone_app one_fm_password_management https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/password_management.git version-15 https://github.com/${GITHUB_ORG}/password_management.git
-clone_app one_fm https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/one_fm.git staging https://github.com/${GITHUB_ORG}/one_fm.git
-clone_app onefm_sso https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/onefm_sso.git version-15 https://github.com/${GITHUB_ORG}/onefm_sso.git
-clone_app one_bpmn https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/one_bpmn.git staging https://github.com/${GITHUB_ORG}/one_bpmn.git
-clone_app onefm_mcp https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/onefm_mcp.git staging https://github.com/${GITHUB_ORG}/onefm_mcp.git
-clone_app frappe_agile https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/frappe_agile.git staging https://github.com/${GITHUB_ORG}/frappe_agile.git
-clone_app one_lms https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/one_lms.git version-15 https://github.com/${GITHUB_ORG}/one_lms.git
-
-# --- Non-Frappe target apps (plain git clone, never bench-installed) ---
-clone_plain_repo mobile_app_ionic https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/mobile_app_ionic.git version-15 https://github.com/${GITHUB_ORG}/mobile_app_ionic.git

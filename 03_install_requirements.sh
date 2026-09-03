@@ -1,5 +1,6 @@
 #!/bin/bash
-# 03_install_requirements.sh — stage 3 of 3 (see 01_init_bench.sh, 02_clone_apps.sh).
+# 03_install_requirements.sh — final stage (see 01_init_bench.sh and the
+# 02a-02d clone stages).
 #
 # Every app is pinned by now (stage 2). Only here do we install dependencies
 # — against the pinned code, not the branch tips stage 2's --skip-assets
