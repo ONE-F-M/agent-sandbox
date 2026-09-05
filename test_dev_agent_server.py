@@ -452,3 +452,51 @@ class TestHandleToolCall(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCollectChangedFilesSeesCommittedEdits(unittest.TestCase):
+    """The fast tools commit every edit as it happens, so by the time
+    open_pull_request looks, `git diff HEAD` is empty — the change lives in
+    the branch's own commits."""
+
+    def setUp(self):
+        self.bench_dir = os.path.realpath(tempfile.mkdtemp())
+        self.app_dir = os.path.join(self.bench_dir, "apps", "one_bpmn")
+        os.makedirs(os.path.join(self.app_dir, "spiff"))
+        for name in ("committed.vue", "pending.py", "both.js"):
+            with open(os.path.join(self.app_dir, "spiff", name), "w") as fh:
+                fh.write(f"content of {name}")
+        self.bench_dir_patch = patch.object(srv, "BENCH_DIR", self.bench_dir)
+        self.bench_dir_patch.start()
+
+    def tearDown(self):
+        self.bench_dir_patch.stop()
+        shutil.rmtree(self.bench_dir, ignore_errors=True)
+
+    @staticmethod
+    def _fake_run(cmd, **kwargs):
+        if "git diff --name-only staging...HEAD" in cmd:
+            return _FakeCompletedProcess(0, "spiff/committed.vue\nspiff/both.js\n", "")
+        if "git diff --name-only HEAD" in cmd:
+            return _FakeCompletedProcess(0, "spiff/pending.py\nspiff/both.js\n", "")
+        raise AssertionError(cmd)
+
+    def test_committed_and_pending_changes_are_both_collected_once(self):
+        with patch.object(srv, "_run", side_effect=self._fake_run):
+            files = srv._collect_changed_files("one_bpmn", "staging")
+        self.assertEqual(sorted(files), ["spiff/both.js", "spiff/committed.vue", "spiff/pending.py"])
+        self.assertEqual(files["spiff/committed.vue"], "content of committed.vue")
+
+    def test_without_a_base_branch_only_pending_changes_are_collected(self):
+        with patch.object(srv, "_run", side_effect=self._fake_run):
+            files = srv._collect_changed_files("one_bpmn")
+        self.assertEqual(sorted(files), ["spiff/both.js", "spiff/pending.py"])
+
+    def test_open_pull_request_diffs_against_the_run_base_branch(self):
+        run_ctx = {"git_branch": "staging", "work_item_description": "Fix it.",
+                   "github_token": "gh-token", "correlation_id": "corr-1"}
+        with patch.object(srv, "_collect_changed_files", return_value={}) as collect, patch.object(
+            srv, "_run_tests"
+        ), patch.object(srv, "_open_pr"):
+            srv._tool_open_pull_request("one_bpmn", {"summary": "s"}, run_ctx)
+        collect.assert_called_once_with("one_bpmn", "staging")
