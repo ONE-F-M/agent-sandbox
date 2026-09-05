@@ -223,7 +223,15 @@ def _validate_tool_call_payload(payload):
 
 
 def _run(cmd, **kwargs):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, **kwargs)
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        # A hung command has to read as a failed one: nothing above this
+        # catches the exception, so it used to kill the job thread silently.
+        out = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        err = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        err = f"{err}\ntimed out after {exc.timeout:.0f}s: {cmd}".strip()
+        return subprocess.CompletedProcess(cmd, 124, out, err)
 
 
 def _checkout_target_branch(target_app, git_branch):
@@ -769,6 +777,19 @@ def _handle_tool_call(payload):
     return {"error": f"unknown fast tool action {action!r}"}
 
 
+def _report_unexpected_failure(job, payload):
+    """Run a background job so an exception it lets escape still reaches
+    Processa; a daemon thread that dies silently leaves /status frozen and
+    the caller waiting out its whole deadline."""
+    try:
+        job(payload)
+    except Exception as exc:  # noqa: BLE001 — the last place that can still report it
+        correlation_id = payload.get("correlation_id")
+        error = f"{type(exc).__name__}: {str(exc)[:400]}"
+        _set_status(correlation_id, state="failed", error=error)
+        _post_callback(payload.get("callback_url"), {"correlation_id": correlation_id, "status": "failed", "error": error})
+
+
 def run_single_action_job(payload):
     """Background job for POST /run's action-based shape (run_tests /
     open_pull_request) — the two sandbox tools slow enough to need the same
@@ -1146,7 +1167,7 @@ class Handler(BaseHTTPRequestHandler):
         # open_pull_request) dispatch; absent -> dispatch_to_sandbox's
         # original bundled coding session.
         target = run_single_action_job if "action" in payload else run_job
-        threading.Thread(target=target, args=(payload,), daemon=True).start()
+        threading.Thread(target=_report_unexpected_failure, args=(target, payload), daemon=True).start()
         self._send_json(202, {"correlation_id": correlation_id, "status": "accepted"})
 
     def _handle_tool_call_request(self):

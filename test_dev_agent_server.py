@@ -452,3 +452,46 @@ class TestHandleToolCall(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHungCommandsReadAsFailures(unittest.TestCase):
+    def test_run_turns_a_timeout_into_a_failed_result(self):
+        boom = srv.subprocess.TimeoutExpired(cmd="yarn build", timeout=900, output=b"partial out", stderr=b"")
+        with patch.object(srv.subprocess, "run", side_effect=boom):
+            result = srv._run("cd /x && yarn build", timeout=900)
+        self.assertEqual(result.returncode, 124)
+        self.assertIn("partial out", result.stdout)
+        self.assertIn("timed out after 900s", result.stderr)
+        self.assertIn("yarn build", result.stderr)
+
+    def test_mobile_tests_report_a_hung_build_instead_of_raising(self):
+        hung = srv.subprocess.CompletedProcess("yarn build", 124, "", "timed out after 900s: yarn build")
+        with patch.object(srv, "_run", return_value=hung) as run:
+            passed, stdout, stderr = srv._run_tests("mobile_app_ionic")
+        self.assertFalse(passed)
+        self.assertIn("timed out after 900s", stderr)
+        run.assert_called_once()  # a hung build never reaches the unit tests
+
+    def test_an_escaping_exception_still_marks_the_job_failed_and_calls_back(self):
+        payload = {"correlation_id": "corr-9", "callback_url": "https://processa.example.com/cb"}
+
+        def job(_payload):
+            raise RuntimeError("something nobody anticipated")
+
+        with patch.object(srv, "_set_status") as set_status, patch.object(srv, "_post_callback") as post:
+            srv._report_unexpected_failure(job, payload)
+        set_status.assert_called_once()
+        self.assertEqual(set_status.call_args.kwargs["state"], "failed")
+        self.assertIn("RuntimeError", set_status.call_args.kwargs["error"])
+        post.assert_called_once()
+        url, body = post.call_args.args
+        self.assertEqual(url, "https://processa.example.com/cb")
+        self.assertEqual(body["correlation_id"], "corr-9")
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("something nobody anticipated", body["error"])
+
+    def test_a_job_that_finishes_normally_reports_nothing_extra(self):
+        with patch.object(srv, "_set_status") as set_status, patch.object(srv, "_post_callback") as post:
+            srv._report_unexpected_failure(lambda p: None, {"correlation_id": "corr-9"})
+        set_status.assert_not_called()
+        post.assert_not_called()
