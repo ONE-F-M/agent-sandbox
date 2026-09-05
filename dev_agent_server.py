@@ -424,17 +424,22 @@ def _run_tests(target_app):
     return result.returncode == 0, result.stdout[-4000:], result.stderr[-4000:]
 
 
-def _collect_changed_files(target_app):
-    """{repo-relative path: final content} for every file the coding loop
-    touched, relative to the branch this app was checked out at — the shape
-    _open_pr below (and Processa's own audit copy of the run) expects."""
+def _collect_changed_files(target_app, base_branch=None):
+    """{repo-relative path: final content} for every file changed on the
+    working branch: committed there by the fast tools (diffed against
+    base_branch) or still uncommitted from the bundled coding loop."""
     app_dir = f"{BENCH_DIR}/apps/{target_app}"
-    diff = _run(f"cd {app_dir} && git diff --name-only HEAD")
-    if diff.returncode != 0 or not diff.stdout.strip():
-        return {}
+    paths = []
+    if base_branch:
+        committed = _run(f"cd {app_dir} && git diff --name-only {base_branch}...HEAD")
+        if committed.returncode == 0:
+            paths += committed.stdout.strip().splitlines()
+    pending = _run(f"cd {app_dir} && git diff --name-only HEAD")
+    if pending.returncode == 0:
+        paths += pending.stdout.strip().splitlines()
 
     files = {}
-    for rel_path in diff.stdout.strip().splitlines():
+    for rel_path in dict.fromkeys(p for p in paths if p):
         abs_path = f"{app_dir}/{rel_path}"
         try:
             with open(abs_path, "r", encoding="utf-8") as fh:
@@ -709,7 +714,7 @@ def _tool_open_pull_request(target_app, args, run_ctx):
     at the moment of opening — not dependent on the model remembering to
     re-test after its last edit before calling this."""
     summary = (args.get("summary") or "").strip()
-    files = _collect_changed_files(target_app)
+    files = _collect_changed_files(target_app, run_ctx["git_branch"])
     if not files:
         return {"error": "no changes to commit yet — nothing to open a pull request for"}
     passed, _stdout, stderr = _run_tests(target_app)
