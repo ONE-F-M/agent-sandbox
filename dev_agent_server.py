@@ -284,11 +284,24 @@ def _authed_remote(app_dir, github_token):
             _run(f"cd {app_dir} && git remote set-url origin {clean_url}")
 
 
-def _head_branch_for(target_app, git_branch, work_item_description):
-    """Deterministic per-work-order branch name — same formula _open_pr has
-    always used, so retries of the same work order (same three inputs)
-    always converge on the same branch, whether they land on this container
-    instance or a fresh one."""
+_BRANCH_UNSAFE = re.compile(r"[^A-Za-z0-9._/-]+")
+
+
+def _branch_from_work_item_id(work_item_id):
+    """The Work Item id as a git ref name, or "" when nothing usable is left.
+    Sanitised, never invented — the hashed name is the fallback, not a guess."""
+    name = _BRANCH_UNSAFE.sub("-", (work_item_id or "").strip()).strip("-/.")
+    while ".." in name:
+        name = name.replace("..", ".")
+    return name[:100]
+
+
+def _head_branch_for(target_app, git_branch, work_item_description, work_item_id=None):
+    """The one branch every call for a work order lands on: the Work Item id
+    when the caller has one, else a hash of the three inputs so retries converge."""
+    named = _branch_from_work_item_id(work_item_id)
+    if named:
+        return named
     work_hash = hashlib.sha256(
         f"{target_app}:{git_branch}:{work_item_description}".encode("utf-8")
     ).hexdigest()[:16]
@@ -466,7 +479,7 @@ def _repo_for_local_clone(target_app):
 
 def _open_pr(
     target_app, git_branch, work_item_description, files, github_token, correlation_id, agent_report,
-    tests_passed=True, stderr_tail="",
+    tests_passed=True, stderr_tail="", work_item_id=None,
 ):
     """Create a branch off git_branch, commit every changed file via the
     Contents API, and open a PR. Returns (pr_url, None) on success or
@@ -484,19 +497,14 @@ def _open_pr(
     if not repo:
         return None, f"Could not determine the GitHub repository for {target_app!r} from its local clone."
 
-    # Derived from the work order's own content, not correlation_id — every
-    # dispatch creates a brand-new Agent Sandbox Run with its own unique
-    # correlation_id, so keying the branch to it meant a model that calls
-    # dispatch_to_sandbox more than once for the same brief (confirmed
-    # happening live) left one PR behind per attempt. This converges
-    # retries of the same work order onto the same branch, and the PR
-    # creation below is made idempotent to match.
-    work_hash = hashlib.sha256(
-        f"{target_app}:{git_branch}:{work_item_description}".encode("utf-8")
-    ).hexdigest()[:16]
-    head_branch = f"dev-agent/{work_hash}"
+    # The same branch the fast tools committed to, so the PR carries their
+    # work; keyed to the work order rather than correlation_id so a retry
+    # updates one PR instead of opening another.
+    head_branch = _head_branch_for(target_app, git_branch, work_item_description, work_item_id)
+    work_item_id = (work_item_id or "").strip()
     title_prefix = "" if tests_passed else "⚠️ Tests failed: "
-    title = f"{title_prefix}Dev Agent: {work_item_description[:72]}"
+    subject = f"{work_item_id}: {work_item_description[:72]}" if work_item_id else f"Dev Agent: {work_item_description[:72]}"
+    title = f"{title_prefix}{subject}"
     file_list = "\n".join(f"- `{path}`" for path in sorted(files))
     if tests_passed:
         testing_section = (
@@ -512,8 +520,10 @@ def _open_pr(
             "Confirm the failure's actual cause before merging.\n\n"
             f"```\n{(stderr_tail or '(no output captured)')[-3000:]}\n```"
         )
+    work_item_line = f"Work Item: **{work_item_id}**\n\n" if work_item_id else ""
     body = (
-        f"Opened automatically by the Dev Agent sandbox ({correlation_id}).\n\n"
+        f"Opened automatically by the agent sandbox ({correlation_id}).\n\n"
+        f"{work_item_line}"
         f"## Work order\n\n{work_item_description}\n\n"
         f"## What changed\n\n{agent_report.strip() or '(the agent finished without a summary)'}\n\n"
         f"## Files changed\n\n{file_list}\n\n"
@@ -698,7 +708,7 @@ def _tool_open_pull_request(target_app, args, run_ctx):
     pr_url, pr_error = _open_pr(
         target_app, run_ctx["git_branch"], run_ctx["work_item_description"], files,
         run_ctx["github_token"], run_ctx["correlation_id"], summary,
-        tests_passed=passed, stderr_tail=stderr,
+        tests_passed=passed, stderr_tail=stderr, work_item_id=run_ctx.get("work_item_id"),
     )
     if pr_url:
         return {"pr_url": pr_url, "tests_passed": passed}
@@ -738,9 +748,10 @@ def _handle_tool_call(payload):
     target_app = payload["target_app"]
     git_branch = payload["git_branch"]
     work_item_description = payload["work_item_description"]
+    work_item_id = payload.get("work_item_id")
     args = payload.get("args") or {}
 
-    head_branch = _head_branch_for(target_app, git_branch, work_item_description)
+    head_branch = _head_branch_for(target_app, git_branch, work_item_description, work_item_id)
     ok, err = _checkout_or_create_head_branch(target_app, git_branch, head_branch)
     if not ok:
         return {"error": err}
@@ -779,11 +790,12 @@ def run_single_action_job(payload):
     target_app = payload["target_app"]
     git_branch = payload["git_branch"]
     work_item_description = payload["work_item_description"]
+    work_item_id = payload.get("work_item_id")
     github_token = payload["github_token"]
     args = payload.get("args") or {}
     callback_url = payload["callback_url"]
 
-    head_branch = _head_branch_for(target_app, git_branch, work_item_description)
+    head_branch = _head_branch_for(target_app, git_branch, work_item_description, work_item_id)
 
     _set_status(correlation_id, state="checking_out_branch")
     ok, err = _checkout_or_create_head_branch(target_app, git_branch, head_branch)
@@ -815,6 +827,7 @@ def run_single_action_job(payload):
         run_ctx = {
             "git_branch": git_branch,
             "work_item_description": work_item_description,
+            "work_item_id": work_item_id,
             "github_token": github_token,
             "correlation_id": correlation_id,
         }
@@ -1031,6 +1044,7 @@ def run_job(payload):
     run_ctx = {
         "git_branch": git_branch,
         "work_item_description": work_item_description,
+        "work_item_id": payload.get("work_item_id"),
         "github_token": github_token,
         "correlation_id": correlation_id,
     }

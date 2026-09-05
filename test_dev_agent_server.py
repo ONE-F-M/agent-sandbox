@@ -452,3 +452,92 @@ class TestHandleToolCall(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHeadBranchForWorkItemId(unittest.TestCase):
+    def test_work_item_id_becomes_the_branch(self):
+        self.assertEqual(srv._head_branch_for("one_bpmn", "staging", "Fix the thing.", "WI-002322"), "WI-002322")
+
+    def test_same_work_item_converges_regardless_of_description(self):
+        a = srv._head_branch_for("one_bpmn", "staging", "Fix the thing.", "WI-002322")
+        b = srv._head_branch_for("one_bpmn", "staging", "Fix the thing, reworded.", "WI-002322")
+        self.assertEqual(a, b)
+
+    def test_unsafe_characters_are_sanitised_not_rejected(self):
+        self.assertEqual(srv._head_branch_for("a", "b", "c", " WI 002322 (rev 2)~ "), "WI-002322-rev-2")
+
+    def test_blank_or_unusable_id_falls_back_to_the_hash(self):
+        hashed = srv._head_branch_for("one_bpmn", "staging", "Fix the thing.")
+        for unusable in ("", None, "~~~", " / "):
+            self.assertEqual(srv._head_branch_for("one_bpmn", "staging", "Fix the thing.", unusable), hashed)
+
+
+class TestWorkItemIdThreading(unittest.TestCase):
+    def test_tool_call_uses_the_work_item_id_for_its_branch(self):
+        payload = {
+            "action": "list_files", "target_app": "one_bpmn", "git_branch": "staging",
+            "work_item_description": "Fix the thing.", "work_item_id": "WI-002322",
+            "args": {}, "github_token": "gh-token",
+        }
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(False, "stop here")) as checkout:
+            srv._handle_tool_call(payload)
+        checkout.assert_called_once_with("one_bpmn", "staging", "WI-002322")
+
+    def test_open_pull_request_passes_the_work_item_id_to_open_pr(self):
+        run_ctx = {
+            "git_branch": "staging", "work_item_description": "Fix it.", "work_item_id": "WI-002322",
+            "github_token": "gh-token", "correlation_id": "corr-1",
+        }
+        with patch.object(srv, "_collect_changed_files", return_value={"a.py": "x"}), patch.object(
+            srv, "_run_tests", return_value=(True, "", "")
+        ), patch.object(srv, "_open_pr", return_value=("https://github.com/x/y/pull/1", None)) as open_pr:
+            srv._tool_open_pull_request("one_bpmn", {"summary": "did it"}, run_ctx)
+        self.assertEqual(open_pr.call_args.kwargs["work_item_id"], "WI-002322")
+
+    def test_open_pr_puts_the_work_item_id_on_branch_title_and_body(self):
+        sent = []
+
+        def fake_request(method, url, token, ok=(200,), json_body=None):
+            sent.append((method, url, json_body))
+            if method == "GET" and "/git/ref/heads/" in url:
+                return {"object": {"sha": "base-sha"}}
+            if method == "POST" and url.endswith("/pulls"):
+                return {"html_url": "https://github.com/ONE-F-M/one_bpmn/pull/9", "number": 9}
+            return {}
+
+        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/one_bpmn"), patch.object(
+            srv, "_github_request", side_effect=fake_request
+        ):
+            pr_url, err = srv._open_pr(
+                "one_bpmn", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "changed a.py",
+                work_item_id="WI-002322",
+            )
+        self.assertIsNone(err)
+        self.assertEqual(pr_url, "https://github.com/ONE-F-M/one_bpmn/pull/9")
+        ref = next(b for m, u, b in sent if m == "POST" and u.endswith("/git/refs"))
+        self.assertEqual(ref["ref"], "refs/heads/WI-002322")
+        pr = next(b for m, u, b in sent if m == "POST" and u.endswith("/pulls"))
+        self.assertEqual(pr["head"], "WI-002322")
+        self.assertTrue(pr["title"].startswith("WI-002322: "))
+        self.assertIn("Work Item: **WI-002322**", pr["body"])
+
+    def test_without_a_work_item_id_nothing_changes(self):
+        """The hashed branch and the old title survive for callers that send no id."""
+        sent = []
+
+        def fake_request(method, url, token, ok=(200,), json_body=None):
+            sent.append((method, url, json_body))
+            if method == "GET" and "/git/ref/heads/" in url:
+                return {"object": {"sha": "base-sha"}}
+            if method == "POST" and url.endswith("/pulls"):
+                return {"html_url": "https://github.com/ONE-F-M/one_bpmn/pull/9", "number": 9}
+            return {}
+
+        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/one_bpmn"), patch.object(
+            srv, "_github_request", side_effect=fake_request
+        ):
+            srv._open_pr("one_bpmn", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "r")
+        pr = next(b for m, u, b in sent if m == "POST" and u.endswith("/pulls"))
+        self.assertEqual(pr["head"], srv._head_branch_for("one_bpmn", "staging", "Fix the thing."))
+        self.assertTrue(pr["title"].startswith("Dev Agent: "))
+        self.assertNotIn("Work Item:", pr["body"])
