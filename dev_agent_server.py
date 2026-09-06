@@ -139,6 +139,24 @@ REQUIRED_ACTION_FIELDS = (
 )
 
 
+_SAFE_APP = re.compile(r"\A[A-Za-z0-9_]{1,64}\Z")
+_SAFE_REF = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]{0,180}\Z")
+
+
+def _validate_identifiers(payload):
+    """target_app and git_branch are interpolated into shell commands, so they
+    are checked against what a real app directory and git ref may contain
+    before any of them runs. Rejected here rather than escaped later: a value
+    outside these sets is a caller bug, not something to sanitise and obey."""
+    app = str(payload.get("target_app") or "").strip()
+    if not _SAFE_APP.match(app):
+        return f"target_app {app!r} is not a valid app name (letters, digits and underscore only)."
+    ref = str(payload.get("git_branch") or "").strip()
+    if not _SAFE_REF.match(ref) or ".." in ref or ref.endswith((".lock", "/", ".")):
+        return f"git_branch {ref!r} is not a valid branch name."
+    return None
+
+
 def _validate_callback_url(payload):
     callback_url = payload["callback_url"]
     parsed = urllib.parse.urlparse(callback_url)
@@ -170,7 +188,7 @@ def _validate_payload(payload):
             )
         if not (payload.get("github_token") or "").strip():
             return "github_token must be a non-empty string"
-        return _validate_callback_url(payload)
+        return _validate_identifiers(payload) or _validate_callback_url(payload)
 
     missing = [f for f in REQUIRED_FIELDS if f not in payload]
     if missing:
@@ -201,7 +219,7 @@ def _validate_payload(payload):
     if not (payload.get("github_token") or "").strip():
         return "github_token must be a non-empty string"
 
-    return _validate_callback_url(payload)
+    return _validate_identifiers(payload) or _validate_callback_url(payload)
 
 
 def _validate_tool_call_payload(payload):
@@ -219,7 +237,7 @@ def _validate_tool_call_payload(payload):
         )
     if not isinstance(payload.get("args") or {}, dict):
         return "args must be an object"
-    return None
+    return _validate_identifiers(payload)
 
 
 def _run(cmd, **kwargs):
@@ -253,24 +271,24 @@ def _checkout_target_branch(target_app, git_branch):
         # gets stored on the AI Agent Run, so the token must never reach it.
         return text.replace(github_token, "***") if github_token else text
 
-    clean_url = _run(f"cd {app_dir} && git remote get-url origin").stdout.strip()
+    clean_url = _run(f"cd {shlex.quote(app_dir)} && git remote get-url origin").stdout.strip()
     authed = bool(github_token) and clean_url.startswith("https://github.com/")
     if authed:
         authed_url = clean_url.replace("https://github.com/", f"https://{github_token}@github.com/", 1)
-        _run(f"cd {app_dir} && git remote set-url origin {authed_url}")
+        _run(f"cd {shlex.quote(app_dir)} && git remote set-url origin {shlex.quote(authed_url)}")
     try:
-        fetch = _run(f"cd {app_dir} && git fetch origin {git_branch}")
+        fetch = _run(f"cd {shlex.quote(app_dir)} && git fetch origin {shlex.quote(git_branch)}")
         if fetch.returncode != 0:
             return False, f"git fetch failed: {_scrub(fetch.stderr)}"
         checkout = _run(
-            f"cd {app_dir} && git checkout {git_branch} || git checkout -b {git_branch} origin/{git_branch}"
+            f"cd {shlex.quote(app_dir)} && git checkout {shlex.quote(git_branch)} || git checkout -b {shlex.quote(git_branch)} origin/{shlex.quote(git_branch)}"
         )
         if checkout.returncode != 0:
             return False, f"git checkout failed: {_scrub(checkout.stderr)}"
         return True, None
     finally:
         if authed:
-            _run(f"cd {app_dir} && git remote set-url origin {clean_url}")
+            _run(f"cd {shlex.quote(app_dir)} && git remote set-url origin {shlex.quote(clean_url)}")
 
 
 @contextlib.contextmanager
@@ -280,16 +298,16 @@ def _authed_remote(app_dir, github_token):
     bake-time clone stages' own remote-scrubbing (lib_clone_functions.sh's
     _normalize_remote; a token left in .git/config would otherwise persist
     on disk between calls)."""
-    clean_url = _run(f"cd {app_dir} && git remote get-url origin").stdout.strip()
+    clean_url = _run(f"cd {shlex.quote(app_dir)} && git remote get-url origin").stdout.strip()
     authed = bool(github_token) and clean_url.startswith("https://github.com/")
     if authed:
         authed_url = clean_url.replace("https://github.com/", f"https://{github_token}@github.com/", 1)
-        _run(f"cd {app_dir} && git remote set-url origin {authed_url}")
+        _run(f"cd {shlex.quote(app_dir)} && git remote set-url origin {shlex.quote(authed_url)}")
     try:
         yield
     finally:
         if authed:
-            _run(f"cd {app_dir} && git remote set-url origin {clean_url}")
+            _run(f"cd {shlex.quote(app_dir)} && git remote set-url origin {shlex.quote(clean_url)}")
 
 
 _BRANCH_UNSAFE = re.compile(r"[^A-Za-z0-9._/-]+")
@@ -332,27 +350,27 @@ def _checkout_or_create_head_branch(target_app, git_branch, head_branch):
         return text.replace(github_token, "***") if github_token else text
 
     with _authed_remote(app_dir, github_token):
-        fetch_head = _run(f"cd {app_dir} && git fetch origin {head_branch}")
+        fetch_head = _run(f"cd {shlex.quote(app_dir)} && git fetch origin {shlex.quote(head_branch)}")
         if fetch_head.returncode == 0:
             checkout = _run(
-                f"cd {app_dir} && git checkout {head_branch} || git checkout -b {head_branch} origin/{head_branch}"
+                f"cd {shlex.quote(app_dir)} && git checkout {shlex.quote(head_branch)} || git checkout -b {shlex.quote(head_branch)} origin/{shlex.quote(head_branch)}"
             )
             if checkout.returncode != 0:
                 return False, f"git checkout of {head_branch} failed: {_scrub(checkout.stderr)}"
             return True, None
 
-        fetch_base = _run(f"cd {app_dir} && git fetch origin {git_branch}")
+        fetch_base = _run(f"cd {shlex.quote(app_dir)} && git fetch origin {shlex.quote(git_branch)}")
         if fetch_base.returncode != 0:
             return False, f"git fetch of base branch {git_branch} failed: {_scrub(fetch_base.stderr)}"
         checkout_base = _run(
-            f"cd {app_dir} && git checkout {git_branch} || git checkout -b {git_branch} origin/{git_branch}"
+            f"cd {shlex.quote(app_dir)} && git checkout {shlex.quote(git_branch)} || git checkout -b {shlex.quote(git_branch)} origin/{shlex.quote(git_branch)}"
         )
         if checkout_base.returncode != 0:
             return False, f"git checkout of base branch {git_branch} failed: {_scrub(checkout_base.stderr)}"
-        new_branch = _run(f"cd {app_dir} && git checkout -B {head_branch}")
+        new_branch = _run(f"cd {shlex.quote(app_dir)} && git checkout -B {shlex.quote(head_branch)}")
         if new_branch.returncode != 0:
             return False, f"git checkout -B {head_branch} failed: {_scrub(new_branch.stderr)}"
-        push = _run(f"cd {app_dir} && git push -u origin {head_branch}")
+        push = _run(f"cd {shlex.quote(app_dir)} && git push -u origin {shlex.quote(head_branch)}")
         if push.returncode != 0:
             return False, f"git push of {head_branch} failed: {_scrub(push.stderr)}"
         return True, None
@@ -367,7 +385,7 @@ def _commit_and_push(target_app, head_branch, path, message):
     app_dir = f"{BENCH_DIR}/apps/{target_app}"
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
     with _authed_remote(app_dir, github_token):
-        _run(f"cd {app_dir} && git add -- {shlex.quote(path)}")
+        _run(f"cd {shlex.quote(app_dir)} && git add -- {shlex.quote(path)}")
         commit = _run(
             f"cd {app_dir} && git -c user.email=dev-agent@sandbox -c user.name='Dev Agent' "
             f"commit -q -m {shlex.quote(message)}"
@@ -376,7 +394,7 @@ def _commit_and_push(target_app, head_branch, path, message):
             # Nothing to commit (e.g. a write_file that produced identical
             # content) isn't a failure worth surfacing to the model.
             return True, None
-        push = _run(f"cd {app_dir} && git push origin {head_branch}")
+        push = _run(f"cd {shlex.quote(app_dir)} && git push origin {shlex.quote(head_branch)}")
         if push.returncode != 0:
             return False, push.stderr[-1000:]
         return True, None
@@ -386,7 +404,7 @@ def _migrate_site():
     # Cheap once the site is baked (mostly a no-op) — necessary because the
     # branch just checked out for the target app can carry schema changes
     # the baked snapshot doesn't have yet.
-    result = _run(f"cd {BENCH_DIR} && bench --site {SITE_NAME} migrate --skip-failing", timeout=600)
+    result = _run(f"cd {shlex.quote(BENCH_DIR)} && bench --site {shlex.quote(SITE_NAME)} migrate --skip-failing", timeout=600)
     return result.returncode == 0, result.stdout[-2000:], result.stderr[-2000:]
 
 
@@ -399,10 +417,10 @@ def _run_tests(target_app):
     # for a single dispatched change.
     if target_app == "mobile_app_ionic":
         app_dir = f"{BENCH_DIR}/apps/{target_app}"
-        build = _run(f"cd {app_dir} && yarn build", timeout=900)
+        build = _run(f"cd {shlex.quote(app_dir)} && yarn build", timeout=900)
         if build.returncode != 0:
             return False, build.stdout[-4000:], build.stderr[-4000:]
-        test = _run(f"cd {app_dir} && yarn test:unit", timeout=900)
+        test = _run(f"cd {shlex.quote(app_dir)} && yarn test:unit", timeout=900)
         stdout = (build.stdout + test.stdout)[-4000:]
         stderr = (build.stderr + test.stderr)[-4000:]
         return test.returncode == 0, stdout, stderr
@@ -418,7 +436,7 @@ def _run_tests(target_app):
     # gap, not a fix for it — one_fm's own bug is untouched and would still
     # break a real Company/Warehouse creation anywhere else it happens.
     result = _run(
-        f"cd {BENCH_DIR} && bench --site {SITE_NAME} run-tests --app {target_app} --skip-before-tests",
+        f"cd {shlex.quote(BENCH_DIR)} && bench --site {shlex.quote(SITE_NAME)} run-tests --app {shlex.quote(target_app)} --skip-before-tests",
         timeout=1800,
     )
     return result.returncode == 0, result.stdout[-4000:], result.stderr[-4000:]
@@ -431,10 +449,10 @@ def _collect_changed_files(target_app, base_branch=None):
     app_dir = f"{BENCH_DIR}/apps/{target_app}"
     paths = []
     if base_branch:
-        committed = _run(f"cd {app_dir} && git diff --name-only {base_branch}...HEAD")
+        committed = _run(f"cd {shlex.quote(app_dir)} && git diff --name-only {shlex.quote(base_branch)}...HEAD")
         if committed.returncode == 0:
             paths += committed.stdout.strip().splitlines()
-    pending = _run(f"cd {app_dir} && git diff --name-only HEAD")
+    pending = _run(f"cd {shlex.quote(app_dir)} && git diff --name-only HEAD")
     if pending.returncode == 0:
         paths += pending.stdout.strip().splitlines()
 
@@ -483,7 +501,7 @@ def _repo_for_local_clone(target_app):
     """"owner/repo" from the remote this app was already cloned from —
     the same repo _checkout_target_branch just fetched and checked out."""
     app_dir = f"{BENCH_DIR}/apps/{target_app}"
-    result = _run(f"cd {app_dir} && git remote get-url origin")
+    result = _run(f"cd {shlex.quote(app_dir)} && git remote get-url origin")
     if result.returncode != 0:
         return None
     match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", result.stdout.strip())
