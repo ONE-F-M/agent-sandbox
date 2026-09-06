@@ -698,7 +698,15 @@ def _tool_edit_file(app_dir, args):
     return {"edited": True, "path": path}
 
 
-_LIST_FILES_MAX = 500
+# Confirmed live: one_bpmn alone (one target app, not the whole bench) already
+# has 738 files under its own tree — a 500 cap silently truncated a real
+# listing, and the model never acted on the "truncated": true it was given,
+# spent its whole turn budget guessing narrower path_prefix values for a
+# file that (separately) did not exist, and never finished. Raised well
+# past any single target app's realistic size so truncation stops being
+# the common case; still bounded so a pathological repo can't return an
+# unbounded response.
+_LIST_FILES_MAX = 5000
 
 
 def _tool_list_files(app_dir, args):

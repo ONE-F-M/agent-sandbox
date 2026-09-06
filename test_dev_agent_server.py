@@ -136,6 +136,50 @@ class TestEditFile(unittest.TestCase):
         self.assertIn("error", result)
 
 
+class TestListFiles(unittest.TestCase):
+    """Confirmed live (2026-09-06): a 500-file cap silently truncated a real
+    listing (one_bpmn alone has 738 files), and the model never acted on the
+    truncated flag it was given — it just kept guessing narrower
+    path_prefix values for a file that (separately) turned out not to
+    exist, and burned its whole turn budget without ever finishing. The cap
+    itself is still real (a pathological repo must not return an unbounded
+    response) — these tests fix the boundary at a small, testable size."""
+
+    def setUp(self):
+        self.app_dir = os.path.realpath(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.app_dir, ignore_errors=True)
+
+    def _make_files(self, count):
+        for i in range(count):
+            path = os.path.join(self.app_dir, f"file_{i:04d}.txt")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("x")
+
+    def test_under_the_cap_is_not_truncated(self):
+        self._make_files(5)
+        with patch.object(srv, "_LIST_FILES_MAX", 10):
+            result = srv._tool_list_files(self.app_dir, {})
+        self.assertEqual(result["count"], 5)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(len(result["files"]), 5)
+
+    def test_over_the_cap_is_truncated_at_exactly_the_cap(self):
+        self._make_files(15)
+        with patch.object(srv, "_LIST_FILES_MAX", 10):
+            result = srv._tool_list_files(self.app_dir, {})
+        self.assertEqual(result["count"], 10)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["files"]), 10)
+
+    def test_default_cap_covers_a_realistic_target_app(self):
+        """The real one_bpmn app alone has 738 files under its own tree
+        (confirmed live) — the default cap must clear that with headroom,
+        not just the boundary this test asserts."""
+        self.assertGreater(srv._LIST_FILES_MAX, 738)
+
+
 class TestDispatchToolRouting(unittest.TestCase):
     def setUp(self):
         self.app_dir = tempfile.mkdtemp()
