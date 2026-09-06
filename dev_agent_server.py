@@ -280,9 +280,7 @@ def _checkout_target_branch(target_app, git_branch):
         fetch = _run(f"cd {shlex.quote(app_dir)} && git fetch origin {shlex.quote(git_branch)}")
         if fetch.returncode != 0:
             return False, f"git fetch failed: {_scrub(fetch.stderr)}"
-        checkout = _run(
-            f"cd {shlex.quote(app_dir)} && git checkout {shlex.quote(git_branch)} || git checkout -b {shlex.quote(git_branch)} origin/{shlex.quote(git_branch)}"
-        )
+        checkout = _run(f"cd {shlex.quote(app_dir)} && git checkout -B {shlex.quote(git_branch)} FETCH_HEAD")
         if checkout.returncode != 0:
             return False, f"git checkout failed: {_scrub(checkout.stderr)}"
         return True, None
@@ -334,6 +332,12 @@ def _head_branch_for(target_app, git_branch, work_item_description, work_item_id
     return f"dev-agent/{work_hash}"
 
 
+# Both checkouts take FETCH_HEAD rather than a local or remote-tracking branch.
+# The local base branch is whatever the image was baked with — every run built on
+# it was 44 commits behind — and on a single-branch clone origin/<branch> never
+# exists for anything but the clone's own branch, which broke retries of a Work
+# Item on a fresh instance. What was just fetched is the one ref that is always
+# present and always current.
 def _checkout_or_create_head_branch(target_app, git_branch, head_branch):
     """Like _checkout_target_branch, but for a branch that may not exist
     remotely yet: every one of the 6 sandbox tools is now its own,
@@ -352,9 +356,7 @@ def _checkout_or_create_head_branch(target_app, git_branch, head_branch):
     with _authed_remote(app_dir, github_token):
         fetch_head = _run(f"cd {shlex.quote(app_dir)} && git fetch origin {shlex.quote(head_branch)}")
         if fetch_head.returncode == 0:
-            checkout = _run(
-                f"cd {shlex.quote(app_dir)} && git checkout {shlex.quote(head_branch)} || git checkout -b {shlex.quote(head_branch)} origin/{shlex.quote(head_branch)}"
-            )
+            checkout = _run(f"cd {shlex.quote(app_dir)} && git checkout -B {shlex.quote(head_branch)} FETCH_HEAD")
             if checkout.returncode != 0:
                 return False, f"git checkout of {head_branch} failed: {_scrub(checkout.stderr)}"
             return True, None
@@ -362,9 +364,7 @@ def _checkout_or_create_head_branch(target_app, git_branch, head_branch):
         fetch_base = _run(f"cd {shlex.quote(app_dir)} && git fetch origin {shlex.quote(git_branch)}")
         if fetch_base.returncode != 0:
             return False, f"git fetch of base branch {git_branch} failed: {_scrub(fetch_base.stderr)}"
-        checkout_base = _run(
-            f"cd {shlex.quote(app_dir)} && git checkout {shlex.quote(git_branch)} || git checkout -b {shlex.quote(git_branch)} origin/{shlex.quote(git_branch)}"
-        )
+        checkout_base = _run(f"cd {shlex.quote(app_dir)} && git checkout -B {shlex.quote(git_branch)} FETCH_HEAD")
         if checkout_base.returncode != 0:
             return False, f"git checkout of base branch {git_branch} failed: {_scrub(checkout_base.stderr)}"
         new_branch = _run(f"cd {shlex.quote(app_dir)} && git checkout -B {shlex.quote(head_branch)}")

@@ -721,3 +721,54 @@ class TestShellIdentifiersAreValidated(unittest.TestCase):
         bare = [l.strip() for l in source.splitlines()
                 if "_run(f" in l and _re.search(r"\{(?!shlex\.quote)[a-z_]+\}", l)]
         self.assertEqual(bare, [])
+
+
+class TestCheckoutTakesWhatWasJustFetched(unittest.TestCase):
+    """The base branch must be origin's current tip, not the one baked into the
+    image, and an existing head branch must be reachable on any instance."""
+
+    @staticmethod
+    def _fake(exists_remotely):
+        def fake_run(cmd, **kwargs):
+            if "git remote get-url origin" in cmd:
+                return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
+            if "git fetch origin WI-003239" in cmd:
+                return _FakeCompletedProcess(0 if exists_remotely else 1, stderr="" if exists_remotely else "couldn't find remote ref")
+            return _FakeCompletedProcess(0)
+        return fake_run
+
+    def test_new_head_branch_starts_from_the_fetched_base_not_the_local_one(self):
+        calls = []
+        def fake(cmd, **kw):
+            calls.append(cmd); return self._fake(False)(cmd, **kw)
+        with patch.object(srv, "_run", side_effect=fake):
+            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "WI-003239")
+        self.assertTrue(ok, err)
+        fetch = next(i for i, c in enumerate(calls) if "git fetch origin staging" in c)
+        base = next(i for i, c in enumerate(calls) if "git checkout -B staging FETCH_HEAD" in c)
+        head = next(i for i, c in enumerate(calls) if "git checkout -B WI-003239" in c and "FETCH_HEAD" not in c)
+        self.assertLess(fetch, base); self.assertLess(base, head)
+        self.assertFalse(any("origin/staging" in c for c in calls))
+
+    def test_existing_head_branch_is_checked_out_from_fetch_head_on_any_instance(self):
+        calls = []
+        def fake(cmd, **kw):
+            calls.append(cmd); return self._fake(True)(cmd, **kw)
+        with patch.object(srv, "_run", side_effect=fake):
+            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "WI-003239")
+        self.assertTrue(ok, err)
+        self.assertTrue(any("git checkout -B WI-003239 FETCH_HEAD" in c for c in calls))
+        self.assertFalse(any("origin/WI-003239" in c for c in calls))
+        self.assertFalse(any("git push" in c for c in calls))
+
+    def test_bundled_path_also_resets_the_base_to_the_fetched_tip(self):
+        calls = []
+        def fake(cmd, **kw):
+            calls.append(cmd)
+            if "git remote get-url origin" in cmd:
+                return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
+            return _FakeCompletedProcess(0)
+        with patch.object(srv, "_run", side_effect=fake):
+            ok, err = srv._checkout_target_branch("one_bpmn", "staging")
+        self.assertTrue(ok, err)
+        self.assertTrue(any("git checkout -B staging FETCH_HEAD" in c for c in calls))
