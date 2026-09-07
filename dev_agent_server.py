@@ -280,7 +280,13 @@ def _checkout_target_branch(target_app, git_branch):
         fetch = _run(f"cd {shlex.quote(app_dir)} && git fetch origin {shlex.quote(git_branch)}")
         if fetch.returncode != 0:
             return False, f"git fetch failed: {_scrub(fetch.stderr)}"
-        checkout = _run(f"cd {shlex.quote(app_dir)} && git checkout -B {shlex.quote(git_branch)} FETCH_HEAD")
+        # -f: the app dirs are cloned once at bake time, not fresh per run, so
+        # a tracked file can already differ from FETCH_HEAD before this call
+        # ever runs (e.g. a line-ending mismatch baked into the image) — a
+        # plain checkout refuses instead of switching. Nothing on this disk
+        # between calls is meant to survive anyway (see the comment above
+        # _checkout_or_create_head_branch), so discarding it here is safe.
+        checkout = _run(f"cd {shlex.quote(app_dir)} && git checkout -f -B {shlex.quote(git_branch)} FETCH_HEAD")
         if checkout.returncode != 0:
             return False, f"git checkout failed: {_scrub(checkout.stderr)}"
         return True, None
@@ -356,7 +362,9 @@ def _checkout_or_create_head_branch(target_app, git_branch, head_branch):
     with _authed_remote(app_dir, github_token):
         fetch_head = _run(f"cd {shlex.quote(app_dir)} && git fetch origin {shlex.quote(head_branch)}")
         if fetch_head.returncode == 0:
-            checkout = _run(f"cd {shlex.quote(app_dir)} && git checkout -B {shlex.quote(head_branch)} FETCH_HEAD")
+            # -f: see _checkout_target_branch — the working tree can already
+            # be dirty from bake time, and nothing in it is worth keeping.
+            checkout = _run(f"cd {shlex.quote(app_dir)} && git checkout -f -B {shlex.quote(head_branch)} FETCH_HEAD")
             if checkout.returncode != 0:
                 return False, f"git checkout of {head_branch} failed: {_scrub(checkout.stderr)}"
             return True, None
@@ -364,7 +372,8 @@ def _checkout_or_create_head_branch(target_app, git_branch, head_branch):
         fetch_base = _run(f"cd {shlex.quote(app_dir)} && git fetch origin {shlex.quote(git_branch)}")
         if fetch_base.returncode != 0:
             return False, f"git fetch of base branch {git_branch} failed: {_scrub(fetch_base.stderr)}"
-        checkout_base = _run(f"cd {shlex.quote(app_dir)} && git checkout -B {shlex.quote(git_branch)} FETCH_HEAD")
+        # -f: see _checkout_target_branch.
+        checkout_base = _run(f"cd {shlex.quote(app_dir)} && git checkout -f -B {shlex.quote(git_branch)} FETCH_HEAD")
         if checkout_base.returncode != 0:
             return False, f"git checkout of base branch {git_branch} failed: {_scrub(checkout_base.stderr)}"
         new_branch = _run(f"cd {shlex.quote(app_dir)} && git checkout -B {shlex.quote(head_branch)}")

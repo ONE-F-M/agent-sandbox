@@ -745,7 +745,7 @@ class TestCheckoutTakesWhatWasJustFetched(unittest.TestCase):
             ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "WI-003239")
         self.assertTrue(ok, err)
         fetch = next(i for i, c in enumerate(calls) if "git fetch origin staging" in c)
-        base = next(i for i, c in enumerate(calls) if "git checkout -B staging FETCH_HEAD" in c)
+        base = next(i for i, c in enumerate(calls) if "git checkout -f -B staging FETCH_HEAD" in c)
         head = next(i for i, c in enumerate(calls) if "git checkout -B WI-003239" in c and "FETCH_HEAD" not in c)
         self.assertLess(fetch, base); self.assertLess(base, head)
         self.assertFalse(any("origin/staging" in c for c in calls))
@@ -757,7 +757,7 @@ class TestCheckoutTakesWhatWasJustFetched(unittest.TestCase):
         with patch.object(srv, "_run", side_effect=fake):
             ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "WI-003239")
         self.assertTrue(ok, err)
-        self.assertTrue(any("git checkout -B WI-003239 FETCH_HEAD" in c for c in calls))
+        self.assertTrue(any("git checkout -f -B WI-003239 FETCH_HEAD" in c for c in calls))
         self.assertFalse(any("origin/WI-003239" in c for c in calls))
         self.assertFalse(any("git push" in c for c in calls))
 
@@ -771,4 +771,37 @@ class TestCheckoutTakesWhatWasJustFetched(unittest.TestCase):
         with patch.object(srv, "_run", side_effect=fake):
             ok, err = srv._checkout_target_branch("one_bpmn", "staging")
         self.assertTrue(ok, err)
-        self.assertTrue(any("git checkout -B staging FETCH_HEAD" in c for c in calls))
+        self.assertTrue(any("git checkout -f -B staging FETCH_HEAD" in c for c in calls))
+
+
+class TestCheckoutForcesPastBakeTimeDrift(unittest.TestCase):
+    """Confirmed live (2026-09-07): a work order failed with "git checkout of
+    base branch staging failed: ... Your local changes to the following
+    files would be overwritten by checkout: one_fm/patches.txt" — a tracked
+    file already differed from FETCH_HEAD before the Dev Agent's own
+    checkout ever ran, because the app dirs are cloned once at image bake
+    time, not fresh per run. A plain `git checkout -B ... FETCH_HEAD`
+    refuses rather than switch; nothing on that disk between calls is meant
+    to survive (the pushed branch is the only durable state), so every
+    FETCH_HEAD checkout must force past this instead of failing the run."""
+
+    def test_every_fetch_head_checkout_site_forces_past_a_dirty_tree(self):
+        for fn, args in (
+            (srv._checkout_target_branch, ("one_bpmn", "staging")),
+            (srv._checkout_or_create_head_branch, ("one_bpmn", "staging", "WI-003239")),
+        ):
+            calls = []
+            def fake(cmd, **kw):
+                calls.append(cmd)
+                if "git remote get-url origin" in cmd:
+                    return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
+                if "git fetch origin WI-003239" in cmd:
+                    return _FakeCompletedProcess(1, stderr="couldn't find remote ref")
+                return _FakeCompletedProcess(0)
+            with patch.object(srv, "_run", side_effect=fake):
+                ok, err = fn(*args)
+            self.assertTrue(ok, err)
+            fetch_head_checkouts = [c for c in calls if "FETCH_HEAD" in c and "git checkout" in c]
+            self.assertTrue(fetch_head_checkouts, f"no FETCH_HEAD checkout issued for {fn.__name__}")
+            for c in fetch_head_checkouts:
+                self.assertIn("git checkout -f -B", c, f"{fn.__name__} checked out without -f: {c!r}")
