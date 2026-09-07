@@ -717,6 +717,15 @@ def _tool_edit_file(app_dir, args):
 # unbounded response.
 _LIST_FILES_MAX = 5000
 
+# Confirmed live (2026-09-07): an unscoped call on a real app (no narrow
+# path_prefix) hit this file-count cap and returned a ~277KB listing —
+# every turn afterward re-sent that same blob as part of the transcript,
+# so one list_files call alone accounted for the bulk of a run's token
+# usage. The count cap bounds pathological depth; this bounds the size of
+# what a single ordinary call can cost, independent of how many files that
+# turns out to be.
+_LIST_FILES_MAX_CHARS = 50_000
+
 
 def _tool_list_files(app_dir, args):
     prefix = (args.get("path_prefix") or "").strip().lstrip("/")
@@ -725,12 +734,14 @@ def _tool_list_files(app_dir, args):
     except ValueError as exc:
         return {"error": str(exc)}
     paths = []
+    chars = 0
     for root, dirs, filenames in os.walk(start_dir):
         dirs[:] = [d for d in dirs if d != ".git"]
         for name in filenames:
             rel = os.path.relpath(os.path.join(root, name), app_dir)
             paths.append(rel)
-            if len(paths) >= _LIST_FILES_MAX:
+            chars += len(rel) + 1  # +1: comma/quote overhead, close enough to bound intent
+            if len(paths) >= _LIST_FILES_MAX or chars >= _LIST_FILES_MAX_CHARS:
                 return {"files": paths, "count": len(paths), "truncated": True}
     return {"files": paths, "count": len(paths), "truncated": False}
 

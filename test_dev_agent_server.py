@@ -179,6 +179,27 @@ class TestListFiles(unittest.TestCase):
         not just the boundary this test asserts."""
         self.assertGreater(srv._LIST_FILES_MAX, 738)
 
+    def test_a_size_cap_truncates_before_the_count_cap_does(self):
+        """Confirmed live (2026-09-07): an unscoped call on a real app returned
+        a ~277KB listing well under the 5000-file count cap — one call alone
+        accounted for the bulk of a run's token usage, resent on every later
+        turn. Long paths must trip a size limit before the count ever does."""
+        self._make_files(50)  # ~14 chars each ≈ 700 chars total — count cap (10) won't fire
+        with patch.object(srv, "_LIST_FILES_MAX", 1000), patch.object(srv, "_LIST_FILES_MAX_CHARS", 100):
+            result = srv._tool_list_files(self.app_dir, {})
+        self.assertTrue(result["truncated"])
+        self.assertLess(result["count"], 50)
+
+    def test_under_both_caps_is_not_truncated(self):
+        self._make_files(5)
+        with patch.object(srv, "_LIST_FILES_MAX", 1000), patch.object(srv, "_LIST_FILES_MAX_CHARS", 100_000):
+            result = srv._tool_list_files(self.app_dir, {})
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["count"], 5)
+
+    def test_default_size_cap_is_well_under_the_277kb_seen_live(self):
+        self.assertLess(srv._LIST_FILES_MAX_CHARS, 277_000)
+
 
 class TestDispatchToolRouting(unittest.TestCase):
     def setUp(self):
