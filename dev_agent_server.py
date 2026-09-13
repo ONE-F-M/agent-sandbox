@@ -651,11 +651,29 @@ def _tool_read_file(app_dir, args):
         return {"error": str(exc)}
     try:
         with open(abs_path, "r", encoding="utf-8") as fh:
-            return {"found": True, "content": fh.read()}
+            lines = fh.readlines()
     except FileNotFoundError:
         return {"found": False, "content": ""}
     except (OSError, UnicodeDecodeError) as exc:
         return {"error": str(exc)}
+
+    offset, limit = args.get("offset"), args.get("limit")
+    if offset is None and limit is None:
+        return {"found": True, "content": "".join(lines)}
+
+    # 1-indexed, inclusive — matches how line numbers get cited in work
+    # orders (e.g. "observability.py:620-653"). Confirmed live: without
+    # this, a model working from cited line numbers re-read a large file
+    # whole a dozen-plus times trying to reconcile them, burning most of
+    # its turn budget before ever writing anything.
+    start = max(0, (offset or 1) - 1)
+    end = start + limit if limit else len(lines)
+    return {
+        "found": True,
+        "content": "".join(lines[start:end]),
+        "total_lines": len(lines),
+        "returned_lines": f"{start + 1}-{min(end, len(lines))}",
+    }
 
 
 def _tool_write_file(app_dir, args):

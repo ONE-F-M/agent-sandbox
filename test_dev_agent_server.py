@@ -74,6 +74,38 @@ class TestValidatePayloadTools(unittest.TestCase):
         self.assertIsNone(srv._validate_payload(_valid_payload(tools=tools)))
 
 
+class TestReadFile(unittest.TestCase):
+    def setUp(self):
+        self.app_dir = os.path.realpath(tempfile.mkdtemp())
+        self._write("f.py", "".join(f"line{i}\n" for i in range(1, 11)))  # 10 lines
+
+    def tearDown(self):
+        shutil.rmtree(self.app_dir, ignore_errors=True)
+
+    def _write(self, rel_path, content):
+        with open(os.path.join(self.app_dir, rel_path), "w", encoding="utf-8") as fh:
+            fh.write(content)
+
+    def test_no_offset_or_limit_returns_the_whole_file(self):
+        result = srv._tool_read_file(self.app_dir, {"path": "f.py"})
+        self.assertEqual(result["content"], "".join(f"line{i}\n" for i in range(1, 11)))
+        self.assertNotIn("total_lines", result)
+
+    def test_offset_and_limit_return_a_1_indexed_inclusive_slice(self):
+        result = srv._tool_read_file(self.app_dir, {"path": "f.py", "offset": 3, "limit": 2})
+        self.assertEqual(result["content"], "line3\nline4\n")
+        self.assertEqual(result["total_lines"], 10)
+        self.assertEqual(result["returned_lines"], "3-4")
+
+    def test_offset_alone_reads_to_end_of_file(self):
+        result = srv._tool_read_file(self.app_dir, {"path": "f.py", "offset": 9})
+        self.assertEqual(result["content"], "line9\nline10\n")
+
+    def test_missing_file_is_still_reported_as_not_found(self):
+        result = srv._tool_read_file(self.app_dir, {"path": "nope.py", "offset": 1})
+        self.assertEqual(result, {"found": False, "content": ""})
+
+
 class TestEditFile(unittest.TestCase):
     def setUp(self):
         # realpath: on macOS, mkdtemp() returns a path through a symlink
