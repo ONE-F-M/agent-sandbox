@@ -385,7 +385,18 @@ def _checkout_or_create_head_branch(target_app, git_branch, head_branch):
         return True, None
 
 
-def _commit_and_push(target_app, head_branch, path, message):
+def _git_identity_for(agent_name):
+    """(user.name, user.email) for a commit author, derived from the calling
+    Processa agent's own name instead of a fixed 'Dev Agent' literal — every
+    sandbox agent (Dev Agent, Bug Agent, any future one) shares this same
+    disposable sandbox, so the identity has to come from the request, not
+    from a constant baked in when this file only served Dev Agent."""
+    name = (agent_name or "Dev Agent").strip() or "Dev Agent"
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "dev-agent"
+    return name, f"{slug}@sandbox"
+
+
+def _commit_and_push(target_app, head_branch, path, message, agent_name="Dev Agent"):
     """Durably records a write_file/edit_file change on the head branch
     immediately — not left as a local, uncommitted change — so the NEXT
     tool call for this work order (run_tests, open_pull_request, or even
@@ -393,10 +404,11 @@ def _commit_and_push(target_app, head_branch, path, message):
     serves that call."""
     app_dir = f"{BENCH_DIR}/apps/{target_app}"
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    user_name, user_email = _git_identity_for(agent_name)
     with _authed_remote(app_dir, github_token):
         _run(f"cd {shlex.quote(app_dir)} && git add -- {shlex.quote(path)}")
         commit = _run(
-            f"cd {app_dir} && git -c user.email=dev-agent@sandbox -c user.name='Dev Agent' "
+            f"cd {app_dir} && git -c user.email={shlex.quote(user_email)} -c user.name={shlex.quote(user_name)} "
             f"commit -q -m {shlex.quote(message)}"
         )
         if commit.returncode != 0:
@@ -519,7 +531,7 @@ def _repo_for_local_clone(target_app):
 
 def _open_pr(
     target_app, git_branch, work_item_description, files, github_token, correlation_id, agent_report,
-    tests_passed=True, stderr_tail="", work_item_id=None,
+    tests_passed=True, stderr_tail="", work_item_id=None, agent_name="Dev Agent",
 ):
     """Create a branch off git_branch, commit every changed file via the
     Contents API, and open a PR. Returns (pr_url, None) on success or
@@ -543,7 +555,7 @@ def _open_pr(
     head_branch = _head_branch_for(target_app, git_branch, work_item_description, work_item_id)
     work_item_id = (work_item_id or "").strip()
     title_prefix = "" if tests_passed else "⚠️ Tests failed: "
-    subject = f"{work_item_id}: {work_item_description[:72]}" if work_item_id else f"Dev Agent: {work_item_description[:72]}"
+    subject = f"{work_item_id}: {work_item_description[:72]}" if work_item_id else f"{agent_name}: {work_item_description[:72]}"
     title = f"{title_prefix}{subject}"
     file_list = "\n".join(f"- `{path}`" for path in sorted(files))
     if tests_passed:
@@ -786,6 +798,7 @@ def _tool_open_pull_request(target_app, args, run_ctx):
         target_app, run_ctx["git_branch"], run_ctx["work_item_description"], files,
         run_ctx["github_token"], run_ctx["correlation_id"], summary,
         tests_passed=passed, stderr_tail=stderr, work_item_id=run_ctx.get("work_item_id"),
+        agent_name=run_ctx.get("agent_name") or "Dev Agent",
     )
     if pr_url:
         return {"pr_url": pr_url, "tests_passed": passed}
@@ -827,6 +840,7 @@ def _handle_tool_call(payload):
     work_item_description = payload["work_item_description"]
     work_item_id = payload.get("work_item_id")
     args = payload.get("args") or {}
+    agent_name = (payload.get("agent_name") or "Dev Agent").strip() or "Dev Agent"
 
     head_branch = _head_branch_for(target_app, git_branch, work_item_description, work_item_id)
     ok, err = _checkout_or_create_head_branch(target_app, git_branch, head_branch)
@@ -841,14 +855,18 @@ def _handle_tool_call(payload):
     if action == "write_file":
         result = _tool_write_file(app_dir, args)
         if result.get("written"):
-            ok, err = _commit_and_push(target_app, head_branch, args.get("path") or "", "write_file via Dev Agent")
+            ok, err = _commit_and_push(
+                target_app, head_branch, args.get("path") or "", f"write_file via {agent_name}", agent_name,
+            )
             if not ok:
                 result["commit_error"] = err
         return result
     if action == "edit_file":
         result = _tool_edit_file(app_dir, args)
         if result.get("edited"):
-            ok, err = _commit_and_push(target_app, head_branch, args.get("path") or "", "edit_file via Dev Agent")
+            ok, err = _commit_and_push(
+                target_app, head_branch, args.get("path") or "", f"edit_file via {agent_name}", agent_name,
+            )
             if not ok:
                 result["commit_error"] = err
         return result
@@ -920,6 +938,7 @@ def run_single_action_job(payload):
             "work_item_id": work_item_id,
             "github_token": github_token,
             "correlation_id": correlation_id,
+            "agent_name": payload.get("agent_name"),
         }
         _set_status(correlation_id, state="opening_pr")
         result = _tool_open_pull_request(target_app, args, run_ctx)
@@ -1137,6 +1156,7 @@ def run_job(payload):
         "work_item_id": payload.get("work_item_id"),
         "github_token": github_token,
         "correlation_id": correlation_id,
+        "agent_name": payload.get("agent_name"),
     }
     try:
         loop_result = _run_coding_loop(target_app, work_item_description, agent_config, tools, run_ctx)

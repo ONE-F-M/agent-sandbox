@@ -858,3 +858,156 @@ class TestCheckoutForcesPastBakeTimeDrift(unittest.TestCase):
             self.assertTrue(fetch_head_checkouts, f"no FETCH_HEAD checkout issued for {fn.__name__}")
             for c in fetch_head_checkouts:
                 self.assertIn("git checkout -f -B", c, f"{fn.__name__} checked out without -f: {c!r}")
+
+
+class TestGitIdentityFor(unittest.TestCase):
+    """_commit_and_push used to hardcode 'Dev Agent' <dev-agent@sandbox> on
+    every commit regardless of which Processa agent actually called the
+    sandbox -- e.g. Bug Agent's own fixes showed up authored as Dev Agent.
+    _git_identity_for derives the identity from the caller instead."""
+
+    def test_slugifies_the_name_into_an_email(self):
+        name, email = srv._git_identity_for("Bug Agent")
+        self.assertEqual(name, "Bug Agent")
+        self.assertEqual(email, "bug-agent@sandbox")
+
+    def test_none_falls_back_to_dev_agent(self):
+        name, email = srv._git_identity_for(None)
+        self.assertEqual(name, "Dev Agent")
+        self.assertEqual(email, "dev-agent@sandbox")
+
+    def test_blank_falls_back_to_dev_agent(self):
+        name, email = srv._git_identity_for("   ")
+        self.assertEqual(name, "Dev Agent")
+        self.assertEqual(email, "dev-agent@sandbox")
+
+    def test_punctuation_and_spacing_collapse_to_single_hyphens(self):
+        name, email = srv._git_identity_for("  Mobile App Agent!! ")
+        self.assertEqual(name, "Mobile App Agent!!")
+        self.assertEqual(email, "mobile-app-agent@sandbox")
+
+
+class TestAgentNameThreading(unittest.TestCase):
+    """Mirrors TestWorkItemIdThreading: agent_name is optional on the
+    payload (every existing caller that never sends it must behave exactly
+    as before -- still 'Dev Agent' everywhere), but when a specialist other
+    than Dev Agent sends its own name, that name reaches the actual git
+    commit author and the PR-title fallback, not a fixed literal."""
+
+    def setUp(self):
+        self.bench_dir = os.path.realpath(tempfile.mkdtemp())
+        self.app_dir = os.path.join(self.bench_dir, "apps", "one_bpmn")
+        os.makedirs(self.app_dir)
+        self.bench_dir_patch = patch.object(srv, "BENCH_DIR", self.bench_dir)
+        self.bench_dir_patch.start()
+
+    def tearDown(self):
+        self.bench_dir_patch.stop()
+        shutil.rmtree(self.bench_dir, ignore_errors=True)
+
+    def _payload(self, action, args, agent_name=None):
+        payload = {
+            "action": action, "target_app": "one_bpmn", "git_branch": "staging",
+            "work_item_description": "Fix the thing.", "args": args, "github_token": "gh-token",
+        }
+        if agent_name is not None:
+            payload["agent_name"] = agent_name
+        return payload
+
+    def test_write_file_commit_uses_the_calling_agents_identity(self):
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
+            srv, "_commit_and_push", return_value=(True, None)
+        ) as mock_commit:
+            srv._handle_tool_call(
+                self._payload("write_file", {"path": "a.py", "content": "x"}, agent_name="Bug Agent")
+            )
+        args, kwargs = mock_commit.call_args
+        self.assertEqual(args[3], "write_file via Bug Agent")
+        self.assertEqual(args[4], "Bug Agent")
+
+    def test_edit_file_commit_uses_the_calling_agents_identity(self):
+        with open(os.path.join(self.app_dir, "a.py"), "w") as fh:
+            fh.write("x")
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
+            srv, "_commit_and_push", return_value=(True, None)
+        ) as mock_commit:
+            srv._handle_tool_call(
+                self._payload("edit_file", {"path": "a.py", "old_string": "x", "new_string": "y"}, agent_name="Bug Agent")
+            )
+        args, kwargs = mock_commit.call_args
+        self.assertEqual(args[3], "edit_file via Bug Agent")
+        self.assertEqual(args[4], "Bug Agent")
+
+    def test_no_agent_name_on_payload_still_reads_as_dev_agent(self):
+        """Every caller that predates this field (or never sends it) must
+        see exactly the old behaviour -- no regression for Dev Agent."""
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
+            srv, "_commit_and_push", return_value=(True, None)
+        ) as mock_commit:
+            srv._handle_tool_call(self._payload("write_file", {"path": "a.py", "content": "x"}))
+        args, kwargs = mock_commit.call_args
+        self.assertEqual(args[3], "write_file via Dev Agent")
+        self.assertEqual(args[4], "Dev Agent")
+
+    def test_commit_and_push_actually_sets_the_git_author(self):
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return _FakeCompletedProcess(0)
+
+        with patch.object(srv, "_run", side_effect=fake_run), patch.object(srv, "_authed_remote"):
+            srv._commit_and_push("one_bpmn", "wi-branch", "a.py", "write_file via Bug Agent", "Bug Agent")
+        commit_cmd = next(c for c in commands if "commit -q -m" in c)
+        self.assertIn("user.email=bug-agent@sandbox", commit_cmd)
+        self.assertIn("user.name='Bug Agent'", commit_cmd)
+
+    def test_open_pull_request_passes_agent_name_through_to_open_pr(self):
+        run_ctx = {
+            "git_branch": "staging", "work_item_description": "Fix it.",
+            "github_token": "gh-token", "correlation_id": "corr-1", "agent_name": "Bug Agent",
+        }
+        with patch.object(srv, "_collect_changed_files", return_value={"a.py": "x"}), patch.object(
+            srv, "_run_tests", return_value=(True, "", "")
+        ), patch.object(srv, "_open_pr", return_value=("https://github.com/x/y/pull/1", None)) as open_pr:
+            srv._tool_open_pull_request("one_bpmn", {"summary": "did it"}, run_ctx)
+        self.assertEqual(open_pr.call_args.kwargs["agent_name"], "Bug Agent")
+
+    def test_open_pr_title_fallback_uses_agent_name_without_a_work_item_id(self):
+        sent = []
+
+        def fake_request(method, url, token, ok=(200,), json_body=None):
+            sent.append((method, url, json_body))
+            if method == "GET" and "/git/ref/heads/" in url:
+                return {"object": {"sha": "base-sha"}}
+            if method == "POST" and url.endswith("/pulls"):
+                return {"html_url": "https://github.com/ONE-F-M/one_bpmn/pull/9", "number": 9}
+            return {}
+
+        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/one_bpmn"), patch.object(
+            srv, "_github_request", side_effect=fake_request
+        ):
+            srv._open_pr(
+                "one_bpmn", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "r",
+                agent_name="Bug Agent",
+            )
+        pr = next(b for m, u, b in sent if m == "POST" and u.endswith("/pulls"))
+        self.assertTrue(pr["title"].startswith("Bug Agent: "))
+
+    def test_open_pr_title_fallback_defaults_to_dev_agent_when_not_given(self):
+        sent = []
+
+        def fake_request(method, url, token, ok=(200,), json_body=None):
+            sent.append((method, url, json_body))
+            if method == "GET" and "/git/ref/heads/" in url:
+                return {"object": {"sha": "base-sha"}}
+            if method == "POST" and url.endswith("/pulls"):
+                return {"html_url": "https://github.com/ONE-F-M/one_bpmn/pull/9", "number": 9}
+            return {}
+
+        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/one_bpmn"), patch.object(
+            srv, "_github_request", side_effect=fake_request
+        ):
+            srv._open_pr("one_bpmn", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "r")
+        pr = next(b for m, u, b in sent if m == "POST" and u.endswith("/pulls"))
+        self.assertTrue(pr["title"].startswith("Dev Agent: "))
