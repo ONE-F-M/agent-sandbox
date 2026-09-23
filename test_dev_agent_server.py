@@ -284,13 +284,15 @@ class TestOpenPullRequestTool(unittest.TestCase):
         edited files after its last run_tests call, so pass/fail here must
         come from a fresh run, not whatever the model last saw."""
         with patch.object(srv, "_collect_changed_files", return_value={"a.py": "content"}), patch.object(
-            srv, "_run_tests", return_value=(True, "out", "err")
+            srv, "_run_tests", return_value=(True, "out", "err", [])
         ) as mock_run_tests, patch.object(
             srv, "_open_pr", return_value=("https://github.com/x/y/pull/1", None)
         ) as mock_open_pr:
             result = srv._tool_open_pull_request("one_bpmn", {"summary": "did stuff"}, self.run_ctx)
         mock_run_tests.assert_called_once_with("one_bpmn")
-        self.assertEqual(result, {"pr_url": "https://github.com/x/y/pull/1", "tests_passed": True})
+        self.assertEqual(
+            result, {"pr_url": "https://github.com/x/y/pull/1", "tests_passed": True, "failing_tests": []}
+        )
         args, kwargs = mock_open_pr.call_args
         self.assertEqual(args[0], "one_bpmn")
         self.assertEqual(args[1], "staging")
@@ -299,10 +301,16 @@ class TestOpenPullRequestTool(unittest.TestCase):
 
     def test_pr_error_surfaces_with_test_status_attached(self):
         with patch.object(srv, "_collect_changed_files", return_value={"a.py": "content"}), patch.object(
-            srv, "_run_tests", return_value=(False, "out", "boom")
+            srv, "_run_tests", return_value=(False, "out", "boom", ["test_thing (module.TestCase)"])
         ), patch.object(srv, "_open_pr", return_value=(None, "GitHub API error (500)")):
             result = srv._tool_open_pull_request("one_bpmn", {"summary": "did stuff"}, self.run_ctx)
-        self.assertEqual(result, {"error": "GitHub API error (500)", "tests_passed": False})
+        self.assertEqual(
+            result,
+            {
+                "error": "GitHub API error (500)", "tests_passed": False,
+                "failing_tests": ["test_thing (module.TestCase)"],
+            },
+        )
 
 
 class TestLastOpenPrResult(unittest.TestCase):
@@ -586,7 +594,7 @@ class TestWorkItemIdThreading(unittest.TestCase):
             "github_token": "gh-token", "correlation_id": "corr-1",
         }
         with patch.object(srv, "_collect_changed_files", return_value={"a.py": "x"}), patch.object(
-            srv, "_run_tests", return_value=(True, "", "")
+            srv, "_run_tests", return_value=(True, "", "", [])
         ), patch.object(srv, "_open_pr", return_value=("https://github.com/x/y/pull/1", None)) as open_pr:
             srv._tool_open_pull_request("one_bpmn", {"summary": "did it"}, run_ctx)
         self.assertEqual(open_pr.call_args.kwargs["work_item_id"], "WI-002322")
@@ -652,8 +660,9 @@ class TestHungCommandsReadAsFailures(unittest.TestCase):
     def test_mobile_tests_report_a_hung_build_instead_of_raising(self):
         hung = srv.subprocess.CompletedProcess("yarn build", 124, "", "timed out after 900s: yarn build")
         with patch.object(srv, "_run", return_value=hung) as run:
-            passed, stdout, stderr = srv._run_tests("mobile_app_ionic")
+            passed, stdout, stderr, failing_tests = srv._run_tests("mobile_app_ionic")
         self.assertFalse(passed)
+        self.assertEqual(failing_tests, [])
         self.assertIn("timed out after 900s", stderr)
         run.assert_called_once()  # a hung build never reaches the unit tests
 
@@ -968,7 +977,7 @@ class TestAgentNameThreading(unittest.TestCase):
             "github_token": "gh-token", "correlation_id": "corr-1", "agent_name": "Bug Agent",
         }
         with patch.object(srv, "_collect_changed_files", return_value={"a.py": "x"}), patch.object(
-            srv, "_run_tests", return_value=(True, "", "")
+            srv, "_run_tests", return_value=(True, "", "", [])
         ), patch.object(srv, "_open_pr", return_value=("https://github.com/x/y/pull/1", None)) as open_pr:
             srv._tool_open_pull_request("one_bpmn", {"summary": "did it"}, run_ctx)
         self.assertEqual(open_pr.call_args.kwargs["agent_name"], "Bug Agent")
@@ -1011,3 +1020,75 @@ class TestAgentNameThreading(unittest.TestCase):
             srv._open_pr("one_bpmn", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "r")
         pr = next(b for m, u, b in sent if m == "POST" and u.endswith("/pulls"))
         self.assertTrue(pr["title"].startswith("Dev Agent: "))
+
+
+class TestExtractFailingTests(unittest.TestCase):
+    """_extract_failing_tests reads the "FAIL: <id>" / "ERROR: <id>" summary
+    lines Python's own unittest.TextTestRunner prints (what `bench
+    run-tests` uses under the hood) -- an agent resuming after a sandbox
+    failure used to get only a raw output tail, with no way to tell which
+    tests actually broke without re-reading the whole thing itself."""
+
+    def test_finds_fail_and_error_lines(self):
+        text = (
+            "======================================================================\n"
+            "FAIL: test_something (one_bpmn.tests.test_x.TestX)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "AssertionError: 1 != 2\n"
+            "\n"
+            "======================================================================\n"
+            "ERROR: test_other (one_bpmn.tests.test_y.TestY)\n"
+            "----------------------------------------------------------------------\n"
+            "ValueError: boom\n"
+        )
+        self.assertEqual(
+            srv._extract_failing_tests(text),
+            ["test_something (one_bpmn.tests.test_x.TestX)", "test_other (one_bpmn.tests.test_y.TestY)"],
+        )
+
+    def test_no_failures_returns_empty_list(self):
+        self.assertEqual(srv._extract_failing_tests("Ran 12 tests in 3.4s\n\nOK\n"), [])
+
+    def test_searches_every_text_given_and_dedupes(self):
+        stdout = "FAIL: test_a (mod.TestA)\n"
+        stderr = "FAIL: test_a (mod.TestA)\nERROR: test_b (mod.TestB)\n"
+        self.assertEqual(
+            srv._extract_failing_tests(stdout, stderr),
+            ["test_a (mod.TestA)", "test_b (mod.TestB)"],
+        )
+
+    def test_none_text_is_ignored_not_an_error(self):
+        self.assertEqual(srv._extract_failing_tests(None, "FAIL: test_a (mod.TestA)\n"), ["test_a (mod.TestA)"])
+
+    def test_stops_at_the_limit(self):
+        text = "\n".join(f"FAIL: test_{i} (mod.TestCase)" for i in range(10))
+        self.assertEqual(len(srv._extract_failing_tests(text, limit=3)), 3)
+
+
+class TestRunTestsReturnsFailingTests(unittest.TestCase):
+    """_run_tests' new 4th return value, and _tool_run_tests surfacing it —
+    the piece agent_callback.py needs to store failing test names on Agent
+    Sandbox Run and hand them back to the agent, instead of just a raw,
+    truncated output tail it has to re-parse itself."""
+
+    def test_run_tests_extracts_failing_tests_from_bench_output(self):
+        result = srv.subprocess.CompletedProcess(
+            "bench run-tests", 1, "FAIL: test_thing (mod.TestThing)\n", "",
+        )
+        with patch.object(srv, "_run", return_value=result):
+            passed, stdout, stderr, failing_tests = srv._run_tests("one_bpmn")
+        self.assertFalse(passed)
+        self.assertEqual(failing_tests, ["test_thing (mod.TestThing)"])
+
+    def test_tool_run_tests_includes_failing_tests_in_its_result(self):
+        with patch.object(
+            srv, "_run_tests", return_value=(False, "out", "err", ["test_thing (mod.TestThing)"])
+        ):
+            result = srv._tool_run_tests("one_bpmn", {})
+        self.assertEqual(result["failing_tests"], ["test_thing (mod.TestThing)"])
+
+    def test_tool_run_tests_empty_failing_tests_on_a_pass(self):
+        with patch.object(srv, "_run_tests", return_value=(True, "out", "err", [])):
+            result = srv._tool_run_tests("one_bpmn", {})
+        self.assertEqual(result["failing_tests"], [])

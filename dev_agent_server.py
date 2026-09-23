@@ -429,6 +429,30 @@ def _migrate_site():
     return result.returncode == 0, result.stdout[-2000:], result.stderr[-2000:]
 
 
+_TEST_FAILURE_LINE = re.compile(r"^(?:FAIL|ERROR): (.+)$", re.MULTILINE)
+
+
+def _extract_failing_tests(*texts, limit=50):
+    """Failing/erroring test identifiers from Python unittest's own output
+    (what `bench run-tests` uses under the hood) -- the "FAIL: <id>" /
+    "ERROR: <id>" summary lines its TextTestRunner always prints, regardless
+    of which of stdout/stderr Frappe happened to send them to. Deliberately
+    format-agnostic about the exact <id> shape (unittest's own formatting
+    has changed across Python versions) -- whatever it printed is what an
+    agent needs to search for, verbatim."""
+    names = []
+    seen = set()
+    for text in texts:
+        for match in _TEST_FAILURE_LINE.finditer(text or ""):
+            name = match.group(1).strip()
+            if name and name not in seen:
+                seen.add(name)
+                names.append(name)
+                if len(names) >= limit:
+                    return names
+    return names
+
+
 def _run_tests(target_app):
     # mobile_app_ionic isn't a Frappe app — no bench run-tests target exists
     # for it at all. Scope deliberately kept to build+unit-tests only:
@@ -440,11 +464,13 @@ def _run_tests(target_app):
         app_dir = f"{BENCH_DIR}/apps/{target_app}"
         build = _run(f"cd {shlex.quote(app_dir)} && yarn build", timeout=900)
         if build.returncode != 0:
-            return False, build.stdout[-4000:], build.stderr[-4000:]
+            # A build failure, not a test failure -- vitest never ran, so
+            # there is no unittest-style FAIL:/ERROR: summary to extract.
+            return False, build.stdout[-4000:], build.stderr[-4000:], []
         test = _run(f"cd {shlex.quote(app_dir)} && yarn test:unit", timeout=900)
         stdout = (build.stdout + test.stdout)[-4000:]
         stderr = (build.stderr + test.stderr)[-4000:]
-        return test.returncode == 0, stdout, stderr
+        return test.returncode == 0, stdout, stderr, _extract_failing_tests(stdout, stderr)
 
     # --skip-before-tests: erpnext's before_tests hook creates a default
     # Company on any fresh site, which cascades into Warehouse creation and
@@ -460,7 +486,8 @@ def _run_tests(target_app):
         f"cd {shlex.quote(BENCH_DIR)} && bench --site {shlex.quote(SITE_NAME)} run-tests --app {shlex.quote(target_app)} --skip-before-tests",
         timeout=1800,
     )
-    return result.returncode == 0, result.stdout[-4000:], result.stderr[-4000:]
+    stdout, stderr = result.stdout[-4000:], result.stderr[-4000:]
+    return result.returncode == 0, stdout, stderr, _extract_failing_tests(stdout, stderr)
 
 
 def _collect_changed_files(target_app, base_branch=None):
@@ -777,8 +804,11 @@ def _tool_list_files(app_dir, args):
 
 
 def _tool_run_tests(target_app, args):
-    passed, stdout, stderr = _run_tests(target_app)
-    return {"passed": passed, "stdout_tail": stdout[-2000:], "stderr_tail": stderr[-2000:]}
+    passed, stdout, stderr, failing_tests = _run_tests(target_app)
+    return {
+        "passed": passed, "stdout_tail": stdout[-2000:], "stderr_tail": stderr[-2000:],
+        "failing_tests": failing_tests,
+    }
 
 
 def _tool_open_pull_request(target_app, args, run_ctx):
@@ -793,7 +823,7 @@ def _tool_open_pull_request(target_app, args, run_ctx):
     files = _collect_changed_files(target_app, run_ctx["git_branch"])
     if not files:
         return {"error": "no changes to commit yet — nothing to open a pull request for"}
-    passed, _stdout, stderr = _run_tests(target_app)
+    passed, _stdout, stderr, failing_tests = _run_tests(target_app)
     pr_url, pr_error = _open_pr(
         target_app, run_ctx["git_branch"], run_ctx["work_item_description"], files,
         run_ctx["github_token"], run_ctx["correlation_id"], summary,
@@ -801,8 +831,8 @@ def _tool_open_pull_request(target_app, args, run_ctx):
         agent_name=run_ctx.get("agent_name") or "Dev Agent",
     )
     if pr_url:
-        return {"pr_url": pr_url, "tests_passed": passed}
-    return {"error": pr_error, "tests_passed": passed}
+        return {"pr_url": pr_url, "tests_passed": passed, "failing_tests": failing_tests}
+    return {"error": pr_error, "tests_passed": passed, "failing_tests": failing_tests}
 
 
 def _dispatch_tool(app_dir, target_app, name, args, run_ctx):
@@ -924,12 +954,13 @@ def run_single_action_job(payload):
 
     if action == "run_tests":
         _set_status(correlation_id, state="running_tests")
-        passed, stdout, stderr = _run_tests(target_app)
+        passed, stdout, stderr, failing_tests = _run_tests(target_app)
         body = {
             "correlation_id": correlation_id,
             "status": "tests_passed" if passed else "tests_failed",
             "stdout_tail": stdout,
             "stderr_tail": stderr,
+            "failing_tests": failing_tests,
         }
     elif action == "open_pull_request":
         run_ctx = {
@@ -948,6 +979,8 @@ def run_single_action_job(payload):
             body["pr_url"] = result["pr_url"]
         if result.get("error"):
             body["pr_error"] = result["error"]
+        if result.get("failing_tests"):
+            body["failing_tests"] = result["failing_tests"]
     else:
         # _validate_payload already restricts action to _SLOW_ACTIONS for
         # /run — reaching this means that set and this branch drifted apart.
@@ -1174,7 +1207,7 @@ def run_job(payload):
     # changed since either of those, and status/callback must reflect the
     # tree as it actually stands right now, not a possibly-stale self-report.
     _set_status(correlation_id, state="running_tests")
-    passed, stdout, stderr = _run_tests(target_app)
+    passed, stdout, stderr, failing_tests = _run_tests(target_app)
 
     status = "tests_passed" if passed else "tests_failed"
     body = {
@@ -1182,6 +1215,7 @@ def run_job(payload):
         "status": status,
         "stdout_tail": stdout,
         "stderr_tail": stderr,
+        "failing_tests": failing_tests,
         "agent_report": agent_report,
         "agent_iterations": iterations,
         "agent_hit_iteration_limit": hit_limit,
