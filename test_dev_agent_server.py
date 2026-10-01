@@ -554,6 +554,46 @@ class TestHandleToolCall(unittest.TestCase):
             result = srv._handle_tool_call(self._payload("delete_everything", {}))
         self.assertIn("error", result)
 
+    def test_delete_file_removes_the_file_and_commits_the_deletion(self):
+        target = os.path.join(self.app_dir, "old.vue")
+        with open(target, "w") as fh:
+            fh.write("<template/>")
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
+            srv, "_commit_and_push", return_value=(True, None)
+        ) as mock_commit:
+            result = srv._handle_tool_call(self._payload("delete_file", {"path": "old.vue"}))
+        self.assertEqual(result, {"deleted": True, "path": "old.vue"})
+        self.assertFalse(os.path.exists(target))
+        self.assertEqual(mock_commit.call_args.args[2], "old.vue")
+        self.assertIn("delete_file via", mock_commit.call_args.args[3])
+
+    def test_delete_file_refuses_a_directory_a_missing_file_and_a_path_out_of_the_app(self):
+        os.makedirs(os.path.join(self.app_dir, "spiff"))
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
+            srv, "_commit_and_push", return_value=(True, None)
+        ) as mock_commit:
+            for path in ("spiff", "missing.vue", "../outside.txt"):
+                self.assertIn("error", srv._handle_tool_call(self._payload("delete_file", {"path": path})))
+        self.assertTrue(os.path.isdir(os.path.join(self.app_dir, "spiff")))
+        mock_commit.assert_not_called()
+
+    def test_git_add_on_a_deleted_path_stages_the_deletion(self):
+        """_commit_and_push runs `git add -- <path>`; for a removed file that must record the removal."""
+        repo = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+
+        def run(cmd):
+            return srv._run(f"cd {repo} && {cmd}")
+
+        run("git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init")
+        with open(os.path.join(repo, "old.vue"), "w") as fh:
+            fh.write("x")
+        run("git add old.vue && git -c user.email=t@t -c user.name=t commit -q -m add")
+        self.assertTrue(srv._tool_delete_file(repo, {"path": "old.vue"})["deleted"])
+        run("git add -- old.vue && git -c user.email=t@t -c user.name=t commit -q -m delete")
+        self.assertEqual(run("git ls-files old.vue").stdout.strip(), "")
+        self.assertIn("D\told.vue", run("git show --name-status --format= HEAD").stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
