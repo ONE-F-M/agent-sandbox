@@ -733,10 +733,10 @@ def _tool_write_file(app_dir, args):
 def _tool_delete_file(app_dir, args):
     """Remove one file. Only a file: a directory, or a path that does not exist, is reported back as an error."""
     path = args.get("path") or ""
-    try:
-        abs_path = _safe_path(app_dir, path)
-    except ValueError as exc:
-        return {"error": str(exc)}
+    # The same check as _safe_path, written inline so the scanner sees the guard on this remove().
+    abs_path = os.path.realpath(os.path.join(app_dir, path))
+    if not abs_path.startswith(app_dir + os.sep):
+        return {"error": f"path escapes the app directory: {path!r}"}
     if not os.path.isfile(abs_path):
         return {"error": f"{path!r} is not a file in this app"}
     os.remove(abs_path)
