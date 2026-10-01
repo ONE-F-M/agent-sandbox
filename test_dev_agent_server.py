@@ -248,6 +248,17 @@ class TestListFiles(unittest.TestCase):
         result = srv._tool_list_files(self.app_dir, {})
         self.assertEqual(result["line_counts"], {"logo.png": None, "broken": None})
 
+    def test_a_symlink_out_of_the_app_is_not_opened(self):
+        outside = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False)
+        outside.write("secret\nsecret\n")
+        outside.close()
+        self.addCleanup(os.unlink, outside.name)
+        os.symlink(outside.name, os.path.join(self.app_dir, "escape.txt"))
+        with patch("builtins.open", wraps=open) as opened:
+            result = srv._tool_list_files(self.app_dir, {})
+        self.assertIsNone(result["line_counts"]["escape.txt"])
+        self.assertNotIn(os.path.realpath(outside.name), [os.path.realpath(c.args[0]) for c in opened.call_args_list])
+
 
 class TestDispatchToolRouting(unittest.TestCase):
     def setUp(self):

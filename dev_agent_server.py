@@ -799,19 +799,23 @@ def _tool_list_files(app_dir, args):
             abs_path = os.path.join(root, name)
             rel = os.path.relpath(abs_path, app_dir)
             paths.append(rel)
-            line_counts[rel] = _line_count(abs_path)
+            line_counts[rel] = _line_count(app_dir, rel)
             chars += len(rel) + len(str(line_counts[rel])) + 6  # quotes, colon, comma, close enough to bound intent
             if len(paths) >= _LIST_FILES_MAX or chars >= _LIST_FILES_MAX_CHARS:
                 return {"files": paths, "line_counts": line_counts, "count": len(paths), "truncated": True}
     return {"files": paths, "line_counts": line_counts, "count": len(paths), "truncated": False}
 
 
-def _line_count(abs_path):
-    """Lines as read_file counts them (newlines plus one), so a model can plan offset and limit; None for a binary or unreadable file."""
+def _line_count(app_dir, rel_path):
+    """Lines as read_file counts them (newlines plus one), so a model can plan offset and limit.
+
+    None for a binary file, one that cannot be opened, or a symlink that leads outside the app directory.
+    """
     try:
+        abs_path = _safe_path(app_dir, rel_path)
         with open(abs_path, "rb") as fh:
             data = fh.read()
-    except OSError:  # a broken symlink, or a file the server cannot read
+    except (ValueError, OSError):  # a symlink out of the app, a broken symlink, or an unreadable file
         return None
     if b"\0" in data[:1024]:
         return None
