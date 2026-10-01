@@ -811,11 +811,14 @@ def _line_count(app_dir, rel_path):
 
     None for a binary file, one that cannot be opened, or a symlink that leads outside the app directory.
     """
+    # The same check as _safe_path, written inline so the scanner sees the guard on this open().
+    abs_path = os.path.realpath(os.path.join(app_dir, rel_path))
+    if not abs_path.startswith(app_dir + os.sep):
+        return None
     try:
-        abs_path = _safe_path(app_dir, rel_path)
         with open(abs_path, "rb") as fh:
             data = fh.read()
-    except (ValueError, OSError):  # a symlink out of the app, a broken symlink, or an unreadable file
+    except OSError:  # a broken symlink, or a file the server cannot read
         return None
     if b"\0" in data[:1024]:
         return None
