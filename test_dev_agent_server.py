@@ -232,6 +232,22 @@ class TestListFiles(unittest.TestCase):
     def test_default_size_cap_is_well_under_the_277kb_seen_live(self):
         self.assertLess(srv._LIST_FILES_MAX_CHARS, 277_000)
 
+    def test_every_file_comes_with_its_line_count(self):
+        with open(os.path.join(self.app_dir, "three.py"), "w", encoding="utf-8") as fh:
+            fh.write("a\nb\nc")
+        with open(os.path.join(self.app_dir, "ends_in_newline.js"), "w", encoding="utf-8") as fh:
+            fh.write("a\nb\n")
+        result = srv._tool_list_files(self.app_dir, {})
+        self.assertEqual(result["line_counts"], {"three.py": 3, "ends_in_newline.js": 3})
+        self.assertEqual(sorted(result["files"]), sorted(result["line_counts"]))
+
+    def test_a_binary_or_broken_file_has_no_line_count(self):
+        with open(os.path.join(self.app_dir, "logo.png"), "wb") as fh:
+            fh.write(b"\x89PNG\0\0\n")
+        os.symlink(os.path.join(self.app_dir, "missing"), os.path.join(self.app_dir, "broken"))
+        result = srv._tool_list_files(self.app_dir, {})
+        self.assertEqual(result["line_counts"], {"logo.png": None, "broken": None})
+
 
 class TestDispatchToolRouting(unittest.TestCase):
     def setUp(self):

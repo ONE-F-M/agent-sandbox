@@ -791,16 +791,31 @@ def _tool_list_files(app_dir, args):
     except ValueError as exc:
         return {"error": str(exc)}
     paths = []
+    line_counts = {}
     chars = 0
     for root, dirs, filenames in os.walk(start_dir):
         dirs[:] = [d for d in dirs if d != ".git"]
         for name in filenames:
-            rel = os.path.relpath(os.path.join(root, name), app_dir)
+            abs_path = os.path.join(root, name)
+            rel = os.path.relpath(abs_path, app_dir)
             paths.append(rel)
-            chars += len(rel) + 1  # +1: comma/quote overhead, close enough to bound intent
+            line_counts[rel] = _line_count(abs_path)
+            chars += len(rel) + len(str(line_counts[rel])) + 6  # quotes, colon, comma, close enough to bound intent
             if len(paths) >= _LIST_FILES_MAX or chars >= _LIST_FILES_MAX_CHARS:
-                return {"files": paths, "count": len(paths), "truncated": True}
-    return {"files": paths, "count": len(paths), "truncated": False}
+                return {"files": paths, "line_counts": line_counts, "count": len(paths), "truncated": True}
+    return {"files": paths, "line_counts": line_counts, "count": len(paths), "truncated": False}
+
+
+def _line_count(abs_path):
+    """Lines as read_file counts them (newlines plus one), so a model can plan offset and limit; None for a binary or unreadable file."""
+    try:
+        with open(abs_path, "rb") as fh:
+            data = fh.read()
+    except OSError:  # a broken symlink, or a file the server cannot read
+        return None
+    if b"\0" in data[:1024]:
+        return None
+    return data.count(b"\n") + 1
 
 
 def _tool_run_tests(target_app, args):
