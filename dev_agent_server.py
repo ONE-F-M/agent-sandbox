@@ -114,7 +114,7 @@ REQUIRED_TOOL_FIELDS = ("name", "description", "input_schema")
 # loudly at validation time, rather than the model discovering it mid-loop as
 # a silent per-call "unknown tool" error.
 _KNOWN_TOOL_NAMES = frozenset({
-    "read_file", "write_file", "edit_file", "list_files", "run_tests", "open_pull_request",
+    "read_file", "write_file", "edit_file", "delete_file", "list_files", "run_tests", "open_pull_request",
 })
 
 # In-memory job status, keyed by correlation_id. Fine for one-instance-per-run
@@ -131,7 +131,7 @@ def _set_status(correlation_id, **fields):
 
 
 _SLOW_ACTIONS = frozenset({"run_tests", "open_pull_request"})
-_FAST_ACTIONS = frozenset({"read_file", "write_file", "edit_file", "list_files"})
+_FAST_ACTIONS = frozenset({"read_file", "write_file", "edit_file", "delete_file", "list_files"})
 
 REQUIRED_ACTION_FIELDS = (
     "correlation_id", "action", "target_app", "git_branch", "work_item_description",
@@ -730,6 +730,19 @@ def _tool_write_file(app_dir, args):
     return {"written": True, "path": path}
 
 
+def _tool_delete_file(app_dir, args):
+    """Remove one file. Only a file: a directory, or a path that does not exist, is reported back as an error."""
+    path = args.get("path") or ""
+    # The same check as _safe_path, written inline so the scanner sees the guard on this remove().
+    abs_path = os.path.realpath(os.path.join(app_dir, path))
+    if not abs_path.startswith(app_dir + os.sep):
+        return {"error": f"path escapes the app directory: {path!r}"}
+    if not os.path.isfile(abs_path):
+        return {"error": f"{path!r} is not a file in this app"}
+    os.remove(abs_path)
+    return {"deleted": True, "path": path}
+
+
 def _tool_edit_file(app_dir, args):
     """Targeted search/replace, complementing write_file's full overwrite —
     mirrors the familiar old_string/new_string Edit-tool convention. Requires
@@ -864,6 +877,8 @@ def _dispatch_tool(app_dir, target_app, name, args, run_ctx):
         return _tool_write_file(app_dir, args)
     if name == "edit_file":
         return _tool_edit_file(app_dir, args)
+    if name == "delete_file":
+        return _tool_delete_file(app_dir, args)
     if name == "list_files":
         return _tool_list_files(app_dir, args)
     if name == "run_tests":
@@ -918,6 +933,15 @@ def _handle_tool_call(payload):
         if result.get("edited"):
             ok, err = _commit_and_push(
                 target_app, head_branch, args.get("path") or "", f"edit_file via {agent_name}", agent_name,
+            )
+            if not ok:
+                result["commit_error"] = err
+        return result
+    if action == "delete_file":
+        result = _tool_delete_file(app_dir, args)
+        if result.get("deleted"):
+            ok, err = _commit_and_push(
+                target_app, head_branch, args.get("path") or "", f"delete_file via {agent_name}", agent_name,
             )
             if not ok:
                 result["commit_error"] = err
