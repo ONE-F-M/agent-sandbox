@@ -38,6 +38,7 @@ this container's own deployment.
 
 import base64
 import contextlib
+import difflib
 import hashlib
 import hmac
 import json
@@ -769,12 +770,30 @@ def _tool_edit_file(app_dir, args):
         return {"error": str(exc)}
     count = content.count(old_string)
     if count == 0:
-        return {"error": "old_string not found in the file — it may have changed since you last read it"}
+        return {
+            "error": "old_string not found in the file — it may have changed since you last read it",
+            **_closest_text(content, old_string),
+        }
     if count > 1:
         return {"error": f"old_string appears {count} times — include more surrounding context to make it unique"}
     with open(abs_path, "w", encoding="utf-8") as fh:
         fh.write(content.replace(old_string, new_string, 1))
     return {"edited": True, "path": path}
+
+
+def _closest_text(content, old_string):
+    """The file's current lines around the line most like old_string's first
+    line, so the next edit can be written against what is there now."""
+    lines = content.splitlines(keepends=True)
+    stripped = [line.strip() for line in lines]
+    wanted = next((line.strip() for line in old_string.splitlines() if line.strip()), "")
+    match = difflib.get_close_matches(wanted, stripped, n=1, cutoff=0.6)
+    if not match:
+        return {}
+    index = stripped.index(match[0])
+    start = max(0, index - 3)
+    end = min(len(lines), index + len(old_string.splitlines()) + 3)
+    return {"current_text": "".join(lines[start:end]), "current_lines": f"{start + 1}-{end}"}
 
 
 # Confirmed live: one_bpmn alone (one target app, not the whole bench) already

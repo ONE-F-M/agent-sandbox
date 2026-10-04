@@ -146,6 +146,23 @@ class TestEditFile(unittest.TestCase):
         self.assertIn("error", result)
         self.assertEqual(self._read("foo.py"), "def foo():\n    return 1\n")  # untouched
 
+    def test_a_miss_returns_the_current_text_around_the_closest_line(self):
+        self._write("foo.py", "import os\n\n\ndef foo():\n    return 1\n\n\nx = 2\n")
+        result = srv._tool_edit_file(self.app_dir, {
+            "path": "foo.py", "old_string": "def foo():\n    return 3\n", "new_string": "def foo():\n    return 4\n",
+        })
+        self.assertIn("error", result)
+        self.assertEqual(result["current_lines"], "1-8")
+        self.assertIn("    return 1\n", result["current_text"])
+
+    def test_a_miss_with_nothing_close_returns_only_the_error(self):
+        self._write("foo.py", "def foo():\n    return 1\n")
+        result = srv._tool_edit_file(self.app_dir, {
+            "path": "foo.py", "old_string": "class Unrelated(Base):", "new_string": "x",
+        })
+        self.assertIn("error", result)
+        self.assertNotIn("current_text", result)
+
     def test_ambiguous_match_is_rejected(self):
         self._write("foo.py", "x = 1\nx = 1\n")
         result = srv._tool_edit_file(self.app_dir, {
