@@ -585,6 +585,37 @@ class TestHandleToolCall(unittest.TestCase):
         self.assertEqual(result, {"written": True, "path": "a.py"})
         mock_commit.assert_called_once()
 
+    def test_a_bench_path_from_search_frontend_reads_the_app_file(self):
+        os.makedirs(os.path.join(self.app_dir, "spiff", "src"))
+        with open(os.path.join(self.app_dir, "spiff", "src", "a.vue"), "w") as fh:
+            fh.write("hello")
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)):
+            result = srv._handle_tool_call(self._payload("read_file", {"path": "one_bpmn/spiff/src/a.vue"}))
+        self.assertTrue(result["found"])
+        self.assertIn("hello", result["content"])
+
+    def test_a_path_inside_the_apps_own_package_is_left_alone(self):
+        os.makedirs(os.path.join(self.app_dir, "one_bpmn", "api"))
+        os.makedirs(os.path.join(self.app_dir, "api"))
+        with open(os.path.join(self.app_dir, "one_bpmn", "api", "x.py"), "w") as fh:
+            fh.write("package")
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)):
+            result = srv._handle_tool_call(self._payload("read_file", {"path": "one_bpmn/api/x.py"}))
+        self.assertIn("package", result["content"])
+
+    def test_bench_paths_reach_delete_and_list_with_the_app_path(self):
+        os.makedirs(os.path.join(self.app_dir, "spiff", "src"))
+        with open(os.path.join(self.app_dir, "spiff", "src", "old.vue"), "w") as fh:
+            fh.write("x")
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
+            srv, "_commit_and_push", return_value=(True, None)
+        ) as mock_commit:
+            listed = srv._handle_tool_call(self._payload("list_files", {"path_prefix": "one_bpmn/spiff"}))
+            deleted = srv._handle_tool_call(self._payload("delete_file", {"path": "one_bpmn/spiff/src/old.vue"}))
+        self.assertEqual(listed["files"], ["spiff/src/old.vue"])
+        self.assertEqual(deleted, {"deleted": True, "path": "spiff/src/old.vue"})
+        self.assertEqual(mock_commit.call_args[0][2], "spiff/src/old.vue")
+
     def test_write_file_surfaces_a_commit_error_without_failing_the_write(self):
         with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
             srv, "_commit_and_push", return_value=(False, "push rejected")
