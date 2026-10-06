@@ -944,6 +944,14 @@ def _handle_tool_call(payload):
         return {"error": err}
 
     app_dir = f"{BENCH_DIR}/apps/{target_app}"
+    # search_frontend reports bench paths ("one_bpmn/spiff/..."); the app's own package keeps its "one_bpmn/..." paths.
+    prefix = f"{target_app}/"
+    for key in ("path", "path_prefix"):
+        value = args.get(key)
+        if isinstance(value, str) and value.startswith(prefix):
+            top = value[len(prefix):].split("/", 1)[0]
+            if top and not os.path.exists(os.path.join(app_dir, target_app, top)) and os.path.exists(os.path.join(app_dir, top)):
+                args = {**args, key: value[len(prefix):]}
     if action == "read_file":
         return _tool_read_file(app_dir, args)
     if action == "list_files":
