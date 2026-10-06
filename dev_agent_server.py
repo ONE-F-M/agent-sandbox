@@ -492,9 +492,9 @@ def _run_tests(target_app):
 
 
 def _collect_changed_files(target_app, base_branch=None):
-    """{repo-relative path: final content} for every file changed on the
-    working branch: committed there by the fast tools (diffed against
-    base_branch) or still uncommitted from the bundled coding loop."""
+    """{repo-relative path: final content, or None for a deleted file} for every
+    file changed on the working branch: committed there by the fast tools
+    (diffed against base_branch) or still uncommitted from the bundled coding loop."""
     app_dir = f"{BENCH_DIR}/apps/{target_app}"
     paths = []
     if base_branch:
@@ -508,6 +508,9 @@ def _collect_changed_files(target_app, base_branch=None):
     files = {}
     for rel_path in dict.fromkeys(p for p in paths if p):
         abs_path = f"{app_dir}/{rel_path}"
+        if not os.path.lexists(abs_path):
+            files[rel_path] = None
+            continue
         try:
             with open(abs_path, "r", encoding="utf-8") as fh:
                 files[rel_path] = fh.read()
@@ -585,7 +588,7 @@ def _open_pr(
     title_prefix = "" if tests_passed else "⚠️ Tests failed: "
     subject = f"{work_item_id}: {work_item_description[:72]}" if work_item_id else f"{agent_name}: {work_item_description[:72]}"
     title = f"{title_prefix}{subject}"
-    file_list = "\n".join(f"- `{path}`" for path in sorted(files))
+    file_list = "\n".join(f"- `{path}`" + (" (deleted)" if files[path] is None else "") for path in sorted(files))
     if tests_passed:
         testing_section = (
             "The target app's real test suite passed in an isolated, disposable "
@@ -628,6 +631,13 @@ def _open_pr(
                 github_token,
                 ok=(200, 404),
             )
+            if content is None:
+                if existing and existing.get("sha"):
+                    _github_request(
+                        "DELETE", f"{_GITHUB_API}/repos/{repo}/contents/{path}", github_token,
+                        json_body={"message": title, "sha": existing["sha"], "branch": head_branch},
+                    )
+                continue
             commit_body = {
                 "message": title,
                 "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
