@@ -357,6 +357,68 @@ class TestOpenPullRequestTool(unittest.TestCase):
         )
 
 
+class TestDeletedFilesReachThePr(unittest.TestCase):
+    """A file removed with delete_file used to be dropped from the changed files, so a delete-only change opened no PR."""
+
+    def _repo_with_deleted_file(self):
+        bench = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, bench, True)
+        app_dir = os.path.join(bench, "apps", "one_bpmn")
+        os.makedirs(app_dir)
+
+        def run(cmd):
+            return srv._run(f"cd {app_dir} && {cmd}")
+
+        run("git init -q -b staging && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init")
+        with open(os.path.join(app_dir, "old.vue"), "w") as fh:
+            fh.write("x")
+        run("git add old.vue && git -c user.email=t@t -c user.name=t commit -q -m add && git checkout -q -b work")
+        srv._tool_delete_file(app_dir, {"path": "old.vue"})
+        run("git add -- old.vue && git -c user.email=t@t -c user.name=t commit -q -m delete")
+        return bench
+
+    def test_a_committed_deletion_is_a_changed_file(self):
+        bench = self._repo_with_deleted_file()
+        with patch.object(srv, "BENCH_DIR", bench):
+            self.assertEqual(srv._collect_changed_files("one_bpmn", "staging"), {"old.vue": None})
+
+    def test_a_delete_only_change_opens_a_pr(self):
+        bench = self._repo_with_deleted_file()
+        run_ctx = {"git_branch": "staging", "work_item_description": "Remove old.vue.", "github_token": "t", "correlation_id": "c"}
+        with patch.object(srv, "BENCH_DIR", bench), patch.object(
+            srv, "_run_tests", return_value=(True, "", "", [])
+        ), patch.object(srv, "_open_pr", return_value=("https://github.com/x/y/pull/2", None)) as mock_open_pr:
+            result = srv._tool_open_pull_request("one_bpmn", {"summary": "removed"}, run_ctx)
+        self.assertEqual(result["pr_url"], "https://github.com/x/y/pull/2")
+        self.assertEqual(mock_open_pr.call_args[0][3], {"old.vue": None})
+
+    def test_open_pr_deletes_the_file_on_the_pr_branch(self):
+        calls = []
+
+        def fake_github(method, url, token, ok=(200, 201), json_body=None):
+            calls.append((method, url, json_body))
+            if method == "GET" and "/git/ref/" in url:
+                return {"object": {"sha": "base"}}
+            if method == "GET" and "/contents/old.vue" in url:
+                return {"sha": "abc"}
+            if method == "POST" and url.endswith("/pulls"):
+                return {"html_url": "https://github.com/x/y/pull/3", "number": 3}
+            return {}
+
+        with patch.object(srv, "_repo_for_local_clone", return_value="x/y"), patch.object(
+            srv, "_github_request", side_effect=fake_github
+        ):
+            pr_url, err = srv._open_pr("one_bpmn", "staging", "Remove old.vue.", {"old.vue": None}, "t", "c", "removed")
+        self.assertEqual((pr_url, err), ("https://github.com/x/y/pull/3", None))
+        deletes = [c for c in calls if c[0] == "DELETE"]
+        self.assertEqual(len(deletes), 1)
+        self.assertTrue(deletes[0][1].endswith("/contents/old.vue"))
+        self.assertEqual(deletes[0][2]["sha"], "abc")
+        self.assertFalse([c for c in calls if c[0] == "PUT" and "/contents/" in c[1]])
+        pr_body = next(c[2]["body"] for c in calls if c[0] == "POST" and c[1].endswith("/pulls"))
+        self.assertIn("`old.vue` (deleted)", pr_body)
+
+
 class TestLastOpenPrResult(unittest.TestCase):
     def test_no_trace_entries_returns_none(self):
         self.assertIsNone(srv._last_open_pr_result([]))
