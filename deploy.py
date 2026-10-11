@@ -46,6 +46,7 @@ IMAGE_TAG = "dev-agent-sandbox"
 _ENVIRONMENTS = {
     "production": {
         "service": "dev-agent-sandbox",
+        "job": "dev-agent-sandbox-job",
         "secrets": {
             "GITHUB_TOKEN": "dev-agent-github-token",
             "CALLBACK_HMAC_SECRET": "dev-agent-callback-secret",
@@ -53,6 +54,7 @@ _ENVIRONMENTS = {
     },
     "beta": {
         "service": "dev-agent-sandbox-beta",
+        "job": "dev-agent-sandbox-job-beta",
         "secrets": {
             "GITHUB_TOKEN": "dev-agent-github-token-beta",
             "CALLBACK_HMAC_SECRET": "dev-agent-callback-secret-beta",
@@ -86,6 +88,11 @@ CLOUD_RUN_MAX_INST = "3"
 CLOUD_RUN_MIN_INST = "1"
 CLOUD_RUN_TIMEOUT = "3600"
 
+# A Job execution carries one Work Item session (session_agent.py). Processa starts it, and
+# Processa's supervisor decides every retry, so Cloud Run never retries a task by itself.
+JOB_TASK_TIMEOUT = "3600"
+JOB_MAX_RETRIES = "0"
+
 
 def run(command: str, description: str) -> None:
     print(f"\n{'=' * 60}\n  {description}\n{'=' * 60}")
@@ -115,6 +122,10 @@ def deploy(
     location: str = "us-central1",
     use_baked: bool = False,
     callback_host: str = "",
+    job: bool = False,
+    processa_host: str = "",
+    no_traffic: bool = False,
+    tag: str = "",
 ) -> None:
     if env not in _ENVIRONMENTS:
         print(f"[ERROR] --env must be one of {list(_ENVIRONMENTS)}, got '{env}'.")
@@ -125,6 +136,9 @@ def deploy(
 
     service_name = _ENVIRONMENTS[env]["service"]
     secret_names = _ENVIRONMENTS[env]["secrets"]
+    if no_traffic and not tag:
+        print("[ERROR] --no-traffic needs --tag, the name of the revision's own test address.")
+        exit(1)
 
     registry = f"{location}-docker.pkg.dev"
     # The docker tag is the env-specific service name, not a shared `:latest`
@@ -183,9 +197,15 @@ def deploy(
         print(f"[WARN] --callback-host not set for '{env}' — the sandbox will accept a callback_url to any https host.")
     env_vars = ",".join(env_var_list)
 
+    if job:
+        _deploy_job(env, project_id, location, remote_image, use_baked, processa_host)
+        return
+
+    traffic = f"--no-traffic --tag={tag} " if no_traffic else ""
     run(
         f"gcloud run deploy {service_name} "
         f"--image={remote_image} "
+        f"{traffic}"
         f"--region={location} "
         f"--platform=managed "
         f"--port={CLOUD_RUN_PORT} "
@@ -200,7 +220,7 @@ def deploy(
         f'--set-secrets="{secrets}" '
         f"--project={project_id} "
         f"--quiet",
-        f"STAGE 4 / 4 — Deploying '{env}' to Google Cloud Run",
+        f"STAGE 4 / 4 - Deploying '{env}' to Google Cloud Run",
     )
 
     print("\n" + "=" * 60)
@@ -220,6 +240,35 @@ def deploy(
     print(f"  gcloud run services describe {service_name} --region={location} --project={project_id} --format='value(status.url)'")
 
 
+def _deploy_job(env: str, project_id: str, location: str, remote_image: str, use_baked: bool, processa_host: str) -> None:
+    """Create or update this environment's Cloud Run Job. It holds no secret: the container gets its
+    settings from Processa at registration, over HTTPS, with a one-time token."""
+    job_name = _ENVIRONMENTS[env]["job"]
+    env_vars = [f"PYTHONUNBUFFERED=1", f"SKIP_SETUP={'1' if use_baked else '0'}", f"SANDBOX_ENV={env}"]
+    if processa_host:
+        env_vars.append(f"ALLOWED_PROCESSA_HOST={processa_host}")
+    else:
+        print(f"[WARN] --processa-host not set for '{env}' - the job will call any https Processa address it is given.")
+    run(
+        f"gcloud run jobs deploy {job_name} "
+        f"--image={remote_image} "
+        f"--region={location} "
+        f"--memory={CLOUD_RUN_MEMORY} "
+        f"--cpu={CLOUD_RUN_CPU} "
+        f"--tasks=1 "
+        f"--max-retries={JOB_MAX_RETRIES} "
+        f"--task-timeout={JOB_TASK_TIMEOUT} "
+        f'--set-env-vars="{",".join(env_vars)}" '
+        f"--project={project_id} "
+        f"--quiet",
+        f"STAGE 4 / 4 - Deploying the '{env}' session Job to Google Cloud Run",
+    )
+    print(f"\n  Job     : {job_name}  ({location})")
+    print(f"  Processa Settings > Sandbox Jobs: project={project_id}, region={location}, name={job_name}")
+    print(f"  Grant the service account in Processa's Sandbox Caller Key roles/run.invoker on this Job")
+    print(f"  (it runs and cancels executions) and roles/run.viewer to read their status.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Deploy the dev-agent sandbox to Cloud Run")
     parser.add_argument("--env", choices=list(_ENVIRONMENTS), default="beta", help="Which environment to deploy — defaults to beta, never production, to avoid an accidental prod push")
@@ -227,6 +276,10 @@ if __name__ == "__main__":
     parser.add_argument("--region", default="us-central1")
     parser.add_argument("--use-baked", action="store_true", help="Deploy the pre-baked golden image for this env (see bake_image.sh) instead of building fresh")
     parser.add_argument("--callback-host", default="", help="Hostname of this environment's Processa bench — pins ALLOWED_CALLBACK_HOST so the sandbox can't be pointed elsewhere")
+    parser.add_argument("--job", action="store_true", help="Deploy the session Job (one execution per Work Item) instead of the always-on service")
+    parser.add_argument("--processa-host", default="", help="With --job: pins ALLOWED_PROCESSA_HOST so the container can only call this environment's Processa")
+    parser.add_argument("--no-traffic", action="store_true", help="Deploy the service revision without sending it traffic; reach it at its --tag address, then shift traffic")
+    parser.add_argument("--tag", default="", help="With --no-traffic: the revision's tag, for example candidate")
     args = parser.parse_args()
     deploy(
         env=args.env,
@@ -234,4 +287,8 @@ if __name__ == "__main__":
         location=args.region,
         use_baked=args.use_baked,
         callback_host=args.callback_host,
+        job=args.job,
+        processa_host=args.processa_host,
+        no_traffic=args.no_traffic,
+        tag=args.tag,
     )

@@ -58,7 +58,7 @@ import anthropic
 
 _GITHUB_API = "https://api.github.com"
 
-BENCH_DIR = "/home/frappe/frappe-bench"
+BENCH_DIR = os.environ.get("BENCH_DIR", "/home/frappe/frappe-bench")
 SITE_NAME = "sandbox"
 
 # Sandbox-infra config, set per environment by deploy.py (SANDBOX_ENV,
@@ -132,7 +132,9 @@ def _set_status(correlation_id, **fields):
 
 
 _SLOW_ACTIONS = frozenset({"run_tests", "open_pull_request"})
-_FAST_ACTIONS = frozenset({"read_file", "write_file", "edit_file", "delete_file", "list_files"})
+_FAST_ACTIONS = frozenset({
+    "read_file", "write_file", "edit_file", "delete_file", "list_files", "read_files", "grep_files", "apply_edits",
+})
 
 REQUIRED_ACTION_FIELDS = (
     "correlation_id", "action", "target_app", "git_branch", "work_item_description",
@@ -239,6 +241,25 @@ def _validate_tool_call_payload(payload):
     if not isinstance(payload.get("args") or {}, dict):
         return "args must be an object"
     return _validate_identifiers(payload)
+
+
+class _Timings:
+    """Milliseconds one request spends in each kind of work (git, tool, migrate, tests, pr)."""
+
+    def __init__(self):
+        self.ms = {}
+        self._started = time.monotonic()
+
+    @contextlib.contextmanager
+    def span(self, name):
+        began = time.monotonic()
+        try:
+            yield
+        finally:
+            self.ms[name] = self.ms.get(name, 0) + int((time.monotonic() - began) * 1000)
+
+    def report(self):
+        return {**self.ms, "total": int((time.monotonic() - self._started) * 1000)}
 
 
 def _run(cmd, **kwargs):
@@ -365,7 +386,9 @@ def _checkout_or_create_head_branch(target_app, git_branch, head_branch):
         if fetch_head.returncode == 0:
             # -f: see _checkout_target_branch — the working tree can already
             # be dirty from bake time, and nothing in it is worth keeping.
-            checkout = _run(f"cd {shlex.quote(app_dir)} && git checkout -f -B {shlex.quote(head_branch)} FETCH_HEAD")
+            checkout = _run(
+                f"cd {shlex.quote(app_dir)} && git checkout -f -B {shlex.quote(head_branch)} FETCH_HEAD && git clean -fdq"
+            )
             if checkout.returncode != 0:
                 return False, f"git checkout of {head_branch} failed: {_scrub(checkout.stderr)}"
             return True, None
@@ -374,10 +397,12 @@ def _checkout_or_create_head_branch(target_app, git_branch, head_branch):
         if fetch_base.returncode != 0:
             return False, f"git fetch of base branch {git_branch} failed: {_scrub(fetch_base.stderr)}"
         # -f: see _checkout_target_branch.
-        checkout_base = _run(f"cd {shlex.quote(app_dir)} && git checkout -f -B {shlex.quote(git_branch)} FETCH_HEAD")
+        checkout_base = _run(
+            f"cd {shlex.quote(app_dir)} && git checkout -f -B {shlex.quote(git_branch)} FETCH_HEAD && git clean -fdq"
+        )
         if checkout_base.returncode != 0:
             return False, f"git checkout of base branch {git_branch} failed: {_scrub(checkout_base.stderr)}"
-        new_branch = _run(f"cd {shlex.quote(app_dir)} && git checkout -B {shlex.quote(head_branch)}")
+        new_branch = _run(f"cd {shlex.quote(app_dir)} && git checkout -f -B {shlex.quote(head_branch)}")
         if new_branch.returncode != 0:
             return False, f"git checkout -B {head_branch} failed: {_scrub(new_branch.stderr)}"
         push = _run(f"cd {shlex.quote(app_dir)} && git push -u origin {shlex.quote(head_branch)}")
@@ -398,6 +423,7 @@ def _git_identity_for(agent_name):
 
 
 def _commit_and_push(target_app, head_branch, path, message, agent_name="Dev Agent"):
+    # path is one repo-relative path, or a list of them for a multi-file change.
     """Durably records a write_file/edit_file change on the head branch
     immediately — not left as a local, uncommitted change — so the NEXT
     tool call for this work order (run_tests, open_pull_request, or even
@@ -407,7 +433,8 @@ def _commit_and_push(target_app, head_branch, path, message, agent_name="Dev Age
     github_token = os.environ.get("GITHUB_TOKEN", "").strip()
     user_name, user_email = _git_identity_for(agent_name)
     with _authed_remote(app_dir, github_token):
-        _run(f"cd {shlex.quote(app_dir)} && git add -- {shlex.quote(path)}")
+        for staged in [path] if isinstance(path, str) else path:
+            _run(f"cd {shlex.quote(app_dir)} && git add -- {shlex.quote(staged)}")
         commit = _run(
             f"cd {app_dir} && git -c user.email={shlex.quote(user_email)} -c user.name={shlex.quote(user_name)} "
             f"commit -q -m {shlex.quote(message)}"
@@ -420,6 +447,36 @@ def _commit_and_push(target_app, head_branch, path, message, agent_name="Dev Age
         if push.returncode != 0:
             return False, push.stderr[-1000:]
         return True, None
+
+
+def _changed_paths(target_app, base_branch=None):
+    """Repo-relative paths changed on the working branch: committed there (against base_branch) or still pending."""
+    app_dir = f"{BENCH_DIR}/apps/{target_app}"
+    paths = []
+    if base_branch:
+        committed = _run(f"cd {shlex.quote(app_dir)} && git diff --name-only {shlex.quote(base_branch)}...HEAD")
+        if committed.returncode == 0:
+            paths += committed.stdout.strip().splitlines()
+    pending = _run(f"cd {shlex.quote(app_dir)} && git diff --name-only HEAD")
+    if pending.returncode == 0:
+        paths += pending.stdout.strip().splitlines()
+    return list(dict.fromkeys(p for p in paths if p))
+
+
+_SCHEMA_PATH = re.compile(r"(/doctype/[^/]+/[^/]+\.json$|/patches/|/fixtures/|(^|/)patches\.txt$|/custom/[^/]+\.json$)")
+
+
+def _needs_migrate(paths):
+    """Whether the change can alter the schema, so the site must be migrated before tests."""
+    return any(_SCHEMA_PATH.search(p) for p in paths)
+
+
+def _pending_paths(target_app):
+    """Paths with changes not yet committed: modified, deleted or new. A change already pushed is not among them."""
+    app_dir = f"{BENCH_DIR}/apps/{target_app}"
+    changed = _run(f"cd {shlex.quote(app_dir)} && git diff --name-only HEAD")
+    new = _run(f"cd {shlex.quote(app_dir)} && git ls-files --others --exclude-standard")
+    return {p for result in (changed, new) if result.returncode == 0 for p in result.stdout.splitlines() if p}
 
 
 def _migrate_site():
@@ -454,7 +511,7 @@ def _extract_failing_tests(*texts, limit=50):
     return names
 
 
-def _run_tests(target_app):
+def _run_tests(target_app, base_branch=None):
     # mobile_app_ionic isn't a Frappe app — no bench run-tests target exists
     # for it at all. Scope deliberately kept to build+unit-tests only:
     # yarn build (catches TS/template errors, matches CI) + vitest unit
@@ -483,12 +540,77 @@ def _run_tests(target_app):
     # still failed here. This is a workaround for that unrelated fixture
     # gap, not a fix for it — one_fm's own bug is untouched and would still
     # break a real Company/Warehouse creation anywhere else it happens.
-    result = _run(
-        f"cd {shlex.quote(BENCH_DIR)} && bench --site {shlex.quote(SITE_NAME)} run-tests --app {shlex.quote(target_app)} --skip-before-tests",
-        timeout=1800,
-    )
-    stdout, stderr = result.stdout[-4000:], result.stderr[-4000:]
-    return result.returncode == 0, stdout, stderr, _extract_failing_tests(stdout, stderr)
+    modules = _test_modules_for(f"{BENCH_DIR}/apps/{target_app}", _changed_paths(target_app, base_branch))
+    if not modules:
+        return True, "No test file matches the changed files, so no tests ran.", "", []
+    passed, out, err = True, "", ""
+    for module in modules[:_MAX_TEST_MODULES]:
+        result = _run(
+            f"cd {shlex.quote(BENCH_DIR)} && bench --site {shlex.quote(SITE_NAME)} run-tests --app {shlex.quote(target_app)} "
+            f"--module {shlex.quote(module)} --skip-before-tests",
+            timeout=1800,
+        )
+        passed = passed and result.returncode == 0
+        out += result.stdout[-4000:]
+        err += result.stderr[-4000:]
+    stdout, stderr = out[-4000:], err[-4000:]
+    return passed, stdout, stderr, _extract_failing_tests(out, err)
+
+
+_MAX_TEST_MODULES = 10
+
+
+def _test_modules_for(app_dir, paths):
+    """Dotted test modules for the changed files: a changed test file itself, or the test file beside or above a changed source file."""
+    modules = []
+    for rel in paths:
+        base, ext = os.path.splitext(rel)
+        if ext not in (".py", ".json"):
+            continue
+        folder, stem = os.path.split(base)
+        if ext == ".py" and stem.startswith("test_"):
+            candidates = [rel]
+        else:
+            candidates = [
+                f"{folder}/test_{stem}.py",
+                f"{folder}/tests/test_{stem}.py",
+                f"{os.path.dirname(folder)}/tests/test_{stem}.py",
+            ]
+        for candidate in candidates:
+            if os.path.isfile(os.path.join(app_dir, candidate)):
+                modules.append(candidate[:-3].replace("/", "."))
+                break
+    return list(dict.fromkeys(modules))
+
+
+_test_results = {}
+_TEST_RESULTS_KEPT = 20
+
+
+def _head_commit(target_app):
+    """The commit the working tree is on, so a test result can be tied to the code it ran against."""
+    app_dir = f"{BENCH_DIR}/apps/{target_app}"
+    return _run(f"cd {shlex.quote(app_dir)} && git rev-parse HEAD").stdout.strip()
+
+
+def _tree_fingerprint(target_app):
+    """The commit plus everything not yet committed, so equal fingerprints mean an identical tree."""
+    app_dir = f"{BENCH_DIR}/apps/{target_app}"
+    head = _run(f"cd {shlex.quote(app_dir)} && git rev-parse HEAD").stdout.strip()
+    pending = _run(f"cd {shlex.quote(app_dir)} && git status --porcelain && git diff HEAD").stdout
+    return f"{head}:{hashlib.sha1(pending.encode()).hexdigest()}"
+
+
+def _tests_for_tree(target_app, base_branch=None):
+    """_run_tests for the tree as it stands, reusing the last result while the tree has not changed."""
+    key = (target_app, _tree_fingerprint(target_app))
+    if key in _test_results:
+        return _test_results[key]
+    result = _run_tests(target_app, base_branch)
+    if len(_test_results) >= _TEST_RESULTS_KEPT:
+        _test_results.pop(next(iter(_test_results)))
+    _test_results[key] = result
+    return result
 
 
 def _collect_changed_files(target_app, base_branch=None):
@@ -496,17 +618,8 @@ def _collect_changed_files(target_app, base_branch=None):
     file changed on the working branch: committed there by the fast tools
     (diffed against base_branch) or still uncommitted from the bundled coding loop."""
     app_dir = f"{BENCH_DIR}/apps/{target_app}"
-    paths = []
-    if base_branch:
-        committed = _run(f"cd {shlex.quote(app_dir)} && git diff --name-only {shlex.quote(base_branch)}...HEAD")
-        if committed.returncode == 0:
-            paths += committed.stdout.strip().splitlines()
-    pending = _run(f"cd {shlex.quote(app_dir)} && git diff --name-only HEAD")
-    if pending.returncode == 0:
-        paths += pending.stdout.strip().splitlines()
-
     files = {}
-    for rel_path in dict.fromkeys(p for p in paths if p):
+    for rel_path in _changed_paths(target_app, base_branch):
         abs_path = f"{app_dir}/{rel_path}"
         if not os.path.lexists(abs_path):
             files[rel_path] = None
@@ -613,18 +726,23 @@ def _open_pr(
         f"## Testing\n\n{testing_section}"
     )
 
+    # Changes the fast tools or a session checkpoint already pushed are on the branch. Only what is still
+    # uncommitted here (the bundled coding loop) goes up through the Contents API.
+    pending = _pending_paths(target_app)
+    uploads = {path: content for path, content in files.items() if path in pending}
     try:
-        ref = _github_request("GET", f"{_GITHUB_API}/repos/{repo}/git/ref/heads/{git_branch}", github_token)
-        base_sha = ref["object"]["sha"]
-        _github_request(
-            "POST",
-            f"{_GITHUB_API}/repos/{repo}/git/refs",
-            github_token,
-            ok=(201, 422),  # 422: branch already exists — fine, reuse it
-            json_body={"ref": f"refs/heads/{head_branch}", "sha": base_sha},
-        )
+        if uploads:
+            ref = _github_request("GET", f"{_GITHUB_API}/repos/{repo}/git/ref/heads/{git_branch}", github_token)
+            base_sha = ref["object"]["sha"]
+            _github_request(
+                "POST",
+                f"{_GITHUB_API}/repos/{repo}/git/refs",
+                github_token,
+                ok=(201, 422),  # 422: branch already exists, reuse it
+                json_body={"ref": f"refs/heads/{head_branch}", "sha": base_sha},
+            )
 
-        for path, content in files.items():
+        for path, content in uploads.items():
             existing = _github_request(
                 "GET",
                 f"{_GITHUB_API}/repos/{repo}/contents/{path}?ref={head_branch}",
@@ -806,6 +924,72 @@ def _closest_text(content, old_string):
     return {"current_text": "".join(lines[start:end]), "current_lines": f"{start + 1}-{end}"}
 
 
+_READ_FILES_MAX = 10
+_READ_FILES_MAX_CHARS = 20_000
+_GREP_MAX_MATCHES = 100
+_GREP_LINE_CHARS = 300
+_APPLY_EDITS_MAX = 20
+
+
+def _tool_read_files(app_dir, args):
+    """Several files in one call: each as read_file returns it, cut at a size that fits one tool result."""
+    paths = args.get("paths")
+    if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
+        return {"error": "paths must be a non-empty list of file paths"}
+    if len(paths) > _READ_FILES_MAX:
+        return {"error": f"at most {_READ_FILES_MAX} paths per call, got {len(paths)}"}
+    files = []
+    for path in paths:
+        one = _tool_read_file(app_dir, {"path": path})
+        content = one.get("content")
+        if isinstance(content, str) and len(content) > _READ_FILES_MAX_CHARS:
+            one = {**one, "content": content[:_READ_FILES_MAX_CHARS], "truncated": True,
+                   "total_chars": len(content), "hint": "Read the rest with read_file and offset and limit."}
+        files.append({"path": path, **one})
+    return {"files": files}
+
+
+def _tool_grep_files(app_dir, args):
+    """Lines matching a pattern across the app (tracked and new files, binaries skipped), capped in count and width."""
+    pattern = args.get("pattern")
+    if not isinstance(pattern, str) or not pattern.strip():
+        return {"error": "pattern is required"}
+    prefix = (args.get("path_prefix") or "").strip().lstrip("/")
+    try:
+        scope = os.path.relpath(_safe_path(app_dir, prefix), app_dir)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    mode = "--fixed-strings" if args.get("literal") else "--extended-regexp"
+    found = _run(
+        f"cd {shlex.quote(app_dir)} && git grep --untracked -n -I --no-color {mode} -e {shlex.quote(pattern)} -- {shlex.quote(scope)}"
+    )
+    if found.returncode not in (0, 1):
+        return {"error": found.stderr[-500:] or "grep failed"}
+    lines = found.stdout.splitlines()
+    matches = []
+    for line in lines[:_GREP_MAX_MATCHES]:
+        path, _, rest = line.partition(":")
+        number, _, text = rest.partition(":")
+        matches.append({"path": path, "line": int(number) if number.isdigit() else None, "text": text[:_GREP_LINE_CHARS]})
+    return {"matches": matches, "count": len(matches), "truncated": len(lines) > _GREP_MAX_MATCHES}
+
+
+def _tool_apply_edits(app_dir, args):
+    """Several edit_file replacements in order. Stops at the first one that fails; earlier ones stay applied."""
+    edits = args.get("edits")
+    if not isinstance(edits, list) or not edits or not all(isinstance(e, dict) for e in edits):
+        return {"error": "edits must be a non-empty list of {path, old_string, new_string}"}
+    if len(edits) > _APPLY_EDITS_MAX:
+        return {"error": f"at most {_APPLY_EDITS_MAX} edits per call, got {len(edits)}"}
+    paths = []
+    for index, edit in enumerate(edits):
+        one = _tool_edit_file(app_dir, edit)
+        if not one.get("edited"):
+            return {"edited": False, "applied": index, "paths": paths, "failed_edit": index, **one}
+        paths.append(one["path"])
+    return {"edited": True, "applied": len(edits), "paths": list(dict.fromkeys(paths))}
+
+
 # Confirmed live: one_bpmn alone (one target app, not the whole bench) already
 # has 738 files under its own tree — a 500 cap silently truncated a real
 # listing, and the model never acted on the "truncated": true it was given,
@@ -824,6 +1008,7 @@ _LIST_FILES_MAX = 5000
 # what a single ordinary call can cost, independent of how many files that
 # turns out to be.
 _LIST_FILES_MAX_CHARS = 50_000
+_LIST_FILES_SKIPPED_DIRS = {".git", "node_modules", "__pycache__", "dist"}
 
 
 def _tool_list_files(app_dir, args):
@@ -836,13 +1021,15 @@ def _tool_list_files(app_dir, args):
     line_counts = {}
     chars = 0
     for root, dirs, filenames in os.walk(start_dir):
-        dirs[:] = [d for d in dirs if d != ".git"]
+        dirs[:] = [d for d in dirs if d not in _LIST_FILES_SKIPPED_DIRS]
         for name in filenames:
             abs_path = os.path.join(root, name)
             rel = os.path.relpath(abs_path, app_dir)
             paths.append(rel)
-            line_counts[rel] = _line_count(app_dir, rel)
-            chars += len(rel) + len(str(line_counts[rel])) + 6  # quotes, colon, comma, close enough to bound intent
+            # Counting reads every file, so only the directory the model asked about is counted.
+            if prefix:
+                line_counts[rel] = _line_count(app_dir, rel)
+            chars += len(rel) + len(str(line_counts.get(rel, ""))) + 6  # quotes, colon, comma, close enough to bound intent
             if len(paths) >= _LIST_FILES_MAX or chars >= _LIST_FILES_MAX_CHARS:
                 return {"files": paths, "line_counts": line_counts, "count": len(paths), "truncated": True}
     return {"files": paths, "line_counts": line_counts, "count": len(paths), "truncated": False}
@@ -867,8 +1054,8 @@ def _line_count(app_dir, rel_path):
     return data.count(b"\n") + 1
 
 
-def _tool_run_tests(target_app, args):
-    passed, stdout, stderr, failing_tests = _run_tests(target_app)
+def _tool_run_tests(target_app, args, base_branch=None):
+    passed, stdout, stderr, failing_tests = _tests_for_tree(target_app, base_branch)
     return {
         "passed": passed, "stdout_tail": stdout[-2000:], "stderr_tail": stderr[-2000:],
         "failing_tests": failing_tests,
@@ -878,16 +1065,15 @@ def _tool_run_tests(target_app, args):
 def _tool_open_pull_request(target_app, args, run_ctx):
     """PR-creation as something the model explicitly decides to call, rather
     than automatic post-loop logic (run_job no longer calls _open_pr itself —
-    see its own docstring). Re-runs the real test suite HERE, independent of
-    whatever the model last saw from its own run_tests calls, so the PR's
-    pass/fail flagging is always accurate to the working tree's current state
-    at the moment of opening — not dependent on the model remembering to
-    re-test after its last edit before calling this."""
+    see its own docstring). Takes the test result for the tree as it stands
+    now: reused when the tree is unchanged since the model's last run_tests,
+    run fresh when anything changed after it, so the PR's pass/fail flagging
+    never depends on the model remembering to re-test."""
     summary = (args.get("summary") or "").strip()
     files = _collect_changed_files(target_app, run_ctx["git_branch"])
     if not files:
         return {"error": "no changes to commit yet — nothing to open a pull request for"}
-    passed, _stdout, stderr, failing_tests = _run_tests(target_app)
+    passed, _stdout, stderr, failing_tests = _tests_for_tree(target_app, run_ctx["git_branch"])
     pr_url, pr_error = _open_pr(
         target_app, run_ctx["git_branch"], run_ctx["work_item_description"], files,
         run_ctx["github_token"], run_ctx["correlation_id"], summary,
@@ -911,7 +1097,7 @@ def _dispatch_tool(app_dir, target_app, name, args, run_ctx):
     if name == "list_files":
         return _tool_list_files(app_dir, args)
     if name == "run_tests":
-        return _tool_run_tests(target_app, args)
+        return _tool_run_tests(target_app, args, run_ctx["git_branch"])
     if name == "open_pull_request":
         return _tool_open_pull_request(target_app, args, run_ctx)
     # _validate_payload already rejects a dispatch naming an unimplemented
@@ -922,7 +1108,7 @@ def _dispatch_tool(app_dir, target_app, name, args, run_ctx):
     return {"error": f"unknown tool {name!r} — the sandbox has no implementation for it"}
 
 
-def _handle_tool_call(payload):
+def _handle_tool_call(payload, timings=None):
     """POST /tool_call's synchronous handler — one fast action
     (read_file/write_file/edit_file/list_files) against the work order's
     own deterministic head branch, answered inline. Each call independently
@@ -937,13 +1123,30 @@ def _handle_tool_call(payload):
     work_item_id = payload.get("work_item_id")
     args = payload.get("args") or {}
     agent_name = (payload.get("agent_name") or "Dev Agent").strip() or "Dev Agent"
+    timings = timings or _Timings()
 
     head_branch = _head_branch_for(target_app, git_branch, work_item_description, work_item_id)
-    ok, err = _checkout_or_create_head_branch(target_app, git_branch, head_branch)
+    with timings.span("git"):
+        ok, err = _checkout_or_create_head_branch(target_app, git_branch, head_branch)
     if not ok:
         return {"error": err}
 
     app_dir = f"{BENCH_DIR}/apps/{target_app}"
+    with timings.span("tool"):
+        result, changed = _apply_tool(app_dir, target_app, action, args)
+    if changed:
+        with timings.span("git"):
+            ok, err = _commit_and_push(target_app, head_branch, changed, f"{action} via {agent_name}", agent_name)
+        if not ok:
+            result["commit_error"] = err
+    return result
+
+
+# The file operations a fast action names: the result, and the path or paths it changed (None when it changed nothing).
+_CHANGING_RESULT_KEYS = {"write_file": "written", "edit_file": "edited", "delete_file": "deleted", "apply_edits": "applied"}
+
+
+def _apply_tool(app_dir, target_app, action, args):
     # search_frontend reports bench paths ("one_bpmn/spiff/..."); the app's own package keeps its "one_bpmn/..." paths.
     prefix = f"{target_app}/"
     for key in ("path", "path_prefix"):
@@ -952,40 +1155,19 @@ def _handle_tool_call(payload):
             top = value[len(prefix):].split("/", 1)[0]
             if top and not os.path.exists(os.path.join(app_dir, target_app, top)) and os.path.exists(os.path.join(app_dir, top)):
                 args = {**args, key: value[len(prefix):]}
-    if action == "read_file":
-        return _tool_read_file(app_dir, args)
-    if action == "list_files":
-        return _tool_list_files(app_dir, args)
-    if action == "write_file":
-        result = _tool_write_file(app_dir, args)
-        if result.get("written"):
-            ok, err = _commit_and_push(
-                target_app, head_branch, args.get("path") or "", f"write_file via {agent_name}", agent_name,
-            )
-            if not ok:
-                result["commit_error"] = err
-        return result
-    if action == "edit_file":
-        result = _tool_edit_file(app_dir, args)
-        if result.get("edited"):
-            ok, err = _commit_and_push(
-                target_app, head_branch, args.get("path") or "", f"edit_file via {agent_name}", agent_name,
-            )
-            if not ok:
-                result["commit_error"] = err
-        return result
-    if action == "delete_file":
-        result = _tool_delete_file(app_dir, args)
-        if result.get("deleted"):
-            ok, err = _commit_and_push(
-                target_app, head_branch, args.get("path") or "", f"delete_file via {agent_name}", agent_name,
-            )
-            if not ok:
-                result["commit_error"] = err
-        return result
-    # _validate_tool_call_payload already restricts action to _FAST_ACTIONS —
-    # reaching this means that set and this dispatcher drifted apart.
-    return {"error": f"unknown fast tool action {action!r}"}
+    tools = {
+        "read_file": _tool_read_file, "list_files": _tool_list_files, "read_files": _tool_read_files,
+        "grep_files": _tool_grep_files, "write_file": _tool_write_file, "edit_file": _tool_edit_file,
+        "delete_file": _tool_delete_file, "apply_edits": _tool_apply_edits,
+    }
+    if action not in tools:
+        # _validate_tool_call_payload already restricts action to _FAST_ACTIONS,
+        # reaching this means that set and this dispatcher drifted apart.
+        return {"error": f"unknown fast tool action {action!r}"}, None
+    result = tools[action](app_dir, args)
+    if not result.get(_CHANGING_RESULT_KEYS.get(action, "")):
+        return result, None
+    return result, result["paths"] if action == "apply_edits" else (args.get("path") or "")
 
 
 def _report_unexpected_failure(job, payload):
@@ -1015,35 +1197,48 @@ def run_single_action_job(payload):
     github_token = payload["github_token"]
     args = payload.get("args") or {}
     callback_url = payload["callback_url"]
+    timings = _Timings()
 
     head_branch = _head_branch_for(target_app, git_branch, work_item_description, work_item_id)
 
     _set_status(correlation_id, state="checking_out_branch")
-    ok, err = _checkout_or_create_head_branch(target_app, git_branch, head_branch)
+    with timings.span("git"):
+        ok, err = _checkout_or_create_head_branch(target_app, git_branch, head_branch)
     if not ok:
         _set_status(correlation_id, state="failed", error=err)
-        _post_callback(callback_url, {"correlation_id": correlation_id, "status": "failed", "error": err})
+        _post_callback(
+            callback_url,
+            {"correlation_id": correlation_id, "status": "failed", "error": err, "timings_ms": timings.report()},
+        )
         return
 
     _set_status(correlation_id, state="migrating")
-    ok, mig_out, mig_err = _migrate_site()
+    ok, mig_out, mig_err = True, "", ""
+    if _needs_migrate(_changed_paths(target_app, git_branch)):
+        with timings.span("migrate"):
+            ok, mig_out, mig_err = _migrate_site()
     if not ok:
         _set_status(correlation_id, state="failed", error=mig_err)
         _post_callback(
             callback_url,
-            {"correlation_id": correlation_id, "status": "failed", "error": mig_err, "stdout_tail": mig_out},
+            {
+                "correlation_id": correlation_id, "status": "failed", "error": mig_err,
+                "stdout_tail": mig_out, "timings_ms": timings.report(),
+            },
         )
         return
 
     if action == "run_tests":
         _set_status(correlation_id, state="running_tests")
-        passed, stdout, stderr, failing_tests = _run_tests(target_app)
+        with timings.span("tests"):
+            passed, stdout, stderr, failing_tests = _tests_for_tree(target_app, git_branch)
         body = {
             "correlation_id": correlation_id,
             "status": "tests_passed" if passed else "tests_failed",
             "stdout_tail": stdout,
             "stderr_tail": stderr,
             "failing_tests": failing_tests,
+            "commit": _head_commit(target_app),
         }
     elif action == "open_pull_request":
         run_ctx = {
@@ -1055,7 +1250,8 @@ def run_single_action_job(payload):
             "agent_name": payload.get("agent_name"),
         }
         _set_status(correlation_id, state="opening_pr")
-        result = _tool_open_pull_request(target_app, args, run_ctx)
+        with timings.span("pr"):
+            result = _tool_open_pull_request(target_app, args, run_ctx)
         status = "tests_passed" if result.get("pr_url") else "tests_failed"
         body = {"correlation_id": correlation_id, "status": status}
         if result.get("pr_url"):
@@ -1069,6 +1265,7 @@ def run_single_action_job(payload):
         # /run — reaching this means that set and this branch drifted apart.
         body = {"correlation_id": correlation_id, "status": "failed", "error": f"unknown action {action!r}"}
 
+    body["timings_ms"] = timings.report()
     _set_status(correlation_id, state="done", result=body.get("status"))
     _post_callback(callback_url, body)
 
@@ -1290,7 +1487,7 @@ def run_job(payload):
     # changed since either of those, and status/callback must reflect the
     # tree as it actually stands right now, not a possibly-stale self-report.
     _set_status(correlation_id, state="running_tests")
-    passed, stdout, stderr, failing_tests = _run_tests(target_app)
+    passed, stdout, stderr, failing_tests = _tests_for_tree(target_app, git_branch)
 
     status = "tests_passed" if passed else "tests_failed"
     body = {
@@ -1334,10 +1531,12 @@ def run_job(payload):
 
 
 class Handler(BaseHTTPRequestHandler):
-    def _send_json(self, code, body):
+    def _send_json(self, code, body, timings=None):
         payload = json.dumps(body).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
+        if timings:
+            self.send_header("X-Timings-Ms", json.dumps(timings.report()))
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -1382,6 +1581,12 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         correlation_id = payload.get("correlation_id") or str(uuid.uuid4())
+        with _jobs_lock:
+            known = correlation_id in _jobs
+        if known:
+            # A retried dispatch whose first answer was lost: the run is already going, so do not start it twice.
+            self._send_json(202, {"correlation_id": correlation_id, "status": "accepted"})
+            return
         _set_status(correlation_id, state="accepted")
         # action present -> one of the 6 tools' own slow (run_tests/
         # open_pull_request) dispatch; absent -> dispatch_to_sandbox's
@@ -1406,12 +1611,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(422, {"error": error})
             return
 
+        timings = _Timings()
         try:
-            result = _handle_tool_call(payload)
+            result = _handle_tool_call(payload, timings)
         except Exception as exc:  # noqa: BLE001 — reported to the caller, not a 500
-            self._send_json(200, {"error": f"tool_call failed: {exc}"})
+            self._send_json(200, {"error": f"tool_call failed: {exc}"}, timings)
             return
-        self._send_json(200, result)
+        self._send_json(200, result, timings)
 
     def log_message(self, fmt, *args):
         print(f"[dev_agent_server] {self.address_string()} - {fmt % args}")
