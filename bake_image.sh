@@ -62,20 +62,21 @@ if [ "${CODE_ONLY:-0}" = "1" ]; then
 
     echo "  Copying dev_agent_server.py ..."
     docker cp dev_agent_server.py $CONTAINER_NAME:/home/frappe/dev_agent_server.py
+    docker cp session_agent.py $CONTAINER_NAME:/home/frappe/session_agent.py
     echo "  Copying entrypoint.sh ..."
     docker cp entrypoint.sh $CONTAINER_NAME:/entrypoint.sh
 
     docker start $CONTAINER_NAME
     sleep 2
     docker exec $CONTAINER_NAME bash -c "
-        chown frappe:frappe /home/frappe/dev_agent_server.py
+        chown frappe:frappe /home/frappe/dev_agent_server.py /home/frappe/session_agent.py
         sed -i 's/\r\$//' /entrypoint.sh
         chmod +x /entrypoint.sh
     "
     docker stop $CONTAINER_NAME
 
     echo "  Committing updated image..."
-    docker commit --change 'ENTRYPOINT ["/entrypoint.sh"]' $CONTAINER_NAME $BAKED_IMAGE_NAME
+    docker commit --change 'ENTRYPOINT ["/entrypoint.sh"]' --change 'ENV GITHUB_TOKEN=' $CONTAINER_NAME $BAKED_IMAGE_NAME
     docker rm $CONTAINER_NAME
 
     echo "--- [BAKE] Code-only re-bake complete: $BAKED_IMAGE_NAME ---"
@@ -136,7 +137,7 @@ docker stop $CONTAINER_NAME
 echo "Stage 4a — Container stop: $((SECONDS - T))s"
 
 T=$SECONDS
-docker commit $CONTAINER_NAME $BAKED_IMAGE_NAME
+docker commit --change 'ENV GITHUB_TOKEN=' $CONTAINER_NAME $BAKED_IMAGE_NAME
 echo "Stage 4b — Docker commit: $((SECONDS - T))s"
 
 docker rm $CONTAINER_NAME

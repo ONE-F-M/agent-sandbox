@@ -199,6 +199,9 @@ fi
 if [ $# -gt 0 ]; then
   echo "DEBUG: Executing custom command as frappe: $@"
   exec sudo -E -H -u frappe bash -c "$*"
+elif [ -n "$SESSION_ID" ]; then
+  echo "DEBUG: Starting session_agent.py (Cloud Run Job session $SESSION_ID)..."
+  exec sudo -E -H -u frappe bash -c "cd /home/frappe && python3 session_agent.py"
 else
   echo "DEBUG: Starting dev_agent_server.py (generic, config-free driver)..."
   exec sudo -E -H -u frappe bash -c "cd /home/frappe && python3 dev_agent_server.py"

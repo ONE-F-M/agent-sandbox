@@ -124,7 +124,7 @@ COPY entrypoint.sh /entrypoint.sh
 RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Generic driver — copied in, config-free (see dev_agent_server.py).
-COPY dev_agent_server.py /home/frappe/dev_agent_server.py
-RUN chown frappe:frappe /home/frappe/dev_agent_server.py
+COPY dev_agent_server.py session_agent.py /home/frappe/
+RUN chown frappe:frappe /home/frappe/dev_agent_server.py /home/frappe/session_agent.py
 
 ENTRYPOINT ["/entrypoint.sh"]

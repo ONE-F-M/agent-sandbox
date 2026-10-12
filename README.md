@@ -196,6 +196,9 @@ min-instances stays at 1.
 
 Note the printed **Service URL** — you'll need it in step 10.
 
+To deploy without sending traffic to the new revision (`--no-traffic --tag candidate`), to pin the hosts
+the sandbox may call back (`--callback-host`), or to roll back, see "Shipping a change" below.
+
 ## 7. Create the service account the connector authenticates as
 
 This is a separate, non-human identity from your own GCP login and from the
@@ -281,6 +284,9 @@ the connector builds won't point anywhere reachable. Note ngrok's free tier
 issues a new random subdomain every time it restarts — update `host_name`
 again whenever that happens, or the callback will silently fail to reach you.
 
+While you test through ngrok, deploy the sandbox without `--callback-host`. A pinned service rejects the
+ngrok hostname, and every `run_tests` and `open_pull_request` then fails to report back.
+
 ## Beta vs. production
 
 Every step above has a beta equivalent — swap `production` for `beta` and the
@@ -293,12 +299,156 @@ production or vice versa. `deploy.py` and `bake_image.sh` both default to
 production always has to be requested explicitly with `--env production` /
 `ENV=production`.
 
-## Rebaking after a code change
+## Shipping a change (rebake, test, go live, roll back)
 
-`entrypoint.sh`, `dev_agent_server.py`, and the Dockerfile are all baked into
-the image at build time — a change to any of them needs a fresh
-`./bake_image.sh` + `deploy.py --use-baked` cycle before it takes effect.
-Nothing about the running container watches these files for changes.
+Which rebake a change needs:
+
+| What changed | What to run |
+|---|---|
+| `dev_agent_server.py`, `session_agent.py`, `entrypoint.sh` | the code-only rebake below (about a minute) |
+| apps, dependencies, `Dockerfile.frappe_runtime`, the clone scripts | a full bake (step 5) |
+| only `deploy.py` options, such as the callback host | no bake, deploy again |
+
+Nothing in the running container watches these files, so a change takes effect only after a rebake and a deploy.
+The bake copies the files from your working directory: check `git status` first so nothing stray goes into the image.
+
+### 1. Rebake the code into the existing image
+
+```bash
+cd ~/Desktop/agent-sandbox && ENV=production CODE_ONLY=1 ./bake_image.sh
+```
+
+This needs the baked image on this machine (`docker image inspect dev-agent-sandbox:baked-production`).
+If it is missing, run the full bake from step 5 first. `CODE_ONLY=1` copies `dev_agent_server.py`,
+`session_agent.py` and `entrypoint.sh` into that image and commits it, with `GITHUB_TOKEN` cleared from the image environment.
+
+### 2. Deploy it as a revision that gets no traffic
+
+```bash
+python3 deploy.py --env production --use-baked --no-traffic --tag candidate
+```
+
+Live traffic stays on the current revision. The deploy prints a tagged URL for the new one,
+`https://candidate---dev-agent-sandbox-<hash>-uc.a.run.app`. `--no-traffic` needs `--tag`.
+Leave `--callback-host` off while you test through ngrok (see "Callback host pin" below).
+
+### 3. Test the candidate
+
+Check it is healthy with your own gcloud login (this needs the Cloud Run Invoker role on your account):
+
+```bash
+curl -s -H "Authorization: Bearer $(gcloud auth print-identity-token)" https://<tagged-url>/health
+```
+
+The Console works too: Cloud Run, dev-agent-sandbox, TESTING, `GET /health`. Expect `{"status": "ok"}`.
+
+Processa authenticates differently. It mints a token for the caller service account, with an audience, and uses one setting,
+**Agent Sandbox URL**, both as the address it calls and as that audience. Cloud Run accepts the token only when the audience
+is the **service** URL and answers 401 when it is the tagged URL, so you cannot put the tagged URL in that setting.
+To test with a real Work Item, send the service's traffic to the candidate.
+Do this only when nothing else uses the sandbox, because everything on the service URL then runs on the candidate:
+
+```bash
+gcloud run services update-traffic dev-agent-sandbox --region us-central1 --project ai-agents-10 --to-tags candidate=100
+```
+
+Confirm which revision holds the traffic:
+
+```bash
+gcloud run services describe dev-agent-sandbox --region us-central1 --project ai-agents-10 --format="value(status.traffic)"
+```
+
+Keep `bench start` and the ngrok tunnel running during the test: the sandbox posts its results back through ngrok (step 12).
+
+### 4. Go live
+
+Deploy again with the callback host pin and without `--no-traffic`. No new bake is needed:
+it reuses the same baked image and only changes the environment variable.
+
+```bash
+python3 deploy.py --env production --use-baked --callback-host one-fm.com,staging.onefm.com,businessanalyst.onefm.com
+```
+
+### 5. Roll back
+
+```bash
+gcloud run revisions list --service dev-agent-sandbox --region us-central1 --project ai-agents-10
+```
+
+```bash
+gcloud run services update-traffic dev-agent-sandbox --region us-central1 --project ai-agents-10 --to-revisions=<previous-revision>=100
+```
+
+### Callback host pin
+
+`--callback-host` sets `ALLOWED_CALLBACK_HOST` on the service. The sandbox then refuses a `callback_url`
+that is not `https` or whose hostname is not exactly one of the pinned hosts, so the results of a run
+(test output and the pull request link) can only be sent to your own Processa benches.
+
+- Give the hostname only, with no `https://` and no path. Several hosts go in one comma-separated list, as in step 4.
+- It must match what Processa sends. Processa builds the callback address from the site's `host_name`, forced to `https`.
+  A host that only ends with a pinned host (for example `evil-one-fm.com`) is refused.
+- Without the flag the sandbox accepts any `https` callback and the deploy prints a warning.
+- The pin is set per revision, so a candidate deployed without it stays unpinned until you deploy again with it.
+- `deploy.py` passes the variables to `gcloud` with the `^@^` delimiter so the commas in a list survive.
+- All the Processa benches that share one service must hold the same callback signing secret
+  (`dev-agent-callback-secret`) and a key for the caller service account that has the Invoker role.
+
+### Session Job (optional, off by default)
+
+One Cloud Run Job execution per Work Item instead of one request per tool call. It is deployed separately
+and an agent uses it only when `sandbox_use_job` is ticked on its AI Agent Configuration.
+
+```bash
+python3 deploy.py --env production --use-baked --job --processa-host <processa-hostname>
+```
+
+`--processa-host` pins `ALLOWED_PROCESSA_HOST`, so the container can call only that Processa. It takes one hostname.
+The Job has its own name per environment, so a Job deployed for testing is never the production one.
+
+### Testing the session Job
+
+**1. Locally, with no cloud (about 10 seconds).** With `bench start` running, from the bench's `sites` folder:
+
+```bash
+cd ~/Desktop/frappe-bench/sites && ../env/bin/python ~/Desktop/agent-sandbox/dev/local_session_check.py
+```
+
+It creates a test session through your local Processa, launches the real `session_agent.py` as a separate process with the
+session id and one-time token, and checks nine things: the agent registers, answers commands over HTTP, applies an edit
+(committed locally and not yet pushed), searches, numbers the commands, and on close pushes the work and exits.
+It uses throwaway git repositories and removes its test records. Only the Cloud Run start is replaced.
+It proves the protocol and the code. It does not prove cold starts, IAM, networking or cost.
+
+**2. A real Cloud Run Job, driven from your local Processa through ngrok.**
+
+1. Deploy the Job pinned to your current ngrok hostname (a restart of ngrok changes it, so redeploy then):
+
+```bash
+python3 deploy.py --env production --use-baked --job --processa-host <your-ngrok-hostname>
+```
+
+2. Let the caller service account start executions of the Job (it needs permission to run a Job with overrides,
+   for example `roles/run.developer` on the Job; check the first error if it fails).
+3. In Processa Settings, fill the Sandbox Job fields: project, region, job name (`dev-agent-sandbox-job` for production),
+   and **Sandbox Job Processa URL** with the ngrok `https` address.
+4. On one agent's AI Agent Configuration, tick **Sandbox Use Job** (the **Sandbox** section of the form, or the **Sandbox**
+   block of the agent task dialog in the Process UI), then run a small Work Item.
+5. Watch the **Agent Sandbox Session** record: queued, starting, registered, active, closed. Each call is an
+   **Agent Sandbox Session Command**, and the whole run is on its **Agent Sandbox Trace**.
+
+Helpers for a local bench (run from `<bench>/sites` with `../env/bin/python`):
+
+- `dev/local_job_test.py status|on|off` shows the state, fills the Sandbox Job fields in Processa Settings and ticks
+  **Sandbox Use Job** on one agent (`on [--settings-only] [--agent "Dev Agent"] [--max-parallel 3]`), or unticks every agent (`off`).
+  With `--settings-only` no agent is ticked, which is the safe state until the Job is deployed.
+- `dev/local_ticks.py [rounds]` runs the scheduler jobs a bench with its scheduler off needs, every 20 seconds, including the
+  session reaper. A queued session only starts, and an idle one only closes, while it runs.
+- For several Work Items at once, add AI workers, one per terminal, because a local bench has a single one: `bench worker --queue bpmn_ai_agent`.
+
+There is no automatic fallback. With the box unticked (the default) every call is its own request to the shared service.
+With it ticked, a Job that cannot start or does not answer makes the call fail ("The sandbox session failed", or "gave no answer in time":
+180 seconds while the container starts, 60 once it runs). To go back, untick the box.
 
 ## Known gaps
 
@@ -315,6 +465,11 @@ Nothing about the running container watches these files for changes.
   that isn't packaged as a fixture, this crashes before a single real test
   runs. Confirmed live via a missing `one_fm` custom field; fix belongs in
   that app's own repo (export the field as a fixture), not here.
+- **`mobile_app_ionic` unit tests are scoped to the change and run once.** `yarn test:unit` is plain `vitest`,
+  which watches for changes and never exits, so the sandbox runs `yarn test:unit --run --passWithNoTests --changed origin/<base>`.
+  Only the tests that import a changed file (and any changed spec) run, so a failing test elsewhere in the repo does not
+  decide the result, and a change no test covers passes with "No test files found". Before that, `yarn check --integrity`
+  decides whether a `yarn install` is needed, and `yarn.lock` is restored afterwards so the install never reaches the pull request.
 - **No coverage/lint step.** The coding loop's only signal is
   pass/fail from the target app's existing test suite — it doesn't run a
   linter or report coverage.

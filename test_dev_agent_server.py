@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -249,20 +250,35 @@ class TestListFiles(unittest.TestCase):
     def test_default_size_cap_is_well_under_the_277kb_seen_live(self):
         self.assertLess(srv._LIST_FILES_MAX_CHARS, 277_000)
 
-    def test_every_file_comes_with_its_line_count(self):
+    def test_every_file_under_the_asked_prefix_comes_with_its_line_count(self):
+        os.makedirs(os.path.join(self.app_dir, "src"))
+        with open(os.path.join(self.app_dir, "src", "three.py"), "w", encoding="utf-8") as fh:
+            fh.write("a\nb\nc")
+        with open(os.path.join(self.app_dir, "src", "ends_in_newline.js"), "w", encoding="utf-8") as fh:
+            fh.write("a\nb\n")
+        result = srv._tool_list_files(self.app_dir, {"path_prefix": "src"})
+        self.assertEqual(result["line_counts"], {"src/three.py": 3, "src/ends_in_newline.js": 3})
+        self.assertEqual(sorted(result["files"]), sorted(result["line_counts"]))
+
+    def test_an_unscoped_listing_counts_no_lines(self):
         with open(os.path.join(self.app_dir, "three.py"), "w", encoding="utf-8") as fh:
             fh.write("a\nb\nc")
-        with open(os.path.join(self.app_dir, "ends_in_newline.js"), "w", encoding="utf-8") as fh:
-            fh.write("a\nb\n")
         result = srv._tool_list_files(self.app_dir, {})
-        self.assertEqual(result["line_counts"], {"three.py": 3, "ends_in_newline.js": 3})
-        self.assertEqual(sorted(result["files"]), sorted(result["line_counts"]))
+        self.assertEqual(result["files"], ["three.py"])
+        self.assertEqual(result["line_counts"], {})
+
+    def test_dependency_and_build_directories_are_not_walked(self):
+        for skipped in ("node_modules", "dist", "__pycache__"):
+            os.makedirs(os.path.join(self.app_dir, skipped))
+            open(os.path.join(self.app_dir, skipped, "x.js"), "w").close()
+        open(os.path.join(self.app_dir, "keep.py"), "w").close()
+        self.assertEqual(srv._tool_list_files(self.app_dir, {})["files"], ["keep.py"])
 
     def test_a_binary_or_broken_file_has_no_line_count(self):
         with open(os.path.join(self.app_dir, "logo.png"), "wb") as fh:
             fh.write(b"\x89PNG\0\0\n")
         os.symlink(os.path.join(self.app_dir, "missing"), os.path.join(self.app_dir, "broken"))
-        result = srv._tool_list_files(self.app_dir, {})
+        result = srv._tool_list_files(self.app_dir, {"path_prefix": "."})
         self.assertEqual(result["line_counts"], {"logo.png": None, "broken": None})
 
     def test_a_symlink_out_of_the_app_is_not_opened(self):
@@ -272,7 +288,7 @@ class TestListFiles(unittest.TestCase):
         self.addCleanup(os.unlink, outside.name)
         os.symlink(outside.name, os.path.join(self.app_dir, "escape.txt"))
         with patch("builtins.open", wraps=open) as opened:
-            result = srv._tool_list_files(self.app_dir, {})
+            result = srv._tool_list_files(self.app_dir, {"path_prefix": "."})
         self.assertIsNone(result["line_counts"]["escape.txt"])
         self.assertNotIn(os.path.realpath(outside.name), [os.path.realpath(c.args[0]) for c in opened.call_args_list])
 
@@ -316,24 +332,21 @@ class TestOpenPullRequestTool(unittest.TestCase):
 
     def test_no_changes_is_an_error_before_anything_else_runs(self):
         with patch.object(srv, "_collect_changed_files", return_value={}), patch.object(
-            srv, "_run_tests"
+            srv, "_tests_for_tree"
         ) as mock_run_tests, patch.object(srv, "_open_pr") as mock_open_pr:
             result = srv._tool_open_pull_request("one_bpmn", {"summary": "nothing"}, self.run_ctx)
         self.assertIn("error", result)
         mock_run_tests.assert_not_called()
         mock_open_pr.assert_not_called()
 
-    def test_reruns_tests_fresh_rather_than_trusting_a_stale_prior_result(self):
-        """The whole point of re-testing inside this tool: the model may have
-        edited files after its last run_tests call, so pass/fail here must
-        come from a fresh run, not whatever the model last saw."""
+    def test_takes_the_test_result_for_the_tree_as_it_stands(self):
         with patch.object(srv, "_collect_changed_files", return_value={"a.py": "content"}), patch.object(
-            srv, "_run_tests", return_value=(True, "out", "err", [])
+            srv, "_tests_for_tree", return_value=(True, "out", "err", [])
         ) as mock_run_tests, patch.object(
             srv, "_open_pr", return_value=("https://github.com/x/y/pull/1", None)
         ) as mock_open_pr:
             result = srv._tool_open_pull_request("one_bpmn", {"summary": "did stuff"}, self.run_ctx)
-        mock_run_tests.assert_called_once_with("one_bpmn")
+        mock_run_tests.assert_called_once_with("one_bpmn", "staging")
         self.assertEqual(
             result, {"pr_url": "https://github.com/x/y/pull/1", "tests_passed": True, "failing_tests": []}
         )
@@ -345,7 +358,7 @@ class TestOpenPullRequestTool(unittest.TestCase):
 
     def test_pr_error_surfaces_with_test_status_attached(self):
         with patch.object(srv, "_collect_changed_files", return_value={"a.py": "content"}), patch.object(
-            srv, "_run_tests", return_value=(False, "out", "boom", ["test_thing (module.TestCase)"])
+            srv, "_tests_for_tree", return_value=(False, "out", "boom", ["test_thing (module.TestCase)"])
         ), patch.object(srv, "_open_pr", return_value=(None, "GitHub API error (500)")):
             result = srv._tool_open_pull_request("one_bpmn", {"summary": "did stuff"}, self.run_ctx)
         self.assertEqual(
@@ -355,6 +368,262 @@ class TestOpenPullRequestTool(unittest.TestCase):
                 "failing_tests": ["test_thing (module.TestCase)"],
             },
         )
+
+
+class TestTheCommitIsReported(unittest.TestCase):
+    def test_the_head_commit_comes_from_git_in_the_app_directory(self):
+        done = srv.subprocess.CompletedProcess("c", 0, "abc123\n", "")
+        with patch.object(srv, "_run", return_value=done) as run:
+            self.assertEqual(srv._head_commit("one_bpmn"), "abc123")
+        self.assertIn("git rev-parse HEAD", run.call_args.args[0])
+        self.assertIn("apps/one_bpmn", run.call_args.args[0])
+
+
+class TestScopedTests(unittest.TestCase):
+    def setUp(self):
+        self.app_dir = os.path.realpath(tempfile.mkdtemp())
+        for rel in (
+            "one_bpmn/api/agent_callback.py", "one_bpmn/tests/test_agent_callback.py",
+            "one_bpmn/one_bpmn/doctype/x/x.py", "one_bpmn/one_bpmn/doctype/x/x.json",
+            "one_bpmn/one_bpmn/doctype/x/test_x.py", "one_bpmn/utils.py",
+        ):
+            path = os.path.join(self.app_dir, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").close()
+
+    def tearDown(self):
+        shutil.rmtree(self.app_dir, ignore_errors=True)
+
+    def test_a_changed_source_file_maps_to_the_test_file_of_its_name(self):
+        modules = srv._test_modules_for(self.app_dir, ["one_bpmn/api/agent_callback.py"])
+        self.assertEqual(modules, ["one_bpmn.tests.test_agent_callback"])
+
+    def test_a_changed_test_file_is_its_own_target(self):
+        modules = srv._test_modules_for(self.app_dir, ["one_bpmn/tests/test_agent_callback.py"])
+        self.assertEqual(modules, ["one_bpmn.tests.test_agent_callback"])
+
+    def test_a_doctype_json_and_controller_map_to_one_test_module(self):
+        paths = ["one_bpmn/one_bpmn/doctype/x/x.json", "one_bpmn/one_bpmn/doctype/x/x.py"]
+        self.assertEqual(srv._test_modules_for(self.app_dir, paths), ["one_bpmn.one_bpmn.doctype.x.test_x"])
+
+    def test_a_file_with_no_test_and_other_file_types_map_to_nothing(self):
+        paths = ["one_bpmn/utils.py", "README.md", "one_bpmn/public/a.js"]
+        self.assertEqual(srv._test_modules_for(self.app_dir, paths), [])
+
+    def test_no_matching_test_runs_nothing_and_says_so(self):
+        with patch.object(srv, "_changed_paths", return_value=["one_bpmn/utils.py"]), patch.object(
+            srv, "_test_modules_for", return_value=[]
+        ), patch.object(srv, "_run") as run:
+            passed, stdout, _stderr, failing = srv._run_tests("one_bpmn", "staging")
+        run.assert_not_called()
+        self.assertTrue(passed)
+        self.assertIn("no tests ran", stdout)
+        self.assertEqual(failing, [])
+
+    def test_each_target_runs_on_its_own_and_one_failure_fails_the_run(self):
+        ok = srv.subprocess.CompletedProcess("c", 0, "fine\n", "")
+        bad = srv.subprocess.CompletedProcess("c", 1, "FAIL: test_b (m.B)\n", "")
+        with patch.object(srv, "_changed_paths", return_value=["a"]), patch.object(
+            srv, "_test_modules_for", return_value=["m.a", "m.b"]
+        ), patch.object(srv, "_run", side_effect=[ok, bad]) as run:
+            passed, _out, _err, failing = srv._run_tests("one_bpmn", "staging")
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("--module m.a", run.call_args_list[0].args[0])
+        self.assertFalse(passed)
+        self.assertEqual(failing, ["test_b (m.B)"])
+
+    def test_the_site_is_migrated_only_for_schema_paths(self):
+        self.assertTrue(srv._needs_migrate(["one_bpmn/one_bpmn/doctype/x/x.json"]))
+        self.assertTrue(srv._needs_migrate(["one_bpmn/patches/v1/p.py"]))
+        self.assertTrue(srv._needs_migrate(["one_bpmn/patches.txt"]))
+        self.assertTrue(srv._needs_migrate(["one_bpmn/fixtures/x.json"]))
+        self.assertFalse(srv._needs_migrate(["one_bpmn/api/x.py", "one_bpmn/public/a.js"]))
+        self.assertFalse(srv._needs_migrate([]))
+
+
+class TestTestsRunOncePerTree(unittest.TestCase):
+    def setUp(self):
+        srv._test_results.clear()
+
+    def test_an_unchanged_tree_reuses_the_last_result(self):
+        with patch.object(srv, "_tree_fingerprint", return_value="sha:1"), patch.object(
+            srv, "_run_tests", return_value=(True, "o", "e", [])
+        ) as run:
+            first = srv._tests_for_tree("one_bpmn", "staging")
+            second = srv._tests_for_tree("one_bpmn", "staging")
+        run.assert_called_once()
+        self.assertEqual(first, second)
+
+    def test_a_changed_tree_runs_the_tests_again(self):
+        with patch.object(srv, "_tree_fingerprint", side_effect=["sha:1", "sha:2"]), patch.object(
+            srv, "_run_tests", return_value=(True, "o", "e", [])
+        ) as run:
+            srv._tests_for_tree("one_bpmn", "staging")
+            srv._tests_for_tree("one_bpmn", "staging")
+        self.assertEqual(run.call_count, 2)
+
+    def test_a_failing_result_is_reused_too(self):
+        with patch.object(srv, "_tree_fingerprint", return_value="sha:1"), patch.object(
+            srv, "_run_tests", return_value=(False, "o", "e", ["t"])
+        ) as run:
+            srv._tests_for_tree("one_bpmn", "staging")
+            again = srv._tests_for_tree("one_bpmn", "staging")
+        run.assert_called_once()
+        self.assertFalse(again[0])
+
+
+class TestCompositeTools(unittest.TestCase):
+    def setUp(self):
+        self.app_dir = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.app_dir, ignore_errors=True)
+
+    def _write(self, rel, content):
+        path = os.path.join(self.app_dir, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+
+    def _git_repo(self):
+        for cmd in ("git init -q", "git add -A", "git -c user.email=a@b -c user.name=t commit -q -m x"):
+            subprocess_run = srv.subprocess.run(cmd, shell=True, cwd=self.app_dir, capture_output=True)
+            self.assertEqual(subprocess_run.returncode, 0, subprocess_run.stderr)
+
+    def test_read_files_returns_every_file_in_order(self):
+        self._write("a.py", "one")
+        self._write("b/c.py", "two")
+        result = srv._tool_read_files(self.app_dir, {"paths": ["a.py", "b/c.py", "missing.py"]})
+        self.assertEqual([f["path"] for f in result["files"]], ["a.py", "b/c.py", "missing.py"])
+        self.assertEqual(result["files"][0]["content"], "one")
+        self.assertFalse(result["files"][2]["found"])
+
+    def test_read_files_cuts_a_long_file_and_says_so(self):
+        self._write("big.py", "x" * (srv._READ_FILES_MAX_CHARS + 5))
+        big = srv._tool_read_files(self.app_dir, {"paths": ["big.py"]})["files"][0]
+        self.assertEqual(len(big["content"]), srv._READ_FILES_MAX_CHARS)
+        self.assertTrue(big["truncated"])
+
+    def test_read_files_refuses_a_bad_list_and_a_path_outside_the_app(self):
+        self.assertIn("error", srv._tool_read_files(self.app_dir, {"paths": []}))
+        self.assertIn("error", srv._tool_read_files(self.app_dir, {"paths": ["a"] * (srv._READ_FILES_MAX + 1)}))
+        escaped = srv._tool_read_files(self.app_dir, {"paths": ["../outside"]})["files"][0]
+        self.assertIn("escapes", escaped["error"])
+
+    def test_grep_files_finds_lines_in_tracked_and_new_files(self):
+        self._write("a.py", "alpha\nneedle here\n")
+        self._git_repo()
+        self._write("new.py", "another needle\n")
+        result = srv._tool_grep_files(self.app_dir, {"pattern": "needle", "literal": True})
+        self.assertEqual(
+            sorted((m["path"], m["line"]) for m in result["matches"]), [("a.py", 2), ("new.py", 1)],
+        )
+        self.assertFalse(result["truncated"])
+
+    def test_grep_files_is_limited_to_the_prefix(self):
+        self._write("src/a.py", "needle\n")
+        self._write("other/b.py", "needle\n")
+        self._git_repo()
+        result = srv._tool_grep_files(self.app_dir, {"pattern": "needle", "path_prefix": "src"})
+        self.assertEqual([m["path"] for m in result["matches"]], ["src/a.py"])
+
+    def test_grep_files_caps_the_matches_and_the_line_width(self):
+        self._write("a.py", ("needle " + "y" * 400 + "\n") * (srv._GREP_MAX_MATCHES + 5))
+        self._git_repo()
+        result = srv._tool_grep_files(self.app_dir, {"pattern": "needle"})
+        self.assertEqual(result["count"], srv._GREP_MAX_MATCHES)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["matches"][0]["text"]), srv._GREP_LINE_CHARS)
+
+    def test_grep_files_treats_the_pattern_as_data_not_shell(self):
+        self._write("a.py", "x\n")
+        self._git_repo()
+        result = srv._tool_grep_files(self.app_dir, {"pattern": "x; touch pwned"})
+        self.assertEqual(result["matches"], [])
+        self.assertFalse(os.path.exists(os.path.join(self.app_dir, "pwned")))
+
+    def test_grep_files_reports_a_pattern_git_cannot_parse(self):
+        self._write("a.py", "x\n")
+        self._git_repo()
+        self.assertIn("error", srv._tool_grep_files(self.app_dir, {"pattern": "("}))
+
+    def test_grep_files_refuses_an_empty_pattern_and_an_outside_prefix(self):
+        self.assertIn("error", srv._tool_grep_files(self.app_dir, {"pattern": "  "}))
+        self.assertIn("escapes", srv._tool_grep_files(self.app_dir, {"pattern": "a", "path_prefix": "../x"})["error"])
+
+    def test_apply_edits_applies_all_in_order(self):
+        self._write("a.py", "one two")
+        self._write("b.py", "three")
+        result = srv._tool_apply_edits(self.app_dir, {"edits": [
+            {"path": "a.py", "old_string": "one", "new_string": "1"},
+            {"path": "a.py", "old_string": "two", "new_string": "2"},
+            {"path": "b.py", "old_string": "three", "new_string": "3"},
+        ]})
+        self.assertEqual(result, {"edited": True, "applied": 3, "paths": ["a.py", "b.py"]})
+        with open(os.path.join(self.app_dir, "a.py")) as fh:
+            self.assertEqual(fh.read(), "1 2")
+
+    def test_apply_edits_stops_at_the_first_failure_and_keeps_the_earlier_ones(self):
+        self._write("a.py", "one")
+        result = srv._tool_apply_edits(self.app_dir, {"edits": [
+            {"path": "a.py", "old_string": "one", "new_string": "1"},
+            {"path": "a.py", "old_string": "absent", "new_string": "x"},
+            {"path": "a.py", "old_string": "1", "new_string": "never"},
+        ]})
+        self.assertFalse(result["edited"])
+        self.assertEqual((result["applied"], result["failed_edit"], result["paths"]), (1, 1, ["a.py"]))
+        with open(os.path.join(self.app_dir, "a.py")) as fh:
+            self.assertEqual(fh.read(), "1")
+
+    def test_apply_edits_refuses_a_bad_list(self):
+        self.assertIn("error", srv._tool_apply_edits(self.app_dir, {"edits": []}))
+        self.assertIn("error", srv._tool_apply_edits(self.app_dir, {"edits": ["nope"]}))
+        too_many = [{"path": "a", "old_string": "a", "new_string": "b"}] * (srv._APPLY_EDITS_MAX + 1)
+        self.assertIn("error", srv._tool_apply_edits(self.app_dir, {"edits": too_many}))
+
+
+class TestCompositeActionsOverHttp(unittest.TestCase):
+    def setUp(self):
+        self.bench_dir = os.path.realpath(tempfile.mkdtemp())
+        self.app_dir = os.path.join(self.bench_dir, "apps", "one_bpmn")
+        os.makedirs(self.app_dir)
+        self.addCleanup(shutil.rmtree, self.bench_dir, ignore_errors=True)
+        patcher = patch.object(srv, "BENCH_DIR", self.bench_dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _payload(self, action, args):
+        return {
+            "action": action, "target_app": "one_bpmn", "git_branch": "staging",
+            "work_item_description": "Fix the thing.", "args": args, "github_token": "gh-token",
+        }
+
+    def test_the_three_actions_are_valid_for_tool_call(self):
+        for action in ("read_files", "grep_files", "apply_edits"):
+            self.assertIsNone(srv._validate_tool_call_payload(self._payload(action, {})), action)
+
+    def test_apply_edits_commits_every_changed_path_once(self):
+        for name, text in (("a.py", "one"), ("b.py", "two")):
+            with open(os.path.join(self.app_dir, name), "w") as fh:
+                fh.write(text)
+        edits = [
+            {"path": "a.py", "old_string": "one", "new_string": "1"},
+            {"path": "b.py", "old_string": "two", "new_string": "2"},
+        ]
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
+            srv, "_commit_and_push", return_value=(True, None)
+        ) as commit:
+            result = srv._handle_tool_call(self._payload("apply_edits", {"edits": edits}))
+        self.assertTrue(result["edited"])
+        commit.assert_called_once()
+        self.assertEqual(commit.call_args.args[2], ["a.py", "b.py"])
+
+    def test_a_failed_first_edit_commits_nothing(self):
+        edits = [{"path": "missing.py", "old_string": "a", "new_string": "b"}]
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
+            srv, "_commit_and_push"
+        ) as commit:
+            result = srv._handle_tool_call(self._payload("apply_edits", {"edits": edits}))
+        self.assertFalse(result["edited"])
+        commit.assert_not_called()
 
 
 class TestDeletedFilesReachThePr(unittest.TestCase):
@@ -373,6 +642,8 @@ class TestDeletedFilesReachThePr(unittest.TestCase):
         with open(os.path.join(app_dir, "old.vue"), "w") as fh:
             fh.write("x")
         run("git add old.vue && git -c user.email=t@t -c user.name=t commit -q -m add && git checkout -q -b work")
+        # Like the mobile clone in the image: the base exists only as a remote-tracking ref, not as a local branch.
+        run("git update-ref refs/remotes/origin/staging staging && git branch -q -D staging")
         srv._tool_delete_file(app_dir, {"path": "old.vue"})
         run("git add -- old.vue && git -c user.email=t@t -c user.name=t commit -q -m delete")
         return bench
@@ -407,7 +678,7 @@ class TestDeletedFilesReachThePr(unittest.TestCase):
 
         with patch.object(srv, "_repo_for_local_clone", return_value="x/y"), patch.object(
             srv, "_github_request", side_effect=fake_github
-        ):
+        ), patch.object(srv, "_pending_paths", return_value={"old.vue"}):
             pr_url, err = srv._open_pr("one_bpmn", "staging", "Remove old.vue.", {"old.vue": None}, "t", "c", "removed")
         self.assertEqual((pr_url, err), ("https://github.com/x/y/pull/3", None))
         deletes = [c for c in calls if c[0] == "DELETE"]
@@ -417,6 +688,84 @@ class TestDeletedFilesReachThePr(unittest.TestCase):
         self.assertFalse([c for c in calls if c[0] == "PUT" and "/contents/" in c[1]])
         pr_body = next(c[2]["body"] for c in calls if c[0] == "POST" and c[1].endswith("/pulls"))
         self.assertIn("`old.vue` (deleted)", pr_body)
+
+
+class TestAPushedChangeIsNotCommittedAgain(unittest.TestCase):
+    """Files the fast tools or a session checkpoint pushed are already on the branch, so only the pull request is created."""
+
+    def _open(self, files, pending):
+        calls = []
+
+        def fake(method, url, token, ok=(200, 201), json_body=None):
+            calls.append((method, url))
+            if method == "POST" and url.endswith("/pulls"):
+                return {"html_url": "https://github.com/x/y/pull/7", "number": 7}
+            return {"object": {"sha": "base"}, "sha": "abc"}
+
+        with patch.object(srv, "_repo_for_local_clone", return_value="x/y"), patch.object(
+            srv, "_github_request", side_effect=fake
+        ), patch.object(srv, "_pending_paths", return_value=pending):
+            result = srv._open_pr("one_bpmn", "staging", "Fix.", files, "t", "c", "done", work_item_id="WI-1")
+        return result, calls
+
+    def test_a_fully_pushed_change_makes_no_branch_or_file_calls(self):
+        result, calls = self._open({"a.py": "x", "b.py": None}, pending=set())
+        self.assertEqual(result, ("https://github.com/x/y/pull/7", None))
+        self.assertEqual([m for m, _ in calls if m in ("PUT", "DELETE")], [])
+        self.assertFalse([u for _, u in calls if "/git/ref" in u or "/contents/" in u])
+        self.assertTrue([u for m, u in calls if m == "POST" and u.endswith("/pulls")])
+
+    def test_only_the_uncommitted_files_go_up_through_the_api(self):
+        _result, calls = self._open({"a.py": "x", "b.py": "y"}, pending={"b.py"})
+        puts = [u for m, u in calls if m == "PUT"]
+        self.assertEqual(len(puts), 1)
+        self.assertTrue(puts[0].endswith("/contents/b.py"))
+
+    def test_the_pending_paths_are_the_modified_deleted_and_new_files(self):
+        modified = srv.subprocess.CompletedProcess("c", 0, "a.py\nold.vue\n", "")
+        new = srv.subprocess.CompletedProcess("c", 0, "n.py\n", "")
+        with patch.object(srv, "_run", side_effect=[modified, new]):
+            self.assertEqual(srv._pending_paths("one_bpmn"), {"a.py", "old.vue", "n.py"})
+
+    def test_a_git_failure_means_nothing_is_taken_as_pending(self):
+        failed = srv.subprocess.CompletedProcess("c", 128, "", "not a repo")
+        with patch.object(srv, "_run", return_value=failed):
+            self.assertEqual(srv._pending_paths("one_bpmn"), set())
+
+
+class TestARepeatedRunIsNotStartedTwice(unittest.TestCase):
+    def setUp(self):
+        self.server = srv.ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        threading_thread = srv.threading.Thread(target=self.server.serve_forever, daemon=True)
+        threading_thread.start()
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.server_close)
+        srv._jobs.clear()
+
+    def _post(self, payload):
+        import json as _json
+        import urllib.request as _request
+
+        request = _request.Request(
+            f"http://127.0.0.1:{self.server.server_address[1]}/run", data=_json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with _request.urlopen(request, timeout=10) as response:
+            return response.status, _json.loads(response.read())
+
+    def test_a_second_dispatch_with_the_same_id_is_accepted_without_a_second_run(self):
+        payload = {
+            "correlation_id": "corr-dup", "action": "run_tests", "target_app": "one_bpmn", "git_branch": "staging",
+            "work_item_description": "d", "github_token": "t", "callback_url": "https://processa.example/cb",
+        }
+        started = []
+        with patch.object(srv, "run_single_action_job", side_effect=lambda p: started.append(p["correlation_id"])):
+            first = self._post(payload)
+            srv.time.sleep(0.2)
+            second = self._post(payload)
+        self.assertEqual(first, (202, {"correlation_id": "corr-dup", "status": "accepted"}))
+        self.assertEqual(second, first)
+        self.assertEqual(started, ["corr-dup"])
 
 
 class TestLastOpenPrResult(unittest.TestCase):
@@ -501,7 +850,7 @@ class TestCheckoutOrCreateHeadBranch(unittest.TestCase):
             ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "dev-agent/abc")
         self.assertTrue(ok)
         self.assertIsNone(err)
-        self.assertTrue(any("git checkout -B dev-agent/abc" in c for c in calls))
+        self.assertTrue(any("git checkout -f -B dev-agent/abc" in c for c in calls))
         self.assertTrue(any("git push -u origin dev-agent/abc" in c for c in calls))
 
     def test_base_branch_fetch_failure_is_reported(self):
@@ -606,6 +955,25 @@ class TestValidatePayloadActionBranch(unittest.TestCase):
         self.assertIsNone(srv._validate_payload(payload))
 
 
+class TestTimings(unittest.TestCase):
+    def test_a_span_adds_up_across_uses_and_the_report_has_a_total(self):
+        timings = srv._Timings()
+        with timings.span("git"):
+            time.sleep(0.01)
+        with timings.span("git"):
+            time.sleep(0.01)
+        report = timings.report()
+        self.assertGreaterEqual(report["git"], 20)
+        self.assertGreaterEqual(report["total"], report["git"])
+
+    def test_a_span_is_recorded_when_its_work_raises(self):
+        timings = srv._Timings()
+        with self.assertRaises(ValueError):
+            with timings.span("tool"):
+                raise ValueError("boom")
+        self.assertIn("tool", timings.ms)
+
+
 class TestHandleToolCall(unittest.TestCase):
     def setUp(self):
         # A fresh BENCH_DIR per test (not a shared /tmp root) with a real
@@ -646,6 +1014,22 @@ class TestHandleToolCall(unittest.TestCase):
             result = srv._handle_tool_call(self._payload("write_file", {"path": "a.py", "content": "x"}))
         self.assertEqual(result, {"written": True, "path": "a.py"})
         mock_commit.assert_called_once()
+
+    def test_a_write_reports_git_and_tool_time(self):
+        timings = srv._Timings()
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
+            srv, "_commit_and_push", return_value=(True, None)
+        ):
+            srv._handle_tool_call(self._payload("write_file", {"path": "a.py", "content": "x"}), timings)
+        self.assertEqual(sorted(timings.ms), ["git", "tool"])
+
+    def test_a_read_reports_tool_time_and_no_commit_time(self):
+        with open(os.path.join(self.app_dir, "a.py"), "w") as fh:
+            fh.write("hello")
+        timings = srv._Timings()
+        with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)):
+            srv._handle_tool_call(self._payload("read_file", {"path": "a.py"}), timings)
+        self.assertEqual(sorted(timings.ms), ["git", "tool"])
 
     def test_a_bench_path_from_search_frontend_reads_the_app_file(self):
         os.makedirs(os.path.join(self.app_dir, "spiff", "src"))
@@ -789,7 +1173,7 @@ class TestWorkItemIdThreading(unittest.TestCase):
 
         with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/one_bpmn"), patch.object(
             srv, "_github_request", side_effect=fake_request
-        ):
+        ), patch.object(srv, "_pending_paths", return_value={"a.py"}):
             pr_url, err = srv._open_pr(
                 "one_bpmn", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "changed a.py",
                 work_item_id="WI-002322",
@@ -888,7 +1272,7 @@ class TestCollectChangedFilesSeesCommittedEdits(unittest.TestCase):
 
     @staticmethod
     def _fake_run(cmd, **kwargs):
-        if "git diff --name-only staging...HEAD" in cmd:
+        if "git diff --name-only origin/staging...HEAD" in cmd:
             return _FakeCompletedProcess(0, "spiff/committed.vue\nspiff/both.js\n", "")
         if "git diff --name-only HEAD" in cmd:
             return _FakeCompletedProcess(0, "spiff/pending.py\nspiff/both.js\n", "")
@@ -962,6 +1346,38 @@ class TestShellIdentifiersAreValidated(unittest.TestCase):
         self.assertEqual(bare, [])
 
 
+class TestADirtyTreeCannotFailACheckout(unittest.TestCase):
+    """Local changes and stray files from an earlier call are discarded at every checkout."""
+
+    def _commands(self, exists_remotely):
+        calls = []
+
+        def fake(cmd, **kwargs):
+            calls.append(cmd)
+            if "git remote get-url origin" in cmd:
+                return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
+            if "git fetch origin WI-1" in cmd:
+                return _FakeCompletedProcess(0 if exists_remotely else 1, stderr="")
+            return _FakeCompletedProcess(0)
+
+        with patch.object(srv, "_run", side_effect=fake):
+            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "WI-1")
+        self.assertTrue(ok, err)
+        return calls
+
+    def test_an_existing_head_branch_is_forced_and_cleaned(self):
+        checkout = next(c for c in self._commands(True) if "git checkout" in c)
+        self.assertIn("checkout -f -B WI-1 FETCH_HEAD", checkout)
+        self.assertIn("git clean -fdq", checkout)
+
+    def test_a_new_head_branch_forces_both_checkouts_and_cleans_after_the_base(self):
+        checkouts = [c for c in self._commands(False) if "git checkout" in c]
+        self.assertEqual(len(checkouts), 2)
+        self.assertIn("checkout -f -B staging FETCH_HEAD", checkouts[0])
+        self.assertIn("git clean -fdq", checkouts[0])
+        self.assertIn("checkout -f -B WI-1", checkouts[1])
+
+
 class TestCheckoutTakesWhatWasJustFetched(unittest.TestCase):
     """The base branch must be origin's current tip, not the one baked into the
     image, and an existing head branch must be reachable on any instance."""
@@ -971,7 +1387,7 @@ class TestCheckoutTakesWhatWasJustFetched(unittest.TestCase):
         def fake_run(cmd, **kwargs):
             if "git remote get-url origin" in cmd:
                 return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
-            if "git fetch origin WI-003239" in cmd:
+            if "git fetch origin item-3239" in cmd:
                 return _FakeCompletedProcess(0 if exists_remotely else 1, stderr="" if exists_remotely else "couldn't find remote ref")
             return _FakeCompletedProcess(0)
         return fake_run
@@ -981,23 +1397,23 @@ class TestCheckoutTakesWhatWasJustFetched(unittest.TestCase):
         def fake(cmd, **kw):
             calls.append(cmd); return self._fake(False)(cmd, **kw)
         with patch.object(srv, "_run", side_effect=fake):
-            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "WI-003239")
+            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "item-3239")
         self.assertTrue(ok, err)
         fetch = next(i for i, c in enumerate(calls) if "git fetch origin staging" in c)
         base = next(i for i, c in enumerate(calls) if "git checkout -f -B staging FETCH_HEAD" in c)
-        head = next(i for i, c in enumerate(calls) if "git checkout -B WI-003239" in c and "FETCH_HEAD" not in c)
+        head = next(i for i, c in enumerate(calls) if "git checkout -f -B item-3239" in c and "FETCH_HEAD" not in c)
         self.assertLess(fetch, base); self.assertLess(base, head)
-        self.assertFalse(any("origin/staging" in c for c in calls))
+        self.assertFalse(any("checkout" in c and "origin/staging" in c for c in calls))
 
     def test_existing_head_branch_is_checked_out_from_fetch_head_on_any_instance(self):
         calls = []
         def fake(cmd, **kw):
             calls.append(cmd); return self._fake(True)(cmd, **kw)
         with patch.object(srv, "_run", side_effect=fake):
-            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "WI-003239")
+            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "item-3239")
         self.assertTrue(ok, err)
-        self.assertTrue(any("git checkout -f -B WI-003239 FETCH_HEAD" in c for c in calls))
-        self.assertFalse(any("origin/WI-003239" in c for c in calls))
+        self.assertTrue(any("git checkout -f -B item-3239 FETCH_HEAD" in c for c in calls))
+        self.assertFalse(any("origin/item-3239" in c for c in calls))
         self.assertFalse(any("git push" in c for c in calls))
 
     def test_bundled_path_also_resets_the_base_to_the_fetched_tip(self):
@@ -1027,14 +1443,14 @@ class TestCheckoutForcesPastBakeTimeDrift(unittest.TestCase):
     def test_every_fetch_head_checkout_site_forces_past_a_dirty_tree(self):
         for fn, args in (
             (srv._checkout_target_branch, ("one_bpmn", "staging")),
-            (srv._checkout_or_create_head_branch, ("one_bpmn", "staging", "WI-003239")),
+            (srv._checkout_or_create_head_branch, ("one_bpmn", "staging", "item-3239")),
         ):
             calls = []
             def fake(cmd, **kw):
                 calls.append(cmd)
                 if "git remote get-url origin" in cmd:
                     return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
-                if "git fetch origin WI-003239" in cmd:
+                if "git fetch origin item-3239" in cmd:
                     return _FakeCompletedProcess(1, stderr="couldn't find remote ref")
                 return _FakeCompletedProcess(0)
             with patch.object(srv, "_run", side_effect=fake):
@@ -1253,19 +1669,204 @@ class TestRunTestsReturnsFailingTests(unittest.TestCase):
         result = srv.subprocess.CompletedProcess(
             "bench run-tests", 1, "FAIL: test_thing (mod.TestThing)\n", "",
         )
-        with patch.object(srv, "_run", return_value=result):
+        with patch.object(srv, "_changed_paths", return_value=["one_bpmn/test_a.py"]), patch.object(
+            srv, "_test_modules_for", return_value=["one_bpmn.test_a"]
+        ), patch.object(srv, "_run", return_value=result):
             passed, stdout, stderr, failing_tests = srv._run_tests("one_bpmn")
         self.assertFalse(passed)
         self.assertEqual(failing_tests, ["test_thing (mod.TestThing)"])
 
     def test_tool_run_tests_includes_failing_tests_in_its_result(self):
         with patch.object(
-            srv, "_run_tests", return_value=(False, "out", "err", ["test_thing (mod.TestThing)"])
+            srv, "_tests_for_tree", return_value=(False, "out", "err", ["test_thing (mod.TestThing)"])
         ):
             result = srv._tool_run_tests("one_bpmn", {})
         self.assertEqual(result["failing_tests"], ["test_thing (mod.TestThing)"])
 
     def test_tool_run_tests_empty_failing_tests_on_a_pass(self):
-        with patch.object(srv, "_run_tests", return_value=(True, "out", "err", [])):
+        with patch.object(srv, "_tests_for_tree", return_value=(True, "out", "err", [])):
             result = srv._tool_run_tests("one_bpmn", {})
         self.assertEqual(result["failing_tests"], [])
+
+
+class TestBaseBranchIsFetchedAndDiffedAsATrackingRef(unittest.TestCase):
+    def test_every_checkout_first_fetches_the_base_into_its_tracking_ref(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if "git remote get-url origin" in cmd:
+                return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
+            return _FakeCompletedProcess(0)
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            ok, _err = srv._checkout_or_create_head_branch("mobile_app_ionic", "staging", "WI-1")
+        self.assertTrue(ok)
+        refspec = "git fetch origin +refs/heads/staging:refs/remotes/origin/staging"
+        first_fetch = next(i for i, c in enumerate(calls) if "git fetch" in c)
+        self.assertIn(refspec, calls[first_fetch])
+        self.assertLess(first_fetch, next(i for i, c in enumerate(calls) if "git fetch origin WI-1" in c))
+
+    def test_a_base_branch_that_cannot_be_fetched_is_reported(self):
+        def fake_run(cmd, **kwargs):
+            if "git remote get-url origin" in cmd:
+                return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
+            if "refs/remotes/origin/staging" in cmd:
+                return _FakeCompletedProcess(1, stderr="couldn't find remote ref staging")
+            return _FakeCompletedProcess(0)
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            ok, err = srv._checkout_or_create_head_branch("mobile_app_ionic", "staging", "WI-1")
+        self.assertFalse(ok)
+        self.assertIn("git fetch of base branch staging failed", err)
+
+    def test_the_diff_is_taken_against_the_tracking_ref(self):
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return _FakeCompletedProcess(0, "")
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            srv._changed_paths("mobile_app_ionic", "staging")
+        self.assertTrue(any("git diff --name-only origin/staging...HEAD" in c for c in commands))
+
+    def test_the_pull_request_names_the_base_when_nothing_changed(self):
+        run_ctx = {"git_branch": "staging", "work_item_description": "x", "github_token": "t", "correlation_id": "c"}
+        with patch.object(srv, "_collect_changed_files", return_value={}):
+            result = srv._tool_open_pull_request("mobile_app_ionic", {}, run_ctx)
+        self.assertIn("no changes against staging", result["error"])
+
+
+class TestMobileDependenciesAreRefreshedBeforeTheBuild(unittest.TestCase):
+    def test_the_install_state_is_checked_and_installed_when_stale_before_building(self):
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return _FakeCompletedProcess(0, "ok", "")
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            srv._run_tests("mobile_app_ionic")
+        self.assertIn("yarn check --integrity", commands[0])
+        self.assertIn("yarn install", commands[0])
+        self.assertNotIn("--frozen-lockfile", commands[0])
+        self.assertIn("git checkout -- yarn.lock", commands[0])
+        self.assertIn("yarn build", commands[1])
+
+    def test_a_failed_install_ends_the_run_before_the_build(self):
+        def fake_run(cmd, **kwargs):
+            if "yarn install" in cmd:
+                return _FakeCompletedProcess(1, "", "error: network unreachable")
+            raise AssertionError(cmd)
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            passed, _stdout, stderr, failing = srv._run_tests("mobile_app_ionic")
+        self.assertFalse(passed)
+        self.assertEqual(failing, [])
+        self.assertIn("network unreachable", stderr)
+
+
+class TestCallbackHostPin(unittest.TestCase):
+    def _error(self, url, pin):
+        with patch.object(srv, "ALLOWED_CALLBACK_HOST", pin):
+            return srv._validate_callback_url({"callback_url": url})
+
+    def test_no_pin_accepts_any_https_host(self):
+        self.assertIsNone(self._error("https://anything.example.com/cb", ""))
+
+    def test_a_pin_of_one_host_accepts_only_that_host(self):
+        self.assertIsNone(self._error("https://one-fm.com/cb", "one-fm.com"))
+        self.assertIn("one-fm.com", self._error("https://evil.example.com/cb", "one-fm.com"))
+
+    def test_a_pin_of_three_hosts_accepts_each_of_them_and_no_other(self):
+        pin = "one-fm.com, staging.onefm.com,businessanalyst.onefm.com"
+        for host in ("one-fm.com", "staging.onefm.com", "businessanalyst.onefm.com"):
+            self.assertIsNone(self._error(f"https://{host}/api/method/cb", pin), host)
+        error = self._error("https://onefm.com/cb", pin)
+        self.assertIn("must be one of", error)
+        self.assertIn("staging.onefm.com", error)
+
+    def test_a_host_that_only_ends_with_an_allowed_host_is_refused(self):
+        self.assertIsNotNone(self._error("https://evil-one-fm.com/cb", "one-fm.com"))
+
+    def test_the_pin_does_not_make_http_acceptable(self):
+        self.assertEqual(self._error("http://one-fm.com/cb", "one-fm.com"), "callback_url must be https")
+
+
+class TestWriteFileDoesNotEmptyAFile(unittest.TestCase):
+    def setUp(self):
+        self.app_dir = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.app_dir, True)
+
+    def _write(self, name, text):
+        with open(os.path.join(self.app_dir, name), "w") as fh:
+            fh.write(text)
+
+    def _read(self, name):
+        with open(os.path.join(self.app_dir, name)) as fh:
+            return fh.read()
+
+    def test_replacing_a_file_that_has_content_with_nothing_is_refused_and_leaves_it_alone(self):
+        self._write("old.py", "x = 1\n")
+        result = srv._tool_write_file(self.app_dir, {"path": "old.py", "content": ""})
+        self.assertIn("delete_file", result["error"])
+        self.assertEqual(self._read("old.py"), "x = 1\n")
+
+    def test_whitespace_alone_counts_as_empty(self):
+        self._write("old.py", "x = 1\n")
+        self.assertIn("error", srv._tool_write_file(self.app_dir, {"path": "old.py", "content": "  \n"}))
+        self.assertEqual(self._read("old.py"), "x = 1\n")
+
+    def test_a_new_empty_file_can_still_be_created(self):
+        result = srv._tool_write_file(self.app_dir, {"path": "pkg/__init__.py", "content": ""})
+        self.assertEqual(result, {"written": True, "path": "pkg/__init__.py"})
+        self.assertEqual(self._read("pkg/__init__.py"), "")
+
+    def test_a_file_that_is_already_empty_can_be_written_empty(self):
+        self._write("empty.py", "")
+        self.assertTrue(srv._tool_write_file(self.app_dir, {"path": "empty.py", "content": ""})["written"])
+
+    def test_real_content_still_overwrites(self):
+        self._write("old.py", "x = 1\n")
+        self.assertTrue(srv._tool_write_file(self.app_dir, {"path": "old.py", "content": "y = 2\n"})["written"])
+        self.assertEqual(self._read("old.py"), "y = 2\n")
+
+
+class TestMobileUnitTestsRunOnceAndAreScoped(unittest.TestCase):
+    def _commands(self, base_branch):
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return _FakeCompletedProcess(0, "ok", "")
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            passed, _stdout, _stderr, _failing = srv._run_tests("mobile_app_ionic", base_branch)
+        self.assertTrue(passed)
+        return commands
+
+    def test_vitest_runs_once_instead_of_watching(self):
+        test_command = self._commands("staging")[-1]
+        self.assertIn("yarn test:unit --run", test_command)
+
+    def test_only_the_tests_the_change_affects_are_run_against_the_base(self):
+        test_command = self._commands("staging")[-1]
+        self.assertIn("--changed origin/staging", test_command)
+        self.assertIn("--passWithNoTests", test_command)
+
+    def test_without_a_base_branch_the_whole_suite_runs_once(self):
+        test_command = self._commands(None)[-1]
+        self.assertIn("yarn test:unit --run", test_command)
+        self.assertNotIn("--changed", test_command)
+
+    def test_a_failing_affected_test_fails_the_run(self):
+        def fake_run(cmd, **kwargs):
+            if "yarn test:unit" in cmd:
+                return _FakeCompletedProcess(1, "FAIL tests/unit/Header.spec.js", "")
+            return _FakeCompletedProcess(0, "ok", "")
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            passed, stdout, _stderr, _failing = srv._run_tests("mobile_app_ionic", "staging")
+        self.assertFalse(passed)
+        self.assertIn("Header.spec.js", stdout)
