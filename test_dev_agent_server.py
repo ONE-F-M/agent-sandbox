@@ -1831,3 +1831,42 @@ class TestWriteFileDoesNotEmptyAFile(unittest.TestCase):
         self._write("old.py", "x = 1\n")
         self.assertTrue(srv._tool_write_file(self.app_dir, {"path": "old.py", "content": "y = 2\n"})["written"])
         self.assertEqual(self._read("old.py"), "y = 2\n")
+
+
+class TestMobileUnitTestsRunOnceAndAreScoped(unittest.TestCase):
+    def _commands(self, base_branch):
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return _FakeCompletedProcess(0, "ok", "")
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            passed, _stdout, _stderr, _failing = srv._run_tests("mobile_app_ionic", base_branch)
+        self.assertTrue(passed)
+        return commands
+
+    def test_vitest_runs_once_instead_of_watching(self):
+        test_command = self._commands("staging")[-1]
+        self.assertIn("yarn test:unit --run", test_command)
+
+    def test_only_the_tests_the_change_affects_are_run_against_the_base(self):
+        test_command = self._commands("staging")[-1]
+        self.assertIn("--changed origin/staging", test_command)
+        self.assertIn("--passWithNoTests", test_command)
+
+    def test_without_a_base_branch_the_whole_suite_runs_once(self):
+        test_command = self._commands(None)[-1]
+        self.assertIn("yarn test:unit --run", test_command)
+        self.assertNotIn("--changed", test_command)
+
+    def test_a_failing_affected_test_fails_the_run(self):
+        def fake_run(cmd, **kwargs):
+            if "yarn test:unit" in cmd:
+                return _FakeCompletedProcess(1, "FAIL tests/unit/Header.spec.js", "")
+            return _FakeCompletedProcess(0, "ok", "")
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            passed, stdout, _stderr, _failing = srv._run_tests("mobile_app_ionic", "staging")
+        self.assertFalse(passed)
+        self.assertIn("Header.spec.js", stdout)

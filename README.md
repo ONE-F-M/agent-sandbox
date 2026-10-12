@@ -421,6 +421,11 @@ The Job has its own name per environment, so a Job deployed for testing is never
   that isn't packaged as a fixture, this crashes before a single real test
   runs. Confirmed live via a missing `one_fm` custom field; fix belongs in
   that app's own repo (export the field as a fixture), not here.
+- **`mobile_app_ionic` unit tests are scoped to the change and run once.** `yarn test:unit` is plain `vitest`,
+  which watches for changes and never exits, so the sandbox runs `yarn test:unit --run --passWithNoTests --changed origin/<base>`.
+  Only the tests that import a changed file (and any changed spec) run, so a failing test elsewhere in the repo does not
+  decide the result, and a change no test covers passes with "No test files found". Before that, `yarn check --integrity`
+  decides whether a `yarn install` is needed, and `yarn.lock` is restored afterwards so the install never reaches the pull request.
 - **No coverage/lint step.** The coding loop's only signal is
   pass/fail from the target app's existing test suite — it doesn't run a
   linter or report coverage.

@@ -543,7 +543,12 @@ def _run_tests(target_app, base_branch=None):
             # A build failure, not a test failure -- vitest never ran, so
             # there is no unittest-style FAIL:/ERROR: summary to extract.
             return False, build.stdout[-4000:], build.stderr[-4000:], []
-        test = _run(f"cd {shlex.quote(app_dir)} && yarn test:unit", timeout=900)
+        # vitest watches by default and never exits, so run it once, and only the tests the change affects: a
+        # failing test elsewhere in the repo must not decide the result.
+        scope = ("--changed", f"origin/{base_branch}") if base_branch else ()
+        test_args = " ".join(shlex.quote(arg) for arg in ("--run", "--passWithNoTests", *scope))
+        test_command = f"cd {shlex.quote(app_dir)} && yarn test:unit {test_args}"
+        test = _run(test_command, timeout=900)
         stdout = (build.stdout + test.stdout)[-4000:]
         stderr = (build.stderr + test.stderr)[-4000:]
         return test.returncode == 0, stdout, stderr, _extract_failing_tests(stdout, stderr)
