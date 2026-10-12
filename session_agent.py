@@ -25,6 +25,8 @@ API = "/api/method/one_bpmn.api.sandbox_session"
 POLL_MIN_SECONDS = 0.3
 POLL_MAX_SECONDS = 2.0
 CHECKPOINT_SECONDS = 300
+# The agent idles this long past Processa's idle timeout, so Processa's close command arrives before the agent exits.
+IDLE_GRACE_SECONDS = 180
 CALL_TRIES = 3
 
 
@@ -78,7 +80,7 @@ class Session:
         self.work_item = settings["work_item"]
         self.agent_name = (settings.get("agent_name") or "Dev Agent").strip() or "Dev Agent"
         self.github_token = settings.get("github_token") or ""
-        self.idle_timeout = settings.get("idle_timeout_seconds", 600)
+        self.idle_timeout = settings.get("idle_timeout_seconds", 600) + IDLE_GRACE_SECONDS
         self.app_dir = f"{srv.BENCH_DIR}/apps/{self.target_app}"
         self.head_branch = srv._head_branch_for(self.target_app, self.git_branch, "", self.work_item)
         self.unpushed = False

@@ -255,10 +255,15 @@ class TestTheLoop(SessionCase):
         self.assertEqual(self._pushed("one_bpmn/a.py"), "1 two")
 
     def test_with_no_commands_the_agent_polls_then_ends_itself_when_idle(self):
-        session, client = self._session(idle_timeout_seconds=0)
+        session, client = self._session()
+        session.idle_timeout = 0
         with patch.object(agent.time, "sleep"):
             self.assertEqual(session.run(), "idle")
         self.assertTrue(all(endpoint == "next_command" for endpoint, _ in client.sent))
+
+    def test_the_agent_waits_past_the_idle_timeout_so_processa_closes_the_session_first(self):
+        session, _client = self._session(idle_timeout_seconds=600)
+        self.assertEqual(session.idle_timeout, 600 + agent.IDLE_GRACE_SECONDS)
 
     def test_the_poll_delay_grows_to_a_limit_and_resets_after_work(self):
         session, client = self._session([None, None, None, self._command(1, "close", "close")])
