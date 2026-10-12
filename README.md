@@ -397,14 +397,41 @@ that is not `https` or whose hostname is not exactly one of the pinned hosts, so
 ### Session Job (optional, off by default)
 
 One Cloud Run Job execution per Work Item instead of one request per tool call. It is deployed separately
-and an agent uses it only when `sandbox_use_job` is ticked on its AI Agent Configuration.
+and an agent uses it only when **Sandbox Use Job** (`sandbox_use_job`) is ticked on its AI Agent Configuration.
 
-```bash
-python3 deploy.py --env production --use-baked --job --processa-host <processa-hostname>
-```
+**If the box is not ticked, nothing changes.** The agent sends every tool call to the shared Cloud Run service exactly as it
+did before the Job existed. The Job, its settings and its IAM grants are not touched. This is the default for every agent.
 
-`--processa-host` pins `ALLOWED_PROCESSA_HOST`, so the container can call only that Processa. It takes one hostname.
-The Job has its own name per environment, so a Job deployed for testing is never the production one.
+| | Shared service (default) | Session Job (opt-in) |
+|---|---|---|
+| Used when | Sandbox Use Job is unticked | Sandbox Use Job is ticked on the agent |
+| Unit of work | one HTTP request per tool call | one Job execution per Work Item |
+| Deployed with | `deploy.py` | `deploy.py --job --processa-host <host>` |
+| Caller needs | `roles/run.invoker` on the service | `roles/run.invoker` and `roles/run.viewer` on the Job |
+| Callback pin | `--callback-host` (comma list) | `--processa-host` (one hostname) |
+
+**To enable it:**
+
+1. Deploy the Job, pinned to the Processa hostname the container must call back:
+
+   ```bash
+   python3 deploy.py --env production --use-baked --job --processa-host <processa-hostname>
+   ```
+
+   `--processa-host` pins `ALLOWED_PROCESSA_HOST`, so the container can call only that Processa. It takes one hostname.
+   The Job has its own name per environment, so a Job deployed for testing is never the production one.
+2. Grant the caller service account (the one whose key Processa uses) `roles/run.invoker` and `roles/run.viewer`
+   on the Job. Both are per-resource grants, so access to the service does not cover the Job.
+3. In Processa Settings, fill the Sandbox Job fields: project, region, job name, **Sandbox Job Processa URL**, and
+   **Max Parallel Sessions**.
+4. Tick **Sandbox Use Job** on the agents that should use it (the **Sandbox** section of the AI Agent Configuration form,
+   or the **Sandbox** block of the agent task dialog in the Process UI). Start with one agent.
+
+**To go back:** untick **Sandbox Use Job** on the agent. The next run uses the shared service again. Sessions already
+running finish on the Job.
+
+**It is not an automatic fallback.** If the box is ticked and the Job cannot start or does not answer, the call fails
+instead of retrying on the shared service (see the end of "Testing the session Job" for the messages and timeouts).
 
 ### Testing the session Job
 
@@ -428,8 +455,8 @@ It proves the protocol and the code. It does not prove cold starts, IAM, network
 python3 deploy.py --env production --use-baked --job --processa-host <your-ngrok-hostname>
 ```
 
-2. Let the caller service account start executions of the Job (it needs permission to run a Job with overrides,
-   for example `roles/run.developer` on the Job; check the first error if it fails).
+2. Grant the caller service account `roles/run.invoker` and `roles/run.viewer` on the Job (see "Session Job" above).
+   Check it before the first run with `testIamPermissions` on the Job using the caller's key.
 3. In Processa Settings, fill the Sandbox Job fields: project, region, job name (`dev-agent-sandbox-job` for production),
    and **Sandbox Job Processa URL** with the ngrok `https` address.
 4. On one agent's AI Agent Configuration, tick **Sandbox Use Job** (the **Sandbox** section of the form, or the **Sandbox**
