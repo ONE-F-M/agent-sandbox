@@ -436,6 +436,40 @@ running finish on the Job.
 **It is not an automatic fallback.** If the box is ticked and the Job cannot start or does not answer, the call fails
 instead of retrying on the shared service (see the end of "Testing the session Job" for the messages and timeouts).
 
+### Going live on Staging, BA and production
+
+The sites are `staging.one-fm.com`, `business-analyst.one-fm.com` and `one-fm.com`. One service and one Job serve all three.
+Replacing a local ngrok deploy with these is the same two commands; the new pin overwrites the ngrok one.
+
+1. Merge the sandbox change, then rebake the code into the existing image:
+
+   ```bash
+   cd ~/Desktop/agent-sandbox && ENV=production CODE_ONLY=1 ./bake_image.sh
+   ```
+
+2. Redeploy the session Job pinned to all three Processa hosts (a Job has no traffic to shift; the next execution uses it):
+
+   ```bash
+   python3 deploy.py --env production --use-baked --job --processa-host one-fm.com,staging.one-fm.com,business-analyst.one-fm.com
+   ```
+
+3. Redeploy the shared service pinned to the same three callback hosts, test the tagged URL, then shift traffic to it:
+
+   ```bash
+   python3 deploy.py --env production --use-baked --no-traffic --tag candidate --callback-host one-fm.com,staging.one-fm.com,business-analyst.one-fm.com
+   ```
+
+4. Grant the caller service account `roles/run.developer` on the Job and `roles/run.invoker` on the service. One grant covers
+   every site only when they all use the same caller service account; a site with its own needs its own grant on the Job.
+5. On each site in turn, starting with Staging, open Processa Settings and fill the Sandbox Job fields: project, region, job
+   name, **Sandbox Job Processa URL** (that site's own `https` address) and **Max Parallel Sessions**. The cap is counted per
+   site, so three sites together can exceed one site's cap; Cloud Run quota is shared.
+6. Tick **Sandbox Use Job** on the Dev Agent only, run one small Work Item, and check: the session ends `closed`, a pull
+   request opens, no session is `lost`, and `gcloud run jobs executions list --job dev-agent-sandbox-job --region us-central1
+   --project ai-agents-10` shows nothing still running. Then add one agent at a time. To go back, untick the box.
+
+The hostnames are an exact match. A typo refuses every session from that site.
+
 ### Testing the session Job
 
 **1. Locally, with no cloud (about 10 seconds).** With `bench start` running, from the bench's `sites` folder:
