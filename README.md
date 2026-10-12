@@ -406,6 +406,41 @@ python3 deploy.py --env production --use-baked --job --processa-host <processa-h
 `--processa-host` pins `ALLOWED_PROCESSA_HOST`, so the container can call only that Processa. It takes one hostname.
 The Job has its own name per environment, so a Job deployed for testing is never the production one.
 
+### Testing the session Job
+
+**1. Locally, with no cloud (about 10 seconds).** With `bench start` running, from the bench's `sites` folder:
+
+```bash
+cd ~/Desktop/frappe-bench/sites && ../env/bin/python ~/Desktop/agent-sandbox/dev/local_session_check.py
+```
+
+It creates a test session through your local Processa, launches the real `session_agent.py` as a separate process with the
+session id and one-time token, and checks nine things: the agent registers, answers commands over HTTP, applies an edit
+(committed locally and not yet pushed), searches, numbers the commands, and on close pushes the work and exits.
+It uses throwaway git repositories and removes its test records. Only the Cloud Run start is replaced.
+It proves the protocol and the code. It does not prove cold starts, IAM, networking or cost.
+
+**2. A real Cloud Run Job, driven from your local Processa through ngrok.**
+
+1. Deploy the Job pinned to your current ngrok hostname (a restart of ngrok changes it, so redeploy then):
+
+```bash
+python3 deploy.py --env production --use-baked --job --processa-host <your-ngrok-hostname>
+```
+
+2. Let the caller service account start executions of the Job (it needs permission to run a Job with overrides,
+   for example `roles/run.developer` on the Job; check the first error if it fails).
+3. In Processa Settings, fill the Sandbox Job fields: project, region, job name (`dev-agent-sandbox-job` for production),
+   and **Sandbox Job Processa URL** with the ngrok `https` address.
+4. On one agent's AI Agent Configuration, tick **Sandbox Use Job** (the **Sandbox** section of the form, or the **Sandbox**
+   block of the agent task dialog in the Process UI), then run a small Work Item.
+5. Watch the **Agent Sandbox Session** record: queued, starting, registered, active, closed. Each call is an
+   **Agent Sandbox Session Command**, and the whole run is on its **Agent Sandbox Trace**.
+
+There is no automatic fallback. With the box unticked (the default) every call is its own request to the shared service.
+With it ticked, a Job that cannot start or does not answer makes the call fail ("The sandbox session failed", or "gave no answer in time":
+180 seconds while the container starts, 60 once it runs). To go back, untick the box.
+
 ## Known gaps
 
 - **Tests need `allow_tests` on the sandboxed site.** Without it, `bench
