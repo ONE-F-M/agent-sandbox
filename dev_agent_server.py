@@ -864,6 +864,11 @@ def _tool_write_file(app_dir, args):
         abs_path = _safe_path(app_dir, path)
     except ValueError as exc:
         return {"error": str(exc)}
+    if not content.strip() and os.path.isfile(abs_path) and os.path.getsize(abs_path) > 0:
+        return {
+            "error": f"This would empty {path!r}. To remove a file that is no longer needed use delete_file; "
+            "if it must stay as an empty file, delete it first and then write it empty."
+        }
     os.makedirs(os.path.dirname(abs_path), exist_ok=True)
     with open(abs_path, "w", encoding="utf-8") as fh:
         fh.write(content)

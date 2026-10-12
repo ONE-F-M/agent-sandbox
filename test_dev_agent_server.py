@@ -1763,3 +1763,42 @@ class TestMobileDependenciesAreRefreshedBeforeTheBuild(unittest.TestCase):
         self.assertFalse(passed)
         self.assertEqual(failing, [])
         self.assertIn("lockfile needs to be updated", stderr)
+
+
+class TestWriteFileDoesNotEmptyAFile(unittest.TestCase):
+    def setUp(self):
+        self.app_dir = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.app_dir, True)
+
+    def _write(self, name, text):
+        with open(os.path.join(self.app_dir, name), "w") as fh:
+            fh.write(text)
+
+    def _read(self, name):
+        with open(os.path.join(self.app_dir, name)) as fh:
+            return fh.read()
+
+    def test_replacing_a_file_that_has_content_with_nothing_is_refused_and_leaves_it_alone(self):
+        self._write("old.py", "x = 1\n")
+        result = srv._tool_write_file(self.app_dir, {"path": "old.py", "content": ""})
+        self.assertIn("delete_file", result["error"])
+        self.assertEqual(self._read("old.py"), "x = 1\n")
+
+    def test_whitespace_alone_counts_as_empty(self):
+        self._write("old.py", "x = 1\n")
+        self.assertIn("error", srv._tool_write_file(self.app_dir, {"path": "old.py", "content": "  \n"}))
+        self.assertEqual(self._read("old.py"), "x = 1\n")
+
+    def test_a_new_empty_file_can_still_be_created(self):
+        result = srv._tool_write_file(self.app_dir, {"path": "pkg/__init__.py", "content": ""})
+        self.assertEqual(result, {"written": True, "path": "pkg/__init__.py"})
+        self.assertEqual(self._read("pkg/__init__.py"), "")
+
+    def test_a_file_that_is_already_empty_can_be_written_empty(self):
+        self._write("empty.py", "")
+        self.assertTrue(srv._tool_write_file(self.app_dir, {"path": "empty.py", "content": ""})["written"])
+
+    def test_real_content_still_overwrites(self):
+        self._write("old.py", "x = 1\n")
+        self.assertTrue(srv._tool_write_file(self.app_dir, {"path": "old.py", "content": "y = 2\n"})["written"])
+        self.assertEqual(self._read("old.py"), "y = 2\n")
