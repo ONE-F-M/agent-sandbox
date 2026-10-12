@@ -30,6 +30,8 @@ IDLE_GRACE_SECONDS = 180
 # About 90 seconds of retrying, so a Processa deploy or a dropped tunnel does not end a live session.
 CALL_TRIES = 10
 CALL_BACKOFF_MAX_SECONDS = 15
+# A tunnel that is briefly offline answers 404; 408, 425 and 429 are also worth waiting out.
+RETRY_CLIENT_CODES = frozenset({404, 408, 425, 429})
 
 
 class SessionRefused(Exception):
@@ -55,7 +57,7 @@ class Processa:
                     data = json.loads(response.read() or b"{}")
                 return data.get("message", data)
             except urllib.error.HTTPError as exc:
-                if exc.code < 500:
+                if exc.code < 500 and exc.code not in RETRY_CLIENT_CODES:
                     raise
                 last = exc
             except (urllib.error.URLError, TimeoutError) as exc:

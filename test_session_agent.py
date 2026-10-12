@@ -348,6 +348,15 @@ class TestTheClient(unittest.TestCase):
             self.assertEqual(client.call("next_command", {}), {"ok": 1})
         self.assertGreater(sum(call.args[0] for call in sleep.call_args_list), 30)
 
+    def test_a_tunnel_that_answers_404_while_offline_is_waited_out(self):
+        client = agent.Processa("https://p.example", "S")
+        offline = urllib.error.HTTPError("u", 404, "not found", {}, io.BytesIO())
+        with patch.object(agent.time, "sleep"), patch.object(
+            agent.urllib.request, "urlopen", side_effect=[offline] * 3 + [self._response({"ok": 1})]
+        ) as urlopen:
+            self.assertEqual(client.call("next_command", {}), {"ok": 1})
+        self.assertEqual(urlopen.call_count, 4)
+
     def test_a_network_failure_that_never_clears_raises_after_the_tries(self):
         client = agent.Processa("https://p.example", "S")
         with patch.object(agent.time, "sleep"), patch.object(
