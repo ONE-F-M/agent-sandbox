@@ -1749,20 +1749,22 @@ class TestMobileDependenciesAreRefreshedBeforeTheBuild(unittest.TestCase):
         with patch.object(srv, "_run", side_effect=fake_run):
             srv._run_tests("mobile_app_ionic")
         self.assertIn("yarn check --integrity", commands[0])
-        self.assertIn("yarn install --frozen-lockfile", commands[0])
+        self.assertIn("yarn install", commands[0])
+        self.assertNotIn("--frozen-lockfile", commands[0])
+        self.assertIn("git checkout -- yarn.lock", commands[0])
         self.assertIn("yarn build", commands[1])
 
     def test_a_failed_install_ends_the_run_before_the_build(self):
         def fake_run(cmd, **kwargs):
             if "yarn install" in cmd:
-                return _FakeCompletedProcess(1, "", "error: lockfile needs to be updated")
+                return _FakeCompletedProcess(1, "", "error: network unreachable")
             raise AssertionError(cmd)
 
         with patch.object(srv, "_run", side_effect=fake_run):
             passed, _stdout, stderr, failing = srv._run_tests("mobile_app_ionic")
         self.assertFalse(passed)
         self.assertEqual(failing, [])
-        self.assertIn("lockfile needs to be updated", stderr)
+        self.assertIn("network unreachable", stderr)
 
 
 class TestCallbackHostPin(unittest.TestCase):

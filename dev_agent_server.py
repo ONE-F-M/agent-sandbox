@@ -533,8 +533,9 @@ def _run_tests(target_app, base_branch=None):
     # for a single dispatched change.
     if target_app == "mobile_app_ionic":
         app_dir = f"{BENCH_DIR}/apps/{target_app}"
-        # node_modules baked into the image can predate package.json, so install when the lockfile no longer matches it.
-        deps = _run(f"cd {shlex.quote(app_dir)} && (yarn check --integrity > /dev/null 2>&1 || yarn install --frozen-lockfile)", timeout=900)
+        # node_modules baked into the image can predate package.json, and the repo's yarn.lock can lag it too, so a
+        # plain install when the install state is stale. yarn.lock is put back so the install never reaches the PR.
+        deps = _run(f"cd {shlex.quote(app_dir)} && (yarn check --integrity > /dev/null 2>&1 || yarn install) && git checkout -- yarn.lock", timeout=900)
         if deps.returncode != 0:
             return False, deps.stdout[-4000:], deps.stderr[-4000:], []
         build = _run(f"cd {shlex.quote(app_dir)} && yarn build", timeout=900)
