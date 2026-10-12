@@ -339,6 +339,15 @@ class TestTheClient(unittest.TestCase):
             client.call("next_command", {})
         self.assertEqual(urlopen.call_count, 1)
 
+    def test_a_connection_that_drops_for_a_while_is_waited_out(self):
+        client = agent.Processa("https://p.example", "S")
+        down = urllib.error.URLError("down")
+        with patch.object(agent.time, "sleep") as sleep, patch.object(
+            agent.urllib.request, "urlopen", side_effect=[down] * 6 + [self._response({"ok": 1})]
+        ):
+            self.assertEqual(client.call("next_command", {}), {"ok": 1})
+        self.assertGreater(sum(call.args[0] for call in sleep.call_args_list), 30)
+
     def test_a_network_failure_that_never_clears_raises_after_the_tries(self):
         client = agent.Processa("https://p.example", "S")
         with patch.object(agent.time, "sleep"), patch.object(
