@@ -45,6 +45,13 @@ class TestDeploy(unittest.TestCase):
         self.assertNotIn("--set-secrets", command)
         self.assertNotIn("gcloud run deploy", command)
 
+    def test_a_job_deploy_tells_the_admin_to_grant_the_developer_role(self):
+        with patch("builtins.print") as printed:
+            self._last(job=True, processa_host="ba.example.com")
+        text = " ".join(str(call.args[0]) for call in printed.call_args_list if call.args)
+        self.assertIn("roles/run.developer", text)
+        self.assertNotIn("roles/run.viewer", text)
+
     def test_a_job_without_a_pinned_host_still_deploys_but_warns(self):
         with patch("builtins.print") as printed:
             command = self._last(job=True)

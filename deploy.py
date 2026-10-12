@@ -267,8 +267,8 @@ def _deploy_job(env: str, project_id: str, location: str, remote_image: str, use
     )
     print(f"\n  Job     : {job_name}  ({location})")
     print(f"  Processa Settings > Sandbox Jobs: project={project_id}, region={location}, name={job_name}")
-    print(f"  Grant the service account in Processa's Sandbox Caller Key roles/run.invoker on this Job")
-    print(f"  (it runs and cancels executions) and roles/run.viewer to read their status.")
+    print(f"  Grant the service account in Processa's Sandbox Caller Key roles/run.developer on this Job")
+    print(f"  (it starts executions with overrides, reads their status and cancels them).")
 
 
 if __name__ == "__main__":
