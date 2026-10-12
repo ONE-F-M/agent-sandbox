@@ -642,6 +642,8 @@ class TestDeletedFilesReachThePr(unittest.TestCase):
         with open(os.path.join(app_dir, "old.vue"), "w") as fh:
             fh.write("x")
         run("git add old.vue && git -c user.email=t@t -c user.name=t commit -q -m add && git checkout -q -b work")
+        # Like the mobile clone in the image: the base exists only as a remote-tracking ref, not as a local branch.
+        run("git update-ref refs/remotes/origin/staging staging && git branch -q -D staging")
         srv._tool_delete_file(app_dir, {"path": "old.vue"})
         run("git add -- old.vue && git -c user.email=t@t -c user.name=t commit -q -m delete")
         return bench
@@ -1270,7 +1272,7 @@ class TestCollectChangedFilesSeesCommittedEdits(unittest.TestCase):
 
     @staticmethod
     def _fake_run(cmd, **kwargs):
-        if "git diff --name-only staging...HEAD" in cmd:
+        if "git diff --name-only origin/staging...HEAD" in cmd:
             return _FakeCompletedProcess(0, "spiff/committed.vue\nspiff/both.js\n", "")
         if "git diff --name-only HEAD" in cmd:
             return _FakeCompletedProcess(0, "spiff/pending.py\nspiff/both.js\n", "")
@@ -1401,7 +1403,7 @@ class TestCheckoutTakesWhatWasJustFetched(unittest.TestCase):
         base = next(i for i, c in enumerate(calls) if "git checkout -f -B staging FETCH_HEAD" in c)
         head = next(i for i, c in enumerate(calls) if "git checkout -f -B item-3239" in c and "FETCH_HEAD" not in c)
         self.assertLess(fetch, base); self.assertLess(base, head)
-        self.assertFalse(any("origin/staging" in c for c in calls))
+        self.assertFalse(any("checkout" in c and "origin/staging" in c for c in calls))
 
     def test_existing_head_branch_is_checked_out_from_fetch_head_on_any_instance(self):
         calls = []
@@ -1685,3 +1687,79 @@ class TestRunTestsReturnsFailingTests(unittest.TestCase):
         with patch.object(srv, "_tests_for_tree", return_value=(True, "out", "err", [])):
             result = srv._tool_run_tests("one_bpmn", {})
         self.assertEqual(result["failing_tests"], [])
+
+
+class TestBaseBranchIsFetchedAndDiffedAsATrackingRef(unittest.TestCase):
+    def test_every_checkout_first_fetches_the_base_into_its_tracking_ref(self):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if "git remote get-url origin" in cmd:
+                return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
+            return _FakeCompletedProcess(0)
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            ok, _err = srv._checkout_or_create_head_branch("mobile_app_ionic", "staging", "WI-1")
+        self.assertTrue(ok)
+        refspec = "git fetch origin +refs/heads/staging:refs/remotes/origin/staging"
+        first_fetch = next(i for i, c in enumerate(calls) if "git fetch" in c)
+        self.assertIn(refspec, calls[first_fetch])
+        self.assertLess(first_fetch, next(i for i, c in enumerate(calls) if "git fetch origin WI-1" in c))
+
+    def test_a_base_branch_that_cannot_be_fetched_is_reported(self):
+        def fake_run(cmd, **kwargs):
+            if "git remote get-url origin" in cmd:
+                return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
+            if "refs/remotes/origin/staging" in cmd:
+                return _FakeCompletedProcess(1, stderr="couldn't find remote ref staging")
+            return _FakeCompletedProcess(0)
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            ok, err = srv._checkout_or_create_head_branch("mobile_app_ionic", "staging", "WI-1")
+        self.assertFalse(ok)
+        self.assertIn("git fetch of base branch staging failed", err)
+
+    def test_the_diff_is_taken_against_the_tracking_ref(self):
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return _FakeCompletedProcess(0, "")
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            srv._changed_paths("mobile_app_ionic", "staging")
+        self.assertTrue(any("git diff --name-only origin/staging...HEAD" in c for c in commands))
+
+    def test_the_pull_request_names_the_base_when_nothing_changed(self):
+        run_ctx = {"git_branch": "staging", "work_item_description": "x", "github_token": "t", "correlation_id": "c"}
+        with patch.object(srv, "_collect_changed_files", return_value={}):
+            result = srv._tool_open_pull_request("mobile_app_ionic", {}, run_ctx)
+        self.assertIn("no changes against staging", result["error"])
+
+
+class TestMobileDependenciesAreRefreshedBeforeTheBuild(unittest.TestCase):
+    def test_the_install_state_is_checked_and_installed_when_stale_before_building(self):
+        commands = []
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            return _FakeCompletedProcess(0, "ok", "")
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            srv._run_tests("mobile_app_ionic")
+        self.assertIn("yarn check --integrity", commands[0])
+        self.assertIn("yarn install --frozen-lockfile", commands[0])
+        self.assertIn("yarn build", commands[1])
+
+    def test_a_failed_install_ends_the_run_before_the_build(self):
+        def fake_run(cmd, **kwargs):
+            if "yarn install" in cmd:
+                return _FakeCompletedProcess(1, "", "error: lockfile needs to be updated")
+            raise AssertionError(cmd)
+
+        with patch.object(srv, "_run", side_effect=fake_run):
+            passed, _stdout, stderr, failing = srv._run_tests("mobile_app_ionic")
+        self.assertFalse(passed)
+        self.assertEqual(failing, [])
+        self.assertIn("lockfile needs to be updated", stderr)

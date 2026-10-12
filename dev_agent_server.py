@@ -382,6 +382,12 @@ def _checkout_or_create_head_branch(target_app, git_branch, head_branch):
         return text.replace(github_token, "***") if github_token else text
 
     with _authed_remote(app_dir, github_token):
+        # The base is fetched into its own tracking ref on every call: a clone that kept only its default
+        # branch has no origin/<base>, and the diff for the pull request is taken against it.
+        base_refspec = f"+refs/heads/{git_branch}:refs/remotes/origin/{git_branch}"
+        fetch_base_ref = _run(f"cd {shlex.quote(app_dir)} && git fetch origin {shlex.quote(base_refspec)}")
+        if fetch_base_ref.returncode != 0:
+            return False, f"git fetch of base branch {git_branch} failed: {_scrub(fetch_base_ref.stderr)}"
         fetch_head = _run(f"cd {shlex.quote(app_dir)} && git fetch origin {shlex.quote(head_branch)}")
         if fetch_head.returncode == 0:
             # -f: see _checkout_target_branch — the working tree can already
@@ -454,7 +460,8 @@ def _changed_paths(target_app, base_branch=None):
     app_dir = f"{BENCH_DIR}/apps/{target_app}"
     paths = []
     if base_branch:
-        committed = _run(f"cd {shlex.quote(app_dir)} && git diff --name-only {shlex.quote(base_branch)}...HEAD")
+        base_ref = f"origin/{base_branch}"
+        committed = _run(f"cd {shlex.quote(app_dir)} && git diff --name-only {shlex.quote(base_ref)}...HEAD")
         if committed.returncode == 0:
             paths += committed.stdout.strip().splitlines()
     pending = _run(f"cd {shlex.quote(app_dir)} && git diff --name-only HEAD")
@@ -520,6 +527,10 @@ def _run_tests(target_app, base_branch=None):
     # for a single dispatched change.
     if target_app == "mobile_app_ionic":
         app_dir = f"{BENCH_DIR}/apps/{target_app}"
+        # node_modules baked into the image can predate package.json, so install when the lockfile no longer matches it.
+        deps = _run(f"cd {shlex.quote(app_dir)} && (yarn check --integrity > /dev/null 2>&1 || yarn install --frozen-lockfile)", timeout=900)
+        if deps.returncode != 0:
+            return False, deps.stdout[-4000:], deps.stderr[-4000:], []
         build = _run(f"cd {shlex.quote(app_dir)} && yarn build", timeout=900)
         if build.returncode != 0:
             # A build failure, not a test failure -- vitest never ran, so
@@ -1072,7 +1083,7 @@ def _tool_open_pull_request(target_app, args, run_ctx):
     summary = (args.get("summary") or "").strip()
     files = _collect_changed_files(target_app, run_ctx["git_branch"])
     if not files:
-        return {"error": "no changes to commit yet — nothing to open a pull request for"}
+        return {"error": f"The working branch has no changes against {run_ctx['git_branch']}. Make an edit first, then open the pull request."}
     passed, _stdout, stderr, failing_tests = _tests_for_tree(target_app, run_ctx["git_branch"])
     pr_url, pr_error = _open_pr(
         target_app, run_ctx["git_branch"], run_ctx["work_item_description"], files,
