@@ -437,6 +437,15 @@ python3 deploy.py --env production --use-baked --job --processa-host <your-ngrok
 5. Watch the **Agent Sandbox Session** record: queued, starting, registered, active, closed. Each call is an
    **Agent Sandbox Session Command**, and the whole run is on its **Agent Sandbox Trace**.
 
+Helpers for a local bench (run from `<bench>/sites` with `../env/bin/python`):
+
+- `dev/local_job_test.py status|on|off` shows the state, fills the Sandbox Job fields in Processa Settings and ticks
+  **Sandbox Use Job** on one agent (`on [--settings-only] [--agent "Dev Agent"] [--max-parallel 3]`), or unticks every agent (`off`).
+  With `--settings-only` no agent is ticked, which is the safe state until the Job is deployed.
+- `dev/local_ticks.py [rounds]` runs the scheduler jobs a bench with its scheduler off needs, every 20 seconds, including the
+  session reaper. A queued session only starts, and an idle one only closes, while it runs.
+- For several Work Items at once, add AI workers, one per terminal, because a local bench has a single one: `bench worker --queue bpmn_ai_agent`.
+
 There is no automatic fallback. With the box unticked (the default) every call is its own request to the shared service.
 With it ticked, a Job that cannot start or does not answer makes the call fail ("The sandbox session failed", or "gave no answer in time":
 180 seconds while the container starts, 60 once it runs). To go back, untick the box.
