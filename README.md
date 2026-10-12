@@ -407,7 +407,7 @@ did before the Job existed. The Job, its settings and its IAM grants are not tou
 | Used when | Sandbox Use Job is unticked | Sandbox Use Job is ticked on the agent |
 | Unit of work | one HTTP request per tool call | one Job execution per Work Item |
 | Deployed with | `deploy.py` | `deploy.py --job --processa-host <host>` |
-| Caller needs | `roles/run.invoker` on the service | `roles/run.invoker` and `roles/run.viewer` on the Job |
+| Caller needs | `roles/run.invoker` on the service | `roles/run.developer` on the Job (start with overrides, read, cancel) |
 | Callback pin | `--callback-host` (comma list) | `--processa-host` (one hostname) |
 
 **To enable it:**
@@ -420,8 +420,9 @@ did before the Job existed. The Job, its settings and its IAM grants are not tou
 
    `--processa-host` pins `ALLOWED_PROCESSA_HOST`, so the container can call only that Processa. It takes one hostname.
    The Job has its own name per environment, so a Job deployed for testing is never the production one.
-2. Grant the caller service account (the one whose key Processa uses) `roles/run.invoker` and `roles/run.viewer`
-   on the Job. Both are per-resource grants, so access to the service does not cover the Job.
+2. Grant the caller service account (the one whose key Processa uses) `roles/run.developer` on the Job. Processa starts
+   each session with overrides, which needs `run.jobs.runWithOverrides`; `run.invoker` does not include it. The grant is
+   per resource, so access to the service does not cover the Job.
 3. In Processa Settings, fill the Sandbox Job fields: project, region, job name, **Sandbox Job Processa URL**, and
    **Max Parallel Sessions**.
 4. Tick **Sandbox Use Job** on the agents that should use it (the **Sandbox** section of the AI Agent Configuration form,
@@ -455,7 +456,7 @@ It proves the protocol and the code. It does not prove cold starts, IAM, network
 python3 deploy.py --env production --use-baked --job --processa-host <your-ngrok-hostname>
 ```
 
-2. Grant the caller service account `roles/run.invoker` and `roles/run.viewer` on the Job (see "Session Job" above).
+2. Grant the caller service account `roles/run.developer` on the Job (see "Session Job" above).
    Check it before the first run with `testIamPermissions` on the Job using the caller's key.
 3. In Processa Settings, fill the Sandbox Job fields: project, region, job name (`dev-agent-sandbox-job` for production),
    and **Sandbox Job Processa URL** with the ngrok `https` address.
