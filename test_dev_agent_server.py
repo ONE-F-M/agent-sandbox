@@ -1765,6 +1765,33 @@ class TestMobileDependenciesAreRefreshedBeforeTheBuild(unittest.TestCase):
         self.assertIn("lockfile needs to be updated", stderr)
 
 
+class TestCallbackHostPin(unittest.TestCase):
+    def _error(self, url, pin):
+        with patch.object(srv, "ALLOWED_CALLBACK_HOST", pin):
+            return srv._validate_callback_url({"callback_url": url})
+
+    def test_no_pin_accepts_any_https_host(self):
+        self.assertIsNone(self._error("https://anything.example.com/cb", ""))
+
+    def test_a_pin_of_one_host_accepts_only_that_host(self):
+        self.assertIsNone(self._error("https://one-fm.com/cb", "one-fm.com"))
+        self.assertIn("one-fm.com", self._error("https://evil.example.com/cb", "one-fm.com"))
+
+    def test_a_pin_of_three_hosts_accepts_each_of_them_and_no_other(self):
+        pin = "one-fm.com, staging.onefm.com,businessanalyst.onefm.com"
+        for host in ("one-fm.com", "staging.onefm.com", "businessanalyst.onefm.com"):
+            self.assertIsNone(self._error(f"https://{host}/api/method/cb", pin), host)
+        error = self._error("https://onefm.com/cb", pin)
+        self.assertIn("must be one of", error)
+        self.assertIn("staging.onefm.com", error)
+
+    def test_a_host_that_only_ends_with_an_allowed_host_is_refused(self):
+        self.assertIsNotNone(self._error("https://evil-one-fm.com/cb", "one-fm.com"))
+
+    def test_the_pin_does_not_make_http_acceptable(self):
+        self.assertEqual(self._error("http://one-fm.com/cb", "one-fm.com"), "callback_url must be https")
+
+
 class TestWriteFileDoesNotEmptyAFile(unittest.TestCase):
     def setUp(self):
         self.app_dir = os.path.realpath(tempfile.mkdtemp())

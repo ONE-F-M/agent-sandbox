@@ -187,15 +187,17 @@ def deploy(
         f"SKIP_SETUP={'1' if use_baked else '0'}",
         f"SANDBOX_ENV={env}",
     ]
+    callback_host = ",".join(host.strip() for host in callback_host.split(",") if host.strip())
     if callback_host:
-        # Pins this environment's sandbox to only ever call back to one host
+        # Pins this environment's sandbox to only ever call back to these hosts
         # — a beta sandbox can't be pointed at production's Processa (or
         # anywhere else) by a malformed/malicious /run payload. Optional
         # because you may not have this bench's public hostname yet.
         env_var_list.append(f"ALLOWED_CALLBACK_HOST={callback_host}")
     else:
         print(f"[WARN] --callback-host not set for '{env}' — the sandbox will accept a callback_url to any https host.")
-    env_vars = ",".join(env_var_list)
+    # A custom delimiter, so a value can hold the commas of a list of hosts.
+    env_vars = "^@^" + "@".join(env_var_list)
 
     if job:
         _deploy_job(env, project_id, location, remote_image, use_baked, processa_host)
@@ -275,7 +277,7 @@ if __name__ == "__main__":
     parser.add_argument("--project", default=_get_gcloud_project())
     parser.add_argument("--region", default="us-central1")
     parser.add_argument("--use-baked", action="store_true", help="Deploy the pre-baked golden image for this env (see bake_image.sh) instead of building fresh")
-    parser.add_argument("--callback-host", default="", help="Hostname of this environment's Processa bench — pins ALLOWED_CALLBACK_HOST so the sandbox can't be pointed elsewhere")
+    parser.add_argument("--callback-host", default="", help="Hostname of this environment's Processa bench, or several separated by commas — pins ALLOWED_CALLBACK_HOST so the sandbox can't be pointed elsewhere")
     parser.add_argument("--job", action="store_true", help="Deploy the session Job (one execution per Work Item) instead of the always-on service")
     parser.add_argument("--processa-host", default="", help="With --job: pins ALLOWED_PROCESSA_HOST so the container can only call this environment's Processa")
     parser.add_argument("--no-traffic", action="store_true", help="Deploy the service revision without sending it traffic; reach it at its --tag address, then shift traffic")

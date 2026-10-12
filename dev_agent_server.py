@@ -160,13 +160,19 @@ def _validate_identifiers(payload):
     return None
 
 
+def _allowed_callback_hosts():
+    """The hostnames the sandbox may call back to: ALLOWED_CALLBACK_HOST holds one, or several separated by commas."""
+    return {host.strip().lower() for host in ALLOWED_CALLBACK_HOST.split(",") if host.strip()}
+
+
 def _validate_callback_url(payload):
     callback_url = payload["callback_url"]
     parsed = urllib.parse.urlparse(callback_url)
     if parsed.scheme != "https":
         return "callback_url must be https"
-    if ALLOWED_CALLBACK_HOST and parsed.hostname != ALLOWED_CALLBACK_HOST:
-        return f"callback_url host must be {ALLOWED_CALLBACK_HOST}"
+    allowed = _allowed_callback_hosts()
+    if allowed and parsed.hostname not in allowed:
+        return f"callback_url host must be one of: {', '.join(sorted(allowed))}"
     return None
 
 

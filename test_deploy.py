@@ -51,6 +51,19 @@ class TestDeploy(unittest.TestCase):
         self.assertNotIn("ALLOWED_PROCESSA_HOST", command)
         self.assertTrue(any("--processa-host not set" in str(call.args[0]) for call in printed.call_args_list))
 
+    def test_several_callback_hosts_are_pinned_with_a_delimiter_that_keeps_their_commas(self):
+        command = self._last(callback_host="one-fm.com, staging.onefm.com,businessanalyst.onefm.com")
+        self.assertIn("--set-env-vars=\"^@^PYTHONUNBUFFERED=1@", command)
+        self.assertIn("@ALLOWED_CALLBACK_HOST=one-fm.com,staging.onefm.com,businessanalyst.onefm.com", command)
+
+    def test_one_callback_host_is_pinned_the_same_way(self):
+        self.assertIn("@ALLOWED_CALLBACK_HOST=one-fm.com", self._last(callback_host="one-fm.com"))
+
+    def test_without_a_callback_host_no_pin_is_set_but_the_other_variables_still_are(self):
+        command = self._last()
+        self.assertNotIn("ALLOWED_CALLBACK_HOST", command)
+        self.assertIn("@SANDBOX_ENV=beta", command)
+
     def test_each_environment_has_its_own_job_name(self):
         self.assertNotEqual(deploy._ENVIRONMENTS["production"]["job"], deploy._ENVIRONMENTS["beta"]["job"])
 
