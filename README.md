@@ -366,7 +366,7 @@ Deploy again with the callback host pin and without `--no-traffic`. No new bake 
 it reuses the same baked image and only changes the environment variable.
 
 ```bash
-python3 deploy.py --env production --use-baked --callback-host one-fm.com,staging.onefm.com,businessanalyst.onefm.com
+python3 deploy.py --env production --use-baked --callback-host one-fm.com,staging.one-fm.com,business-analyst.one-fm.com
 ```
 
 ### 5. Roll back
