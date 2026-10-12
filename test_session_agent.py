@@ -377,6 +377,15 @@ class TestTheClient(unittest.TestCase):
         with patch.object(srv, "SANDBOX_ENV", "local"):
             agent.check_processa_url("http://localhost:8000")
 
+    def test_several_pinned_hosts_each_pass_and_any_other_is_refused(self):
+        with patch.object(srv, "SANDBOX_ENV", "production"), patch.dict(
+            os.environ, {"ALLOWED_PROCESSA_HOST": "staging.example, ba.example,prod.example"}
+        ):
+            for host in ("staging.example", "ba.example", "prod.example"):
+                agent.check_processa_url(f"https://{host}/x")
+            with self.assertRaises(ValueError):
+                agent.check_processa_url("https://other.example")
+
 
 class TestMain(unittest.TestCase):
     def test_missing_settings_end_it_with_a_usage_error(self):

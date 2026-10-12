@@ -247,6 +247,7 @@ def _deploy_job(env: str, project_id: str, location: str, remote_image: str, use
     settings from Processa at registration, over HTTPS, with a one-time token."""
     job_name = _ENVIRONMENTS[env]["job"]
     env_vars = [f"PYTHONUNBUFFERED=1", f"SKIP_SETUP={'1' if use_baked else '0'}", f"SANDBOX_ENV={env}"]
+    processa_host = ",".join(host.strip() for host in processa_host.split(",") if host.strip())
     if processa_host:
         env_vars.append(f"ALLOWED_PROCESSA_HOST={processa_host}")
     else:
@@ -260,7 +261,7 @@ def _deploy_job(env: str, project_id: str, location: str, remote_image: str, use
         f"--tasks=1 "
         f"--max-retries={JOB_MAX_RETRIES} "
         f"--task-timeout={JOB_TASK_TIMEOUT} "
-        f'--set-env-vars="{",".join(env_vars)}" '
+        f'--set-env-vars="^@^{"@".join(env_vars)}" '
         f"--project={project_id} "
         f"--quiet",
         f"STAGE 4 / 4 - Deploying the '{env}' session Job to Google Cloud Run",
@@ -279,7 +280,7 @@ if __name__ == "__main__":
     parser.add_argument("--use-baked", action="store_true", help="Deploy the pre-baked golden image for this env (see bake_image.sh) instead of building fresh")
     parser.add_argument("--callback-host", default="", help="Hostname of this environment's Processa bench, or several separated by commas — pins ALLOWED_CALLBACK_HOST so the sandbox can't be pointed elsewhere")
     parser.add_argument("--job", action="store_true", help="Deploy the session Job (one execution per Work Item) instead of the always-on service")
-    parser.add_argument("--processa-host", default="", help="With --job: pins ALLOWED_PROCESSA_HOST so the container can only call this environment's Processa")
+    parser.add_argument("--processa-host", default="", help="With --job: pins ALLOWED_PROCESSA_HOST (one hostname or a comma list) so the container can only call those Processa hosts")
     parser.add_argument("--no-traffic", action="store_true", help="Deploy the service revision without sending it traffic; reach it at its --tag address, then shift traffic")
     parser.add_argument("--tag", default="", help="With --no-traffic: the revision's tag, for example candidate")
     args = parser.parse_args()

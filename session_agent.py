@@ -67,13 +67,13 @@ class Processa:
 
 
 def check_processa_url(url):
-    """The address must be https (http only for a local run) and on the pinned host when one is set."""
+    """The address must be https (http only for a local run) and on one of the pinned hosts when any are set."""
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" and srv.SANDBOX_ENV != "local":
         raise ValueError("PROCESSA_URL must be https")
-    pinned = os.environ.get("ALLOWED_PROCESSA_HOST", "")
-    if pinned and parsed.hostname != pinned:
-        raise ValueError(f"PROCESSA_URL host must be {pinned}")
+    pinned = [host.strip() for host in os.environ.get("ALLOWED_PROCESSA_HOST", "").split(",") if host.strip()]
+    if pinned and parsed.hostname not in pinned:
+        raise ValueError(f"PROCESSA_URL host must be one of {', '.join(pinned)}")
 
 
 class Session:
