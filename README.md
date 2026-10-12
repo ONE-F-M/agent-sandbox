@@ -474,11 +474,10 @@ Helpers for a local bench (run from `<bench>/sites` with `../env/bin/python`):
   session reaper. A queued session only starts, and an idle one only closes, while it runs.
 - For several Work Items at once, add AI workers, one per terminal, because a local bench has a single one: `bench worker --queue bpmn_ai_agent`.
 
-**Start time.** The image is baked once, so nothing is built per run. Each Job execution is a new container, though, and
-a machine that does not have the image cached has to pull it first. A real test showed about 3 minutes from start to
-register on the first executions, close to the 180 second wait for a starting session. This is the expected cause and has
-not been confirmed from the container logs. Check a later execution (the image is likely cached by then) before changing
-the wait.
+**Start time.** The image is baked once, so nothing is built per run, and Cloud Run imports it in about a second. A Job
+execution still takes 1 to 2 minutes from start to register (58 to 113 seconds to start, then registration shortly after),
+because the container's entrypoint boots Redis and MariaDB before `session_agent.py` runs. A session waits up to 180
+seconds for its first call while it starts, so allow for this when sizing that wait.
 
 There is no automatic fallback. With the box unticked (the default) every call is its own request to the shared service.
 With it ticked, a Job that cannot start or does not answer makes the call fail ("The sandbox session failed", or "gave no answer in time":
