@@ -45,6 +45,11 @@ class TestDeploy(unittest.TestCase):
         self.assertNotIn("--set-secrets", command)
         self.assertNotIn("gcloud run deploy", command)
 
+    def test_several_processa_hosts_are_pinned_with_a_delimiter_that_keeps_their_commas(self):
+        command = self._last(job=True, processa_host="staging.example, ba.example,prod.example")
+        self.assertIn("--set-env-vars=\"^@^PYTHONUNBUFFERED=1@", command)
+        self.assertIn("@ALLOWED_PROCESSA_HOST=staging.example,ba.example,prod.example", command)
+
     def test_a_job_deploy_tells_the_admin_to_grant_the_developer_role(self):
         with patch("builtins.print") as printed:
             self._last(job=True, processa_host="ba.example.com")

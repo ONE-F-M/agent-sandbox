@@ -408,7 +408,7 @@ did before the Job existed. The Job, its settings and its IAM grants are not tou
 | Unit of work | one HTTP request per tool call | one Job execution per Work Item |
 | Deployed with | `deploy.py` | `deploy.py --job --processa-host <host>` |
 | Caller needs | `roles/run.invoker` on the service | `roles/run.developer` on the Job (start with overrides, read, cancel) |
-| Callback pin | `--callback-host` (comma list) | `--processa-host` (one hostname) |
+| Callback pin | `--callback-host` (comma list) | `--processa-host` (one hostname or a comma list) |
 
 **To enable it:**
 
@@ -418,7 +418,9 @@ did before the Job existed. The Job, its settings and its IAM grants are not tou
    python3 deploy.py --env production --use-baked --job --processa-host <processa-hostname>
    ```
 
-   `--processa-host` pins `ALLOWED_PROCESSA_HOST`, so the container can call only that Processa. It takes one hostname.
+   `--processa-host` pins `ALLOWED_PROCESSA_HOST`, so the container can call only those Processa hosts. It takes one hostname or a comma
+   list (for example `staging.example.com,ba.example.com,prod.example.com`), so one Job can serve several sites. Each site's
+   **Sandbox Job Processa URL** says which one a session calls, and the container refuses any host not in the list.
    The Job has its own name per environment, so a Job deployed for testing is never the production one.
 2. Grant the caller service account (the one whose key Processa uses) `roles/run.developer` on the Job. Processa starts
    each session with overrides, which needs `run.jobs.runWithOverrides`; `run.invoker` does not include it. The grant is
