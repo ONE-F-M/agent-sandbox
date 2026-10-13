@@ -501,6 +501,7 @@ def _migrate_site():
 
 
 _TEST_FAILURE_LINE = re.compile(r"^(?:FAIL|ERROR): (.+)$", re.MULTILINE)
+_NODE_FAILURE_LINE = re.compile(r"^\s*not ok \d+ - (.+)$", re.MULTILINE)
 
 
 def _extract_failing_tests(*texts, limit=50):
@@ -514,7 +515,7 @@ def _extract_failing_tests(*texts, limit=50):
     names = []
     seen = set()
     for text in texts:
-        for match in _TEST_FAILURE_LINE.finditer(text or ""):
+        for match in (*_TEST_FAILURE_LINE.finditer(text or ""), *_NODE_FAILURE_LINE.finditer(text or "")):
             name = match.group(1).strip()
             if name and name not in seen:
                 seen.add(name)
@@ -563,8 +564,11 @@ def _run_tests(target_app, base_branch=None):
     # still failed here. This is a workaround for that unrelated fixture
     # gap, not a fix for it — one_fm's own bug is untouched and would still
     # break a real Company/Warehouse creation anywhere else it happens.
-    modules = _test_modules_for(f"{BENCH_DIR}/apps/{target_app}", _changed_paths(target_app, base_branch))
-    if not modules:
+    app_dir = f"{BENCH_DIR}/apps/{target_app}"
+    changed = _changed_paths(target_app, base_branch)
+    modules = _test_modules_for(app_dir, changed)
+    node_tests = _node_tests_for(app_dir, changed)
+    if not modules and not node_tests:
         return True, "No test file matches the changed files, so no tests ran.", "", []
     passed, out, err = True, "", ""
     for module in modules[:_MAX_TEST_MODULES]:
@@ -573,6 +577,13 @@ def _run_tests(target_app, base_branch=None):
             f"--module {shlex.quote(module)} --skip-before-tests",
             timeout=1800,
         )
+        passed = passed and result.returncode == 0
+        out += result.stdout[-4000:]
+        err += result.stderr[-4000:]
+    if node_tests:
+        spiff_dir = f"{app_dir}/spiff"
+        node = ["node", "--test", *node_tests[:_MAX_TEST_MODULES]]
+        result = _run(f"cd {shlex.quote(spiff_dir)} && " + shlex.join(node), timeout=300)
         passed = passed and result.returncode == 0
         out += result.stdout[-4000:]
         err += result.stderr[-4000:]
@@ -604,6 +615,32 @@ def _test_modules_for(app_dir, paths):
                 modules.append(candidate[:-3].replace("/", "."))
                 break
     return list(dict.fromkeys(modules))
+
+
+_NODE_TEST_SUFFIX = ".test.mjs"
+
+
+def _node_tests_for(app_dir, paths):
+    """The Vue app's node tests for the changed files: a changed test, the test beside a changed file, or a test that names it."""
+    src = os.path.join(app_dir, "spiff", "src")
+    changed = [path[len("spiff/src/") :] for path in paths if path.startswith("spiff/src/")]
+    if not changed or not os.path.isdir(src):
+        return []
+    tests = {}
+    for folder, _dirs, names in os.walk(src):
+        for name in names:
+            if name.endswith(_NODE_TEST_SUFFIX):
+                path = os.path.join(folder, name)
+                with open(path, encoding="utf-8") as handle:
+                    tests[os.path.relpath(path, src)] = handle.read()
+    wanted = []
+    for rel in changed:
+        if rel in tests:
+            wanted.append(rel)
+            continue
+        beside = os.path.splitext(rel)[0] + _NODE_TEST_SUFFIX
+        wanted.extend([beside] if beside in tests else [test for test, text in tests.items() if rel in text])
+    return ["src/" + test for test in dict.fromkeys(wanted)]
 
 
 _test_results = {}

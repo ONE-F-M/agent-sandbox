@@ -540,6 +540,10 @@ With it ticked, a Job that cannot start or does not answer makes the call fail (
   Only the tests that import a changed file (and any changed spec) run, so a failing test elsewhere in the repo does not
   decide the result, and a change no test covers passes with "No test files found". Before that, `yarn check --integrity`
   decides whether a `yarn install` is needed, and `yarn.lock` is restored afterwards so the install never reaches the pull request.
+- **`one_bpmn` Vue tests run with plain Node, for the files a change affects.** A change under `spiff/src/` runs
+  `node --test` in `spiff/` on: a changed `*.test.mjs`, the `.test.mjs` beside a changed source file, and any test that names
+  the changed file's path. These tests read source text, so they need no installed packages. Only those files run, because the
+  whole directory has a test that fails on its own, and a change no test covers still reports "no tests ran".
 - **No coverage/lint step.** The coding loop's only signal is
   pass/fail from the target app's existing test suite — it doesn't run a
   linter or report coverage.
