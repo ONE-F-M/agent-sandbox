@@ -1698,6 +1698,12 @@ class TestRunTestsRunsTheNodeTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertEqual(failing, ["a node test"])
 
+    def test_a_test_that_errors_fails_the_run_even_when_bench_exits_zero(self):
+        errored = srv.subprocess.CompletedProcess("c", 0, "", "E.\nERROR: test_bad (m.a.T.test_bad)\n")
+        (passed, _out, _err, failing), _run = self._run_tests([], ["m.a"], [errored])
+        self.assertFalse(passed)
+        self.assertEqual(failing, ["test_bad (m.a.T.test_bad)"])
+
     def test_nothing_to_run_still_says_no_tests_ran(self):
         (passed, stdout, _err, _failing), run = self._run_tests([], [])
         run.assert_not_called()

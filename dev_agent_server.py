@@ -588,7 +588,9 @@ def _run_tests(target_app, base_branch=None):
         out += result.stdout[-4000:]
         err += result.stderr[-4000:]
     stdout, stderr = out[-4000:], err[-4000:]
-    return passed, stdout, stderr, _extract_failing_tests(out, err)
+    failing = _extract_failing_tests(out, err)
+    # bench run-tests exits 0 when a test raises an error, so a named failing test fails the run.
+    return passed and not failing, stdout, stderr, failing
 
 
 _MAX_TEST_MODULES = 10
