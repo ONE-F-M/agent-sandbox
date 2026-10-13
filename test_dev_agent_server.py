@@ -1615,6 +1615,96 @@ class TestAgentNameThreading(unittest.TestCase):
         self.assertTrue(pr["title"].startswith("Dev Agent: "))
 
 
+class TestNodeTestsForTheVueApp(unittest.TestCase):
+    def setUp(self):
+        self.app_dir = os.path.realpath(tempfile.mkdtemp())
+        files = {
+            "spiff/src/uiPolish.test.mjs": 'source("components/ProcessFilter.vue")',
+            "spiff/src/utils/formatters.test.mjs": "import { f } from './formatters.mjs'",
+            "spiff/src/utils/formatters.mjs": "",
+            "spiff/src/components/ProcessFilter.vue": "",
+            "spiff/src/components/Other.vue": "",
+            "one_bpmn/utils.py": "",
+        }
+        for rel, text in files.items():
+            path = os.path.join(self.app_dir, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as handle:
+                handle.write(text)
+
+    def tearDown(self):
+        shutil.rmtree(self.app_dir, ignore_errors=True)
+
+    def test_a_changed_test_file_is_its_own_target(self):
+        self.assertEqual(srv._node_tests_for(self.app_dir, ["spiff/src/uiPolish.test.mjs"]), ["src/uiPolish.test.mjs"])
+
+    def test_the_test_beside_a_changed_source_file_is_a_target(self):
+        self.assertEqual(
+            srv._node_tests_for(self.app_dir, ["spiff/src/utils/formatters.mjs"]), ["src/utils/formatters.test.mjs"]
+        )
+
+    def test_a_test_that_names_a_changed_component_is_a_target(self):
+        self.assertEqual(
+            srv._node_tests_for(self.app_dir, ["spiff/src/components/ProcessFilter.vue"]), ["src/uiPolish.test.mjs"]
+        )
+
+    def test_a_change_and_its_test_together_run_the_test_once(self):
+        paths = ["spiff/src/components/ProcessFilter.vue", "spiff/src/uiPolish.test.mjs"]
+        self.assertEqual(srv._node_tests_for(self.app_dir, paths), ["src/uiPolish.test.mjs"])
+
+    def test_a_file_no_test_covers_and_paths_outside_the_vue_app_map_to_nothing(self):
+        self.assertEqual(srv._node_tests_for(self.app_dir, ["spiff/src/components/Other.vue", "one_bpmn/utils.py"]), [])
+
+    def test_an_app_without_a_vue_app_maps_to_nothing(self):
+        shutil.rmtree(os.path.join(self.app_dir, "spiff"))
+        self.assertEqual(srv._node_tests_for(self.app_dir, ["spiff/src/uiPolish.test.mjs"]), [])
+
+
+class TestRunTestsRunsTheNodeTests(unittest.TestCase):
+    def _run_tests(self, node_tests, modules=(), results=()):
+        with patch.object(srv, "_changed_paths", return_value=["spiff/src/a.vue"]), patch.object(
+            srv, "_test_modules_for", return_value=list(modules)
+        ), patch.object(srv, "_node_tests_for", return_value=list(node_tests)), patch.object(
+            srv, "_run", side_effect=list(results)
+        ) as run:
+            outcome = srv._run_tests("one_bpmn", "staging")
+        return outcome, run
+
+    def test_a_vue_change_runs_node_in_the_spiff_folder_and_not_bench(self):
+        ok = srv.subprocess.CompletedProcess("c", 0, "# pass 1\n", "")
+        (passed, stdout, _err, failing), run = self._run_tests(["src/uiPolish.test.mjs"], results=[ok])
+        run.assert_called_once()
+        command = run.call_args.args[0]
+        self.assertIn("/apps/one_bpmn/spiff", command)
+        self.assertIn("node --test src/uiPolish.test.mjs", command)
+        self.assertNotIn("run-tests", command)
+        self.assertTrue(passed)
+        self.assertNotIn("no tests ran", stdout)
+        self.assertEqual(failing, [])
+
+    def test_a_failing_node_test_fails_the_run_and_is_named(self):
+        bad = srv.subprocess.CompletedProcess("c", 1, "not ok 1 - the button has a name\n", "")
+        (passed, _out, _err, failing), _run = self._run_tests(["src/uiPolish.test.mjs"], results=[bad])
+        self.assertFalse(passed)
+        self.assertEqual(failing, ["the button has a name"])
+
+    def test_python_modules_and_node_tests_both_run_and_either_can_fail_the_run(self):
+        python_ok = srv.subprocess.CompletedProcess("c", 0, "ok\n", "")
+        node_bad = srv.subprocess.CompletedProcess("c", 1, "not ok 2 - a node test\n", "")
+        (passed, _out, _err, failing), run = self._run_tests(["src/a.test.mjs"], ["m.a"], [python_ok, node_bad])
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("--module m.a", run.call_args_list[0].args[0])
+        self.assertIn("node --test", run.call_args_list[1].args[0])
+        self.assertFalse(passed)
+        self.assertEqual(failing, ["a node test"])
+
+    def test_nothing_to_run_still_says_no_tests_ran(self):
+        (passed, stdout, _err, _failing), run = self._run_tests([], [])
+        run.assert_not_called()
+        self.assertTrue(passed)
+        self.assertIn("no tests ran", stdout)
+
+
 class TestExtractFailingTests(unittest.TestCase):
     """_extract_failing_tests reads the "FAIL: <id>" / "ERROR: <id>" summary
     lines Python's own unittest.TextTestRunner prints (what `bench
@@ -1653,6 +1743,10 @@ class TestExtractFailingTests(unittest.TestCase):
 
     def test_none_text_is_ignored_not_an_error(self):
         self.assertEqual(srv._extract_failing_tests(None, "FAIL: test_a (mod.TestA)\n"), ["test_a (mod.TestA)"])
+
+    def test_finds_the_tests_node_reports_as_not_ok(self):
+        text = "TAP version 13\nok 1 - fine\n    not ok 2 - the button has a name\nnot ok 3 - the file\n"
+        self.assertEqual(srv._extract_failing_tests(text), ["the button has a name", "the file"])
 
     def test_stops_at_the_limit(self):
         text = "\n".join(f"FAIL: test_{i} (mod.TestCase)" for i in range(10))
