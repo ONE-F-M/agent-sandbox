@@ -66,6 +66,9 @@ _ENVIRONMENTS = {
 # your GCP quota. --concurrency=1 is the isolation boundary: one work item's
 # sandbox per container instance, never shared.
 CLOUD_RUN_MEMORY = "8Gi"
+# The session Job only (the shared service stays at CLOUD_RUN_MEMORY): 16Gi after 9 of 40 sessions on
+# 2026-10-28 ended "The container never registered".
+JOB_MEMORY = "16Gi"
 CLOUD_RUN_CPU = "4"
 CLOUD_RUN_PORT = "8080"
 CLOUD_RUN_MAX_INST = "3"
@@ -256,7 +259,7 @@ def _deploy_job(env: str, project_id: str, location: str, remote_image: str, use
         f"gcloud run jobs deploy {job_name} "
         f"--image={remote_image} "
         f"--region={location} "
-        f"--memory={CLOUD_RUN_MEMORY} "
+        f"--memory={JOB_MEMORY} "
         f"--cpu={CLOUD_RUN_CPU} "
         f"--tasks=1 "
         f"--max-retries={JOB_MAX_RETRIES} "
