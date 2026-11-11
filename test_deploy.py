@@ -40,10 +40,17 @@ class TestDeploy(unittest.TestCase):
         self.assertIn("gcloud run jobs deploy dev-agent-sandbox-job-beta ", command)
         self.assertIn("--max-retries=0", command)
         self.assertIn("--tasks=1", command)
+        self.assertIn("--memory=16Gi", command)
+        self.assertIn("--cpu=4 ", command)
         self.assertIn("ALLOWED_PROCESSA_HOST=ba.example.com", command)
         self.assertIn("SKIP_SETUP=1", command)
         self.assertNotIn("--set-secrets", command)
         self.assertNotIn("gcloud run deploy", command)
+
+    def test_the_shared_service_stays_at_8gi(self):
+        command = self._last()
+        self.assertIn("--memory=8Gi", command)
+        self.assertIn("--cpu=4 ", command)
 
     def test_several_processa_hosts_are_pinned_with_a_delimiter_that_keeps_their_commas(self):
         command = self._last(job=True, processa_host="staging.example, ba.example,prod.example")
