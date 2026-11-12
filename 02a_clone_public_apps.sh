@@ -35,4 +35,6 @@ clone_app lending https://github.com/frappe/lending version-15
 # lms — cloned here (before the ONE-F-M private apps in later stages)
 # because one_lms directly imports it (`from lms import plugins`); must be
 # installed before one_lms in entrypoint.sh's INSTALL_APPS too.
-clone_app lms https://github.com/frappe/lms develop
+# Pin BEFORE install: lms `develop` tip now needs Python >=3.14, the pinned
+# commit still supports 3.10+ (see clone_app_pinned_first).
+clone_app_pinned_first lms https://github.com/frappe/lms develop
