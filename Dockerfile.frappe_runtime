@@ -117,6 +117,45 @@ RUN --mount=type=secret,id=github_token,mode=0444 \
 
 RUN /03_install_requirements.sh /home/frappe/frappe-bench
 
+# ── WI-004006: browser testing toolchain + built Desk assets ──────────────────
+# Placed AFTER the clone/requirements layers on purpose: editing anything below
+# never invalidates the ~45-minute clone layers above.
+#
+# Playwright is installed globally (outside every app checkout — house rule B7,
+# no app package.json is touched). Pin: bump PLAYWRIGHT_VERSION to upgrade; the
+# Chromium build is fetched by that same CLI, so they cannot drift apart.
+# ENV (not just ARG) so verify_browser_env.sh and every later `docker exec` see them.
+USER root
+ENV PLAYWRIGHT_VERSION=1.49.1 \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
+    NODE_PATH=/usr/lib/node_modules
+# GitHub CLI from GitHub's own apt repo (Ubuntu's packaged gh is far older than 2.103;
+# the actual version is asserted by verify_browser_env.sh below, not assumed).
+RUN mkdir -p -m 755 /etc/apt/keyrings && \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y gh fontconfig fonts-noto-core fonts-noto-ui-core && \
+    npm install -g @playwright/test@${PLAYWRIGHT_VERSION} && \
+    npx playwright install --with-deps chromium && \
+    chmod -R a+rX /opt/pw-browsers && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+USER frappe
+# Desk bundles (AC2). The ARG is declared in the same stage, right above the RUN
+# that uses it, so it is in scope here without any shell state from an earlier layer.
+# helpdesk is deliberately not in the list (its build breaks — see 03_install_requirements.sh).
+# WI-004405 changes one_bpmn -> processa here, and only here.
+ARG DESK_BUILD_APPS=frappe,erpnext,hrms,one_bpmn,one_fm
+RUN cd /home/frappe/frappe-bench && bench build --apps "${DESK_BUILD_APPS}"
+
+COPY --chown=frappe:frappe browser_smoke/ /opt/playwright-smoke/
+USER root
+RUN sed -i 's/\r$//' /opt/playwright-smoke/*.sh && chmod +x /opt/playwright-smoke/*.sh
+USER frappe
+RUN /opt/playwright-smoke/verify_browser_env.sh
+
 WORKDIR /home/frappe/frappe-bench
 
 USER root
