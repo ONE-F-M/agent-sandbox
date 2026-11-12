@@ -299,6 +299,62 @@ production or vice versa. `deploy.py` and `bake_image.sh` both default to
 production always has to be requested explicitly with `--env production` /
 `ENV=production`.
 
+### Trying a beta copy against a staging site
+
+Everything below uses the `-beta` names, so production's service, Job, secrets and image are never touched.
+
+1. **Secrets.** The GitHub token is the same PAT, copied without printing it. The callback secret is a new random value,
+   so beta and production never share a signing key:
+   ```bash
+   gcloud secrets versions access latest --secret=dev-agent-github-token --project=<PROJECT_ID> | gcloud secrets create dev-agent-github-token-beta --data-file=- --project=<PROJECT_ID>
+   printf '%s' "$(openssl rand -hex 32)" | gcloud secrets create dev-agent-callback-secret-beta --data-file=- --project=<PROJECT_ID>
+   ```
+2. **Let Cloud Run read them** (step 4, with the `-beta` secret names).
+3. **Bake and deploy.** Pin the hosts to the staging Processa only:
+   ```bash
+   ENV=beta ./bake_image.sh
+   python3 deploy.py --env beta --project <PROJECT_ID> --use-baked --callback-host <staging-host>
+   python3 deploy.py --env beta --project <PROJECT_ID> --use-baked --job --processa-host <staging-host>
+   ```
+   Leave `--callback-host` off while you test through ngrok (see "Callback host pin").
+4. **Grant the caller account** `roles/run.invoker` on `dev-agent-sandbox-beta` and `roles/run.developer` on
+   `dev-agent-sandbox-job-beta` (the same two roles production's service and Job grant it).
+5. **Point the staging site at it**, never production's. Set the beta Sandbox URL and the beta callback secret
+   (`gcloud secrets versions access latest --secret=dev-agent-callback-secret-beta --project=<PROJECT_ID>`) in Processa
+   Settings. Only the callback secret has to match in Processa: the GitHub token lives only in Secret Manager, and the Job
+   holds no secret at all.
+
+The beta service keeps one warm instance (`--min-instances=1`), a small standing cost. Delete it when the test is over:
+`gcloud run services delete dev-agent-sandbox-beta --region=us-central1 --project=<PROJECT_ID>`.
+
+## Browser testing in the image
+
+The image carries what a Testing Agent needs to serve the Desk to a browser, record video and upload it.
+The layers sit after the clone and requirements layers, so changing them never re-clones the apps.
+
+| What | Detail |
+|---|---|
+| Playwright | `@playwright/test`, exact version `PLAYWRIGHT_VERSION` in `Dockerfile.frappe_runtime`, installed globally and outside every app checkout, so no app's `package.json` is touched |
+| Chromium | installed by that same Playwright CLI into `/opt/pw-browsers`, readable by `frappe`. Launch it with `--no-sandbox --disable-dev-shm-usage` |
+| GitHub CLI | from GitHub's apt repo. The build fails if `gh` is older than 2.103 |
+| Fonts | `fonts-noto-core` and `fonts-noto-ui-core` (Noto Naskh, Kufi and Sans Arabic) |
+| Desk assets | `bench build --apps "${DESK_BUILD_APPS}"`, set by the `DESK_BUILD_APPS` build ARG. Helpdesk is deliberately not built (its build breaks, see `03_install_requirements.sh`) |
+
+`DESK_BUILD_APPS` is `frappe,erpnext,hrms,one_bpmn,one_fm`. When the app is renamed (WI-004405), change `one_bpmn` to
+`processa` there, and only there. To upgrade Playwright, change `PLAYWRIGHT_VERSION`; the Chromium build comes from the
+same CLI, so the two cannot drift apart.
+
+**Checks.** `browser_smoke/verify_browser_env.sh` runs during the build and fails it if `gh`, the pinned Playwright, the
+Noto Arabic font families (via `fc-list`) or a Chromium launch is wrong. A full bake then runs `browser_smoke/run_smoke.sh`
+(stage 3b): it serves the `sandbox` site with `bench serve`, opens `/login`, checks the login form is visible, and records a
+WebM to `/home/frappe/pw-output/video`. Traces are never recorded. To re-run the build checks on a baked image:
+```bash
+docker run --rm --platform linux/amd64 --entrypoint bash -u frappe dev-agent-sandbox:baked-beta -c "npx playwright --version && gh --version && /opt/playwright-smoke/verify_browser_env.sh"
+```
+
+All of this needs a **full bake**. The code-only rebake copies only `dev_agent_server.py`, `session_agent.py` and
+`entrypoint.sh`, so it neither rebuilds assets nor changes the browser tools.
+
 ## Shipping a change (rebake, test, go live, roll back)
 
 Which rebake a change needs:
@@ -544,6 +600,10 @@ With it ticked, a Job that cannot start or does not answer makes the call fail (
   `node --test` in `spiff/` on: a changed `*.test.mjs`, the `.test.mjs` beside a changed source file, and any test that names
   the changed file's path. These tests read source text, so they need no installed packages. Only those files run, because the
   whole directory has a test that fails on its own, and a change no test covers still reports "no tests ran".
+- **`lms` is installed at its pinned commit, not the branch tip.** `clone_app` normally installs the branch tip and pins
+  afterwards. `frappe/lms` `develop` now requires Python 3.14 and this image is 3.11, so that order aborted the clone stage.
+  `clone_app_pinned_first` (in `lib_clone_functions.sh`) clones, pins, then installs. If another app's tip stops installing the
+  same way, use it for that app too.
 - **No coverage/lint step.** The coding loop's only signal is
   pass/fail from the target app's existing test suite — it doesn't run a
   linter or report coverage.
