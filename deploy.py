@@ -80,7 +80,7 @@ CLOUD_RUN_MAX_INST = "3"
 # right after the 202 and reclaims it mid-job: confirmed against real Cloud
 # Run logs for run DAS-91629 (dispatched 2026-08-25T15:24:35Z, instance
 # session closed 2026-08-25T15:39:42Z — ~15 minutes in, well before a
-# migrate+run-tests pass on a large app like one_bpmn could finish), after
+# migrate+run-tests pass on a large app like processa could finish), after
 # which every later /status check 404'd against a fresh cold instance that
 # had never heard of the correlation_id. min-instances=1 keeps an instance
 # permanently warm so the background thread is never killed out from under
