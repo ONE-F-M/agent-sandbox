@@ -24,7 +24,7 @@ import dev_agent_server as srv
 def _valid_payload(**overrides):
     payload = {
         "correlation_id": "corr-1",
-        "target_app": "one_bpmn",
+        "target_app": "processa",
         "git_branch": "staging",
         "work_item_description": "Fix the thing.",
         "agent_config": {"system_prompt": "You are helpful.", "model": "claude-haiku-4-5", "api_key": "sk-test"},
@@ -32,7 +32,7 @@ def _valid_payload(**overrides):
             {"name": "read_file", "description": "Read a file.", "input_schema": {"type": "object", "properties": {}}},
         ],
         "github_token": "gh-test-token",
-        "callback_url": "https://processa.example.com/api/method/one_bpmn.api.agent_callback.report_result",
+        "callback_url": "https://processa.example.com/api/method/processa.api.agent_callback.report_result",
     }
     payload.update(overrides)
     return payload
@@ -188,7 +188,7 @@ class TestEditFile(unittest.TestCase):
 
 class TestListFiles(unittest.TestCase):
     """Confirmed live (2026-09-06): a 500-file cap silently truncated a real
-    listing (one_bpmn alone has 738 files), and the model never acted on the
+    listing (processa alone has 738 files), and the model never acted on the
     truncated flag it was given — it just kept guessing narrower
     path_prefix values for a file that (separately) turned out not to
     exist, and burned its whole turn budget without ever finishing. The cap
@@ -224,7 +224,7 @@ class TestListFiles(unittest.TestCase):
         self.assertEqual(len(result["files"]), 10)
 
     def test_default_cap_covers_a_realistic_target_app(self):
-        """The real one_bpmn app alone has 738 files under its own tree
+        """The real processa app alone has 738 files under its own tree
         (confirmed live) — the default cap must clear that with headroom,
         not just the boundary this test asserts."""
         self.assertGreater(srv._LIST_FILES_MAX, 738)
@@ -305,20 +305,20 @@ class TestDispatchToolRouting(unittest.TestCase):
         shutil.rmtree(self.app_dir, ignore_errors=True)
 
     def test_unknown_tool_name_returns_a_structured_error_not_a_crash(self):
-        result = srv._dispatch_tool(self.app_dir, "one_bpmn", "not_a_real_tool", {}, self.run_ctx)
+        result = srv._dispatch_tool(self.app_dir, "processa", "not_a_real_tool", {}, self.run_ctx)
         self.assertIn("error", result)
         self.assertIn("not_a_real_tool", result["error"])
 
     def test_open_pull_request_routes_to_the_new_handler(self):
         with patch.object(srv, "_tool_open_pull_request", return_value={"pr_url": "https://x"}) as mock_fn:
-            result = srv._dispatch_tool(self.app_dir, "one_bpmn", "open_pull_request", {"summary": "did stuff"}, self.run_ctx)
-        mock_fn.assert_called_once_with("one_bpmn", {"summary": "did stuff"}, self.run_ctx)
+            result = srv._dispatch_tool(self.app_dir, "processa", "open_pull_request", {"summary": "did stuff"}, self.run_ctx)
+        mock_fn.assert_called_once_with("processa", {"summary": "did stuff"}, self.run_ctx)
         self.assertEqual(result, {"pr_url": "https://x"})
 
     def test_edit_file_routes_to_the_new_handler(self):
         with patch.object(srv, "_tool_edit_file", return_value={"edited": True}) as mock_fn:
             args = {"path": "a.py", "old_string": "x", "new_string": "y"}
-            result = srv._dispatch_tool(self.app_dir, "one_bpmn", "edit_file", args, self.run_ctx)
+            result = srv._dispatch_tool(self.app_dir, "processa", "edit_file", args, self.run_ctx)
         mock_fn.assert_called_once_with(self.app_dir, args)
         self.assertEqual(result, {"edited": True})
 
@@ -334,7 +334,7 @@ class TestOpenPullRequestTool(unittest.TestCase):
         with patch.object(srv, "_collect_changed_files", return_value={}), patch.object(
             srv, "_tests_for_tree"
         ) as mock_run_tests, patch.object(srv, "_open_pr") as mock_open_pr:
-            result = srv._tool_open_pull_request("one_bpmn", {"summary": "nothing"}, self.run_ctx)
+            result = srv._tool_open_pull_request("processa", {"summary": "nothing"}, self.run_ctx)
         self.assertIn("error", result)
         mock_run_tests.assert_not_called()
         mock_open_pr.assert_not_called()
@@ -345,13 +345,13 @@ class TestOpenPullRequestTool(unittest.TestCase):
         ) as mock_run_tests, patch.object(
             srv, "_open_pr", return_value=("https://github.com/x/y/pull/1", None)
         ) as mock_open_pr:
-            result = srv._tool_open_pull_request("one_bpmn", {"summary": "did stuff"}, self.run_ctx)
-        mock_run_tests.assert_called_once_with("one_bpmn", "staging")
+            result = srv._tool_open_pull_request("processa", {"summary": "did stuff"}, self.run_ctx)
+        mock_run_tests.assert_called_once_with("processa", "staging")
         self.assertEqual(
             result, {"pr_url": "https://github.com/x/y/pull/1", "tests_passed": True, "failing_tests": []}
         )
         args, kwargs = mock_open_pr.call_args
-        self.assertEqual(args[0], "one_bpmn")
+        self.assertEqual(args[0], "processa")
         self.assertEqual(args[1], "staging")
         self.assertIs(kwargs["tests_passed"], True)
         self.assertEqual(kwargs["stderr_tail"], "err")
@@ -360,7 +360,7 @@ class TestOpenPullRequestTool(unittest.TestCase):
         with patch.object(srv, "_collect_changed_files", return_value={"a.py": "content"}), patch.object(
             srv, "_tests_for_tree", return_value=(False, "out", "boom", ["test_thing (module.TestCase)"])
         ), patch.object(srv, "_open_pr", return_value=(None, "GitHub API error (500)")):
-            result = srv._tool_open_pull_request("one_bpmn", {"summary": "did stuff"}, self.run_ctx)
+            result = srv._tool_open_pull_request("processa", {"summary": "did stuff"}, self.run_ctx)
         self.assertEqual(
             result,
             {
@@ -374,18 +374,18 @@ class TestTheCommitIsReported(unittest.TestCase):
     def test_the_head_commit_comes_from_git_in_the_app_directory(self):
         done = srv.subprocess.CompletedProcess("c", 0, "abc123\n", "")
         with patch.object(srv, "_run", return_value=done) as run:
-            self.assertEqual(srv._head_commit("one_bpmn"), "abc123")
+            self.assertEqual(srv._head_commit("processa"), "abc123")
         self.assertIn("git rev-parse HEAD", run.call_args.args[0])
-        self.assertIn("apps/one_bpmn", run.call_args.args[0])
+        self.assertIn("apps/processa", run.call_args.args[0])
 
 
 class TestScopedTests(unittest.TestCase):
     def setUp(self):
         self.app_dir = os.path.realpath(tempfile.mkdtemp())
         for rel in (
-            "one_bpmn/api/agent_callback.py", "one_bpmn/tests/test_agent_callback.py",
-            "one_bpmn/one_bpmn/doctype/x/x.py", "one_bpmn/one_bpmn/doctype/x/x.json",
-            "one_bpmn/one_bpmn/doctype/x/test_x.py", "one_bpmn/utils.py",
+            "processa/api/agent_callback.py", "processa/tests/test_agent_callback.py",
+            "processa/processa/doctype/x/x.py", "processa/processa/doctype/x/x.json",
+            "processa/processa/doctype/x/test_x.py", "processa/utils.py",
         ):
             path = os.path.join(self.app_dir, rel)
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -395,26 +395,26 @@ class TestScopedTests(unittest.TestCase):
         shutil.rmtree(self.app_dir, ignore_errors=True)
 
     def test_a_changed_source_file_maps_to_the_test_file_of_its_name(self):
-        modules = srv._test_modules_for(self.app_dir, ["one_bpmn/api/agent_callback.py"])
-        self.assertEqual(modules, ["one_bpmn.tests.test_agent_callback"])
+        modules = srv._test_modules_for(self.app_dir, ["processa/api/agent_callback.py"])
+        self.assertEqual(modules, ["processa.tests.test_agent_callback"])
 
     def test_a_changed_test_file_is_its_own_target(self):
-        modules = srv._test_modules_for(self.app_dir, ["one_bpmn/tests/test_agent_callback.py"])
-        self.assertEqual(modules, ["one_bpmn.tests.test_agent_callback"])
+        modules = srv._test_modules_for(self.app_dir, ["processa/tests/test_agent_callback.py"])
+        self.assertEqual(modules, ["processa.tests.test_agent_callback"])
 
     def test_a_doctype_json_and_controller_map_to_one_test_module(self):
-        paths = ["one_bpmn/one_bpmn/doctype/x/x.json", "one_bpmn/one_bpmn/doctype/x/x.py"]
-        self.assertEqual(srv._test_modules_for(self.app_dir, paths), ["one_bpmn.one_bpmn.doctype.x.test_x"])
+        paths = ["processa/processa/doctype/x/x.json", "processa/processa/doctype/x/x.py"]
+        self.assertEqual(srv._test_modules_for(self.app_dir, paths), ["processa.processa.doctype.x.test_x"])
 
     def test_a_file_with_no_test_and_other_file_types_map_to_nothing(self):
-        paths = ["one_bpmn/utils.py", "README.md", "one_bpmn/public/a.js"]
+        paths = ["processa/utils.py", "README.md", "processa/public/a.js"]
         self.assertEqual(srv._test_modules_for(self.app_dir, paths), [])
 
     def test_no_matching_test_runs_nothing_and_says_so(self):
-        with patch.object(srv, "_changed_paths", return_value=["one_bpmn/utils.py"]), patch.object(
+        with patch.object(srv, "_changed_paths", return_value=["processa/utils.py"]), patch.object(
             srv, "_test_modules_for", return_value=[]
         ), patch.object(srv, "_run") as run:
-            passed, stdout, _stderr, failing = srv._run_tests("one_bpmn", "staging")
+            passed, stdout, _stderr, failing = srv._run_tests("processa", "staging")
         run.assert_not_called()
         self.assertTrue(passed)
         self.assertIn("no tests ran", stdout)
@@ -426,18 +426,18 @@ class TestScopedTests(unittest.TestCase):
         with patch.object(srv, "_changed_paths", return_value=["a"]), patch.object(
             srv, "_test_modules_for", return_value=["m.a", "m.b"]
         ), patch.object(srv, "_run", side_effect=[ok, bad]) as run:
-            passed, _out, _err, failing = srv._run_tests("one_bpmn", "staging")
+            passed, _out, _err, failing = srv._run_tests("processa", "staging")
         self.assertEqual(run.call_count, 2)
         self.assertIn("--module m.a", run.call_args_list[0].args[0])
         self.assertFalse(passed)
         self.assertEqual(failing, ["test_b (m.B)"])
 
     def test_the_site_is_migrated_only_for_schema_paths(self):
-        self.assertTrue(srv._needs_migrate(["one_bpmn/one_bpmn/doctype/x/x.json"]))
-        self.assertTrue(srv._needs_migrate(["one_bpmn/patches/v1/p.py"]))
-        self.assertTrue(srv._needs_migrate(["one_bpmn/patches.txt"]))
-        self.assertTrue(srv._needs_migrate(["one_bpmn/fixtures/x.json"]))
-        self.assertFalse(srv._needs_migrate(["one_bpmn/api/x.py", "one_bpmn/public/a.js"]))
+        self.assertTrue(srv._needs_migrate(["processa/processa/doctype/x/x.json"]))
+        self.assertTrue(srv._needs_migrate(["processa/patches/v1/p.py"]))
+        self.assertTrue(srv._needs_migrate(["processa/patches.txt"]))
+        self.assertTrue(srv._needs_migrate(["processa/fixtures/x.json"]))
+        self.assertFalse(srv._needs_migrate(["processa/api/x.py", "processa/public/a.js"]))
         self.assertFalse(srv._needs_migrate([]))
 
 
@@ -449,8 +449,8 @@ class TestTestsRunOncePerTree(unittest.TestCase):
         with patch.object(srv, "_tree_fingerprint", return_value="sha:1"), patch.object(
             srv, "_run_tests", return_value=(True, "o", "e", [])
         ) as run:
-            first = srv._tests_for_tree("one_bpmn", "staging")
-            second = srv._tests_for_tree("one_bpmn", "staging")
+            first = srv._tests_for_tree("processa", "staging")
+            second = srv._tests_for_tree("processa", "staging")
         run.assert_called_once()
         self.assertEqual(first, second)
 
@@ -458,16 +458,16 @@ class TestTestsRunOncePerTree(unittest.TestCase):
         with patch.object(srv, "_tree_fingerprint", side_effect=["sha:1", "sha:2"]), patch.object(
             srv, "_run_tests", return_value=(True, "o", "e", [])
         ) as run:
-            srv._tests_for_tree("one_bpmn", "staging")
-            srv._tests_for_tree("one_bpmn", "staging")
+            srv._tests_for_tree("processa", "staging")
+            srv._tests_for_tree("processa", "staging")
         self.assertEqual(run.call_count, 2)
 
     def test_a_failing_result_is_reused_too(self):
         with patch.object(srv, "_tree_fingerprint", return_value="sha:1"), patch.object(
             srv, "_run_tests", return_value=(False, "o", "e", ["t"])
         ) as run:
-            srv._tests_for_tree("one_bpmn", "staging")
-            again = srv._tests_for_tree("one_bpmn", "staging")
+            srv._tests_for_tree("processa", "staging")
+            again = srv._tests_for_tree("processa", "staging")
         run.assert_called_once()
         self.assertFalse(again[0])
 
@@ -583,7 +583,7 @@ class TestCompositeTools(unittest.TestCase):
 class TestCompositeActionsOverHttp(unittest.TestCase):
     def setUp(self):
         self.bench_dir = os.path.realpath(tempfile.mkdtemp())
-        self.app_dir = os.path.join(self.bench_dir, "apps", "one_bpmn")
+        self.app_dir = os.path.join(self.bench_dir, "apps", "processa")
         os.makedirs(self.app_dir)
         self.addCleanup(shutil.rmtree, self.bench_dir, ignore_errors=True)
         patcher = patch.object(srv, "BENCH_DIR", self.bench_dir)
@@ -592,7 +592,7 @@ class TestCompositeActionsOverHttp(unittest.TestCase):
 
     def _payload(self, action, args):
         return {
-            "action": action, "target_app": "one_bpmn", "git_branch": "staging",
+            "action": action, "target_app": "processa", "git_branch": "staging",
             "work_item_description": "Fix the thing.", "args": args, "github_token": "gh-token",
         }
 
@@ -632,7 +632,7 @@ class TestDeletedFilesReachThePr(unittest.TestCase):
     def _repo_with_deleted_file(self):
         bench = os.path.realpath(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, bench, True)
-        app_dir = os.path.join(bench, "apps", "one_bpmn")
+        app_dir = os.path.join(bench, "apps", "processa")
         os.makedirs(app_dir)
 
         def run(cmd):
@@ -651,7 +651,7 @@ class TestDeletedFilesReachThePr(unittest.TestCase):
     def test_a_committed_deletion_is_a_changed_file(self):
         bench = self._repo_with_deleted_file()
         with patch.object(srv, "BENCH_DIR", bench):
-            self.assertEqual(srv._collect_changed_files("one_bpmn", "staging"), {"old.vue": None})
+            self.assertEqual(srv._collect_changed_files("processa", "staging"), {"old.vue": None})
 
     def test_a_delete_only_change_opens_a_pr(self):
         bench = self._repo_with_deleted_file()
@@ -659,7 +659,7 @@ class TestDeletedFilesReachThePr(unittest.TestCase):
         with patch.object(srv, "BENCH_DIR", bench), patch.object(
             srv, "_run_tests", return_value=(True, "", "", [])
         ), patch.object(srv, "_open_pr", return_value=("https://github.com/x/y/pull/2", None)) as mock_open_pr:
-            result = srv._tool_open_pull_request("one_bpmn", {"summary": "removed"}, run_ctx)
+            result = srv._tool_open_pull_request("processa", {"summary": "removed"}, run_ctx)
         self.assertEqual(result["pr_url"], "https://github.com/x/y/pull/2")
         self.assertEqual(mock_open_pr.call_args[0][3], {"old.vue": None})
 
@@ -679,7 +679,7 @@ class TestDeletedFilesReachThePr(unittest.TestCase):
         with patch.object(srv, "_repo_for_local_clone", return_value="x/y"), patch.object(
             srv, "_github_request", side_effect=fake_github
         ), patch.object(srv, "_pending_paths", return_value={"old.vue"}):
-            pr_url, err = srv._open_pr("one_bpmn", "staging", "Remove old.vue.", {"old.vue": None}, "t", "c", "removed")
+            pr_url, err = srv._open_pr("processa", "staging", "Remove old.vue.", {"old.vue": None}, "t", "c", "removed")
         self.assertEqual((pr_url, err), ("https://github.com/x/y/pull/3", None))
         deletes = [c for c in calls if c[0] == "DELETE"]
         self.assertEqual(len(deletes), 1)
@@ -705,7 +705,7 @@ class TestAPushedChangeIsNotCommittedAgain(unittest.TestCase):
         with patch.object(srv, "_repo_for_local_clone", return_value="x/y"), patch.object(
             srv, "_github_request", side_effect=fake
         ), patch.object(srv, "_pending_paths", return_value=pending):
-            result = srv._open_pr("one_bpmn", "staging", "Fix.", files, "t", "c", "done", work_item_id="WI-1")
+            result = srv._open_pr("processa", "staging", "Fix.", files, "t", "c", "done", work_item_id="WI-1")
         return result, calls
 
     def test_a_fully_pushed_change_makes_no_branch_or_file_calls(self):
@@ -725,12 +725,12 @@ class TestAPushedChangeIsNotCommittedAgain(unittest.TestCase):
         modified = srv.subprocess.CompletedProcess("c", 0, "a.py\nold.vue\n", "")
         new = srv.subprocess.CompletedProcess("c", 0, "n.py\n", "")
         with patch.object(srv, "_run", side_effect=[modified, new]):
-            self.assertEqual(srv._pending_paths("one_bpmn"), {"a.py", "old.vue", "n.py"})
+            self.assertEqual(srv._pending_paths("processa"), {"a.py", "old.vue", "n.py"})
 
     def test_a_git_failure_means_nothing_is_taken_as_pending(self):
         failed = srv.subprocess.CompletedProcess("c", 128, "", "not a repo")
         with patch.object(srv, "_run", return_value=failed):
-            self.assertEqual(srv._pending_paths("one_bpmn"), set())
+            self.assertEqual(srv._pending_paths("processa"), set())
 
 
 class TestARepeatedRunIsNotStartedTwice(unittest.TestCase):
@@ -755,7 +755,7 @@ class TestARepeatedRunIsNotStartedTwice(unittest.TestCase):
 
     def test_a_second_dispatch_with_the_same_id_is_accepted_without_a_second_run(self):
         payload = {
-            "correlation_id": "corr-dup", "action": "run_tests", "target_app": "one_bpmn", "git_branch": "staging",
+            "correlation_id": "corr-dup", "action": "run_tests", "target_app": "processa", "git_branch": "staging",
             "work_item_description": "d", "github_token": "t", "callback_url": "https://processa.example/cb",
         }
         started = []
@@ -795,16 +795,16 @@ class TestLastOpenPrResult(unittest.TestCase):
 
 class TestHeadBranchFor(unittest.TestCase):
     def test_deterministic_across_calls(self):
-        a = srv._head_branch_for("one_bpmn", "staging", "Fix the thing.")
-        b = srv._head_branch_for("one_bpmn", "staging", "Fix the thing.")
+        a = srv._head_branch_for("processa", "staging", "Fix the thing.")
+        b = srv._head_branch_for("processa", "staging", "Fix the thing.")
         self.assertEqual(a, b)
         self.assertTrue(a.startswith("dev-agent/"))
 
     def test_differs_when_any_input_differs(self):
-        base = srv._head_branch_for("one_bpmn", "staging", "Fix the thing.")
+        base = srv._head_branch_for("processa", "staging", "Fix the thing.")
         self.assertNotEqual(base, srv._head_branch_for("one_fm", "staging", "Fix the thing."))
-        self.assertNotEqual(base, srv._head_branch_for("one_bpmn", "main", "Fix the thing."))
-        self.assertNotEqual(base, srv._head_branch_for("one_bpmn", "staging", "Fix another thing."))
+        self.assertNotEqual(base, srv._head_branch_for("processa", "main", "Fix the thing."))
+        self.assertNotEqual(base, srv._head_branch_for("processa", "staging", "Fix another thing."))
 
 
 class _FakeCompletedProcess:
@@ -829,7 +829,7 @@ class TestCheckoutOrCreateHeadBranch(unittest.TestCase):
             return _FakeCompletedProcess(0)
 
         with patch.object(srv, "_run", side_effect=fake_run):
-            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "dev-agent/abc")
+            ok, err = srv._checkout_or_create_head_branch("processa", "staging", "dev-agent/abc")
         self.assertTrue(ok)
         self.assertIsNone(err)
         # Never fell through to creating/pushing a new branch off the base.
@@ -847,7 +847,7 @@ class TestCheckoutOrCreateHeadBranch(unittest.TestCase):
             return _FakeCompletedProcess(0)
 
         with patch.object(srv, "_run", side_effect=fake_run):
-            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "dev-agent/abc")
+            ok, err = srv._checkout_or_create_head_branch("processa", "staging", "dev-agent/abc")
         self.assertTrue(ok)
         self.assertIsNone(err)
         self.assertTrue(any("git checkout -f -B dev-agent/abc" in c for c in calls))
@@ -864,7 +864,7 @@ class TestCheckoutOrCreateHeadBranch(unittest.TestCase):
             return _FakeCompletedProcess(0)
 
         with patch.object(srv, "_run", side_effect=fake_run):
-            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "dev-agent/abc")
+            ok, err = srv._checkout_or_create_head_branch("processa", "staging", "dev-agent/abc")
         self.assertFalse(ok)
         self.assertIn("network error", err)
 
@@ -884,7 +884,7 @@ class TestCheckoutOrCreateHeadBranch(unittest.TestCase):
                 return _FakeCompletedProcess(0)
 
             with patch.object(srv, "_run", side_effect=fake_run):
-                ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "dev-agent/abc")
+                ok, err = srv._checkout_or_create_head_branch("processa", "staging", "dev-agent/abc")
         self.assertFalse(ok)
         self.assertNotIn("super-secret-token", err)
         self.assertIn("***", err)
@@ -894,7 +894,7 @@ class TestValidateToolCallPayload(unittest.TestCase):
     def _payload(self, **overrides):
         payload = {
             "action": "read_file",
-            "target_app": "one_bpmn",
+            "target_app": "processa",
             "git_branch": "staging",
             "work_item_description": "Fix the thing.",
             "github_token": "gh-token",
@@ -926,11 +926,11 @@ class TestValidatePayloadActionBranch(unittest.TestCase):
         payload = {
             "correlation_id": "corr-1",
             "action": "run_tests",
-            "target_app": "one_bpmn",
+            "target_app": "processa",
             "git_branch": "staging",
             "work_item_description": "Fix the thing.",
             "github_token": "gh-token",
-            "callback_url": "https://processa.example.com/api/method/one_bpmn.api.agent_callback.report_result",
+            "callback_url": "https://processa.example.com/api/method/processa.api.agent_callback.report_result",
         }
         payload.update(overrides)
         return payload
@@ -977,10 +977,10 @@ class TestTimings(unittest.TestCase):
 class TestHandleToolCall(unittest.TestCase):
     def setUp(self):
         # A fresh BENCH_DIR per test (not a shared /tmp root) with a real
-        # apps/one_bpmn directory — no symlink needed, and no risk of one
+        # apps/processa directory — no symlink needed, and no risk of one
         # test's directory colliding with another's.
         self.bench_dir = os.path.realpath(tempfile.mkdtemp())
-        self.app_dir = os.path.join(self.bench_dir, "apps", "one_bpmn")
+        self.app_dir = os.path.join(self.bench_dir, "apps", "processa")
         os.makedirs(self.app_dir)
         self.bench_dir_patch = patch.object(srv, "BENCH_DIR", self.bench_dir)
         self.bench_dir_patch.start()
@@ -991,7 +991,7 @@ class TestHandleToolCall(unittest.TestCase):
 
     def _payload(self, action, args):
         return {
-            "action": action, "target_app": "one_bpmn", "git_branch": "staging",
+            "action": action, "target_app": "processa", "git_branch": "staging",
             "work_item_description": "Fix the thing.", "args": args, "github_token": "gh-token",
         }
 
@@ -1032,35 +1032,35 @@ class TestHandleToolCall(unittest.TestCase):
         self.assertEqual(sorted(timings.ms), ["git", "tool"])
 
     def test_a_bench_path_from_search_frontend_reads_the_app_file(self):
-        os.makedirs(os.path.join(self.app_dir, "spiff", "src"))
-        with open(os.path.join(self.app_dir, "spiff", "src", "a.vue"), "w") as fh:
+        os.makedirs(os.path.join(self.app_dir, "frontend", "src"))
+        with open(os.path.join(self.app_dir, "frontend", "src", "a.vue"), "w") as fh:
             fh.write("hello")
         with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)):
-            result = srv._handle_tool_call(self._payload("read_file", {"path": "one_bpmn/spiff/src/a.vue"}))
+            result = srv._handle_tool_call(self._payload("read_file", {"path": "processa/frontend/src/a.vue"}))
         self.assertTrue(result["found"])
         self.assertIn("hello", result["content"])
 
     def test_a_path_inside_the_apps_own_package_is_left_alone(self):
-        os.makedirs(os.path.join(self.app_dir, "one_bpmn", "api"))
+        os.makedirs(os.path.join(self.app_dir, "processa", "api"))
         os.makedirs(os.path.join(self.app_dir, "api"))
-        with open(os.path.join(self.app_dir, "one_bpmn", "api", "x.py"), "w") as fh:
+        with open(os.path.join(self.app_dir, "processa", "api", "x.py"), "w") as fh:
             fh.write("package")
         with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)):
-            result = srv._handle_tool_call(self._payload("read_file", {"path": "one_bpmn/api/x.py"}))
+            result = srv._handle_tool_call(self._payload("read_file", {"path": "processa/api/x.py"}))
         self.assertIn("package", result["content"])
 
     def test_bench_paths_reach_delete_and_list_with_the_app_path(self):
-        os.makedirs(os.path.join(self.app_dir, "spiff", "src"))
-        with open(os.path.join(self.app_dir, "spiff", "src", "old.vue"), "w") as fh:
+        os.makedirs(os.path.join(self.app_dir, "frontend", "src"))
+        with open(os.path.join(self.app_dir, "frontend", "src", "old.vue"), "w") as fh:
             fh.write("x")
         with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
             srv, "_commit_and_push", return_value=(True, None)
         ) as mock_commit:
-            listed = srv._handle_tool_call(self._payload("list_files", {"path_prefix": "one_bpmn/spiff"}))
-            deleted = srv._handle_tool_call(self._payload("delete_file", {"path": "one_bpmn/spiff/src/old.vue"}))
-        self.assertEqual(listed["files"], ["spiff/src/old.vue"])
-        self.assertEqual(deleted, {"deleted": True, "path": "spiff/src/old.vue"})
-        self.assertEqual(mock_commit.call_args[0][2], "spiff/src/old.vue")
+            listed = srv._handle_tool_call(self._payload("list_files", {"path_prefix": "processa/frontend"}))
+            deleted = srv._handle_tool_call(self._payload("delete_file", {"path": "processa/frontend/src/old.vue"}))
+        self.assertEqual(listed["files"], ["frontend/src/old.vue"])
+        self.assertEqual(deleted, {"deleted": True, "path": "frontend/src/old.vue"})
+        self.assertEqual(mock_commit.call_args[0][2], "frontend/src/old.vue")
 
     def test_write_file_surfaces_a_commit_error_without_failing_the_write(self):
         with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
@@ -1089,13 +1089,13 @@ class TestHandleToolCall(unittest.TestCase):
         self.assertIn("delete_file via", mock_commit.call_args.args[3])
 
     def test_delete_file_refuses_a_directory_a_missing_file_and_a_path_out_of_the_app(self):
-        os.makedirs(os.path.join(self.app_dir, "spiff"))
+        os.makedirs(os.path.join(self.app_dir, "frontend"))
         with patch.object(srv, "_checkout_or_create_head_branch", return_value=(True, None)), patch.object(
             srv, "_commit_and_push", return_value=(True, None)
         ) as mock_commit:
-            for path in ("spiff", "missing.vue", "../outside.txt"):
+            for path in ("frontend", "missing.vue", "../outside.txt"):
                 self.assertIn("error", srv._handle_tool_call(self._payload("delete_file", {"path": path})))
-        self.assertTrue(os.path.isdir(os.path.join(self.app_dir, "spiff")))
+        self.assertTrue(os.path.isdir(os.path.join(self.app_dir, "frontend")))
         mock_commit.assert_not_called()
 
     def test_git_add_on_a_deleted_path_stages_the_deletion(self):
@@ -1122,32 +1122,32 @@ if __name__ == "__main__":
 
 class TestHeadBranchForWorkItemId(unittest.TestCase):
     def test_work_item_id_becomes_the_branch(self):
-        self.assertEqual(srv._head_branch_for("one_bpmn", "staging", "Fix the thing.", "WI-002322"), "WI-002322")
+        self.assertEqual(srv._head_branch_for("processa", "staging", "Fix the thing.", "WI-002322"), "WI-002322")
 
     def test_same_work_item_converges_regardless_of_description(self):
-        a = srv._head_branch_for("one_bpmn", "staging", "Fix the thing.", "WI-002322")
-        b = srv._head_branch_for("one_bpmn", "staging", "Fix the thing, reworded.", "WI-002322")
+        a = srv._head_branch_for("processa", "staging", "Fix the thing.", "WI-002322")
+        b = srv._head_branch_for("processa", "staging", "Fix the thing, reworded.", "WI-002322")
         self.assertEqual(a, b)
 
     def test_unsafe_characters_are_sanitised_not_rejected(self):
         self.assertEqual(srv._head_branch_for("a", "b", "c", " WI 002322 (rev 2)~ "), "WI-002322-rev-2")
 
     def test_blank_or_unusable_id_falls_back_to_the_hash(self):
-        hashed = srv._head_branch_for("one_bpmn", "staging", "Fix the thing.")
+        hashed = srv._head_branch_for("processa", "staging", "Fix the thing.")
         for unusable in ("", None, "~~~", " / "):
-            self.assertEqual(srv._head_branch_for("one_bpmn", "staging", "Fix the thing.", unusable), hashed)
+            self.assertEqual(srv._head_branch_for("processa", "staging", "Fix the thing.", unusable), hashed)
 
 
 class TestWorkItemIdThreading(unittest.TestCase):
     def test_tool_call_uses_the_work_item_id_for_its_branch(self):
         payload = {
-            "action": "list_files", "target_app": "one_bpmn", "git_branch": "staging",
+            "action": "list_files", "target_app": "processa", "git_branch": "staging",
             "work_item_description": "Fix the thing.", "work_item_id": "WI-002322",
             "args": {}, "github_token": "gh-token",
         }
         with patch.object(srv, "_checkout_or_create_head_branch", return_value=(False, "stop here")) as checkout:
             srv._handle_tool_call(payload)
-        checkout.assert_called_once_with("one_bpmn", "staging", "WI-002322")
+        checkout.assert_called_once_with("processa", "staging", "WI-002322")
 
     def test_open_pull_request_passes_the_work_item_id_to_open_pr(self):
         run_ctx = {
@@ -1157,7 +1157,7 @@ class TestWorkItemIdThreading(unittest.TestCase):
         with patch.object(srv, "_collect_changed_files", return_value={"a.py": "x"}), patch.object(
             srv, "_run_tests", return_value=(True, "", "", [])
         ), patch.object(srv, "_open_pr", return_value=("https://github.com/x/y/pull/1", None)) as open_pr:
-            srv._tool_open_pull_request("one_bpmn", {"summary": "did it"}, run_ctx)
+            srv._tool_open_pull_request("processa", {"summary": "did it"}, run_ctx)
         self.assertEqual(open_pr.call_args.kwargs["work_item_id"], "WI-002322")
 
     def test_open_pr_puts_the_work_item_id_on_branch_title_and_body(self):
@@ -1175,7 +1175,7 @@ class TestWorkItemIdThreading(unittest.TestCase):
             srv, "_github_request", side_effect=fake_request
         ), patch.object(srv, "_pending_paths", return_value={"a.py"}):
             pr_url, err = srv._open_pr(
-                "one_bpmn", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "changed a.py",
+                "processa", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "changed a.py",
                 work_item_id="WI-002322",
             )
         self.assertIsNone(err)
@@ -1202,9 +1202,9 @@ class TestWorkItemIdThreading(unittest.TestCase):
         with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/one_bpmn"), patch.object(
             srv, "_github_request", side_effect=fake_request
         ):
-            srv._open_pr("one_bpmn", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "r")
+            srv._open_pr("processa", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "r")
         pr = next(b for m, u, b in sent if m == "POST" and u.endswith("/pulls"))
-        self.assertEqual(pr["head"], srv._head_branch_for("one_bpmn", "staging", "Fix the thing."))
+        self.assertEqual(pr["head"], srv._head_branch_for("processa", "staging", "Fix the thing."))
         self.assertTrue(pr["title"].startswith("Dev Agent: "))
         self.assertNotIn("Work Item:", pr["body"])
 
@@ -1258,10 +1258,10 @@ class TestCollectChangedFilesSeesCommittedEdits(unittest.TestCase):
 
     def setUp(self):
         self.bench_dir = os.path.realpath(tempfile.mkdtemp())
-        self.app_dir = os.path.join(self.bench_dir, "apps", "one_bpmn")
-        os.makedirs(os.path.join(self.app_dir, "spiff"))
+        self.app_dir = os.path.join(self.bench_dir, "apps", "processa")
+        os.makedirs(os.path.join(self.app_dir, "frontend"))
         for name in ("committed.vue", "pending.py", "both.js"):
-            with open(os.path.join(self.app_dir, "spiff", name), "w") as fh:
+            with open(os.path.join(self.app_dir, "frontend", name), "w") as fh:
                 fh.write(f"content of {name}")
         self.bench_dir_patch = patch.object(srv, "BENCH_DIR", self.bench_dir)
         self.bench_dir_patch.start()
@@ -1273,21 +1273,21 @@ class TestCollectChangedFilesSeesCommittedEdits(unittest.TestCase):
     @staticmethod
     def _fake_run(cmd, **kwargs):
         if "git diff --name-only origin/staging...HEAD" in cmd:
-            return _FakeCompletedProcess(0, "spiff/committed.vue\nspiff/both.js\n", "")
+            return _FakeCompletedProcess(0, "frontend/committed.vue\nfrontend/both.js\n", "")
         if "git diff --name-only HEAD" in cmd:
-            return _FakeCompletedProcess(0, "spiff/pending.py\nspiff/both.js\n", "")
+            return _FakeCompletedProcess(0, "frontend/pending.py\nfrontend/both.js\n", "")
         raise AssertionError(cmd)
 
     def test_committed_and_pending_changes_are_both_collected_once(self):
         with patch.object(srv, "_run", side_effect=self._fake_run):
-            files = srv._collect_changed_files("one_bpmn", "staging")
-        self.assertEqual(sorted(files), ["spiff/both.js", "spiff/committed.vue", "spiff/pending.py"])
-        self.assertEqual(files["spiff/committed.vue"], "content of committed.vue")
+            files = srv._collect_changed_files("processa", "staging")
+        self.assertEqual(sorted(files), ["frontend/both.js", "frontend/committed.vue", "frontend/pending.py"])
+        self.assertEqual(files["frontend/committed.vue"], "content of committed.vue")
 
     def test_without_a_base_branch_only_pending_changes_are_collected(self):
         with patch.object(srv, "_run", side_effect=self._fake_run):
-            files = srv._collect_changed_files("one_bpmn")
-        self.assertEqual(sorted(files), ["spiff/both.js", "spiff/pending.py"])
+            files = srv._collect_changed_files("processa")
+        self.assertEqual(sorted(files), ["frontend/both.js", "frontend/pending.py"])
 
     def test_open_pull_request_diffs_against_the_run_base_branch(self):
         run_ctx = {"git_branch": "staging", "work_item_description": "Fix it.",
@@ -1295,8 +1295,8 @@ class TestCollectChangedFilesSeesCommittedEdits(unittest.TestCase):
         with patch.object(srv, "_collect_changed_files", return_value={}) as collect, patch.object(
             srv, "_run_tests"
         ), patch.object(srv, "_open_pr"):
-            srv._tool_open_pull_request("one_bpmn", {"summary": "s"}, run_ctx)
-        collect.assert_called_once_with("one_bpmn", "staging")
+            srv._tool_open_pull_request("processa", {"summary": "s"}, run_ctx)
+        collect.assert_called_once_with("processa", "staging")
 
 
 class TestShellIdentifiersAreValidated(unittest.TestCase):
@@ -1304,7 +1304,7 @@ class TestShellIdentifiersAreValidated(unittest.TestCase):
     value carrying shell metacharacters must be refused before anything runs."""
 
     def _tool_call(self, **over):
-        payload = {"action": "list_files", "target_app": "one_bpmn", "git_branch": "staging",
+        payload = {"action": "list_files", "target_app": "processa", "git_branch": "staging",
                    "work_item_description": "Fix it.", "github_token": "gh-token"}
         payload.update(over)
         return payload
@@ -1321,7 +1321,7 @@ class TestShellIdentifiersAreValidated(unittest.TestCase):
             self.assertIn("git_branch", error)
 
     def test_command_injection_in_target_app_is_refused(self):
-        for evil in ("one_bpmn; id", "../../etc", "one bpmn", "one_bpmn$(id)", ""):
+        for evil in ("processa; id", "../../etc", "one bpmn", "processa$(id)", ""):
             error = srv._validate_tool_call_payload(self._tool_call(target_app=evil))
             self.assertIsNotNone(error, f"accepted {evil!r}")
 
@@ -1329,7 +1329,7 @@ class TestShellIdentifiersAreValidated(unittest.TestCase):
         error = srv._validate_payload(_valid_payload(git_branch="staging; id"))
         self.assertIn("git_branch", error)
         error = srv._validate_payload({**_valid_payload(), "action": "run_tests",
-                                       "target_app": "one_bpmn; id"})
+                                       "target_app": "processa; id"})
         self.assertIn("target_app", error)
 
     def test_real_branch_shapes_are_still_accepted(self):
@@ -1361,7 +1361,7 @@ class TestADirtyTreeCannotFailACheckout(unittest.TestCase):
             return _FakeCompletedProcess(0)
 
         with patch.object(srv, "_run", side_effect=fake):
-            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "WI-1")
+            ok, err = srv._checkout_or_create_head_branch("processa", "staging", "WI-1")
         self.assertTrue(ok, err)
         return calls
 
@@ -1397,7 +1397,7 @@ class TestCheckoutTakesWhatWasJustFetched(unittest.TestCase):
         def fake(cmd, **kw):
             calls.append(cmd); return self._fake(False)(cmd, **kw)
         with patch.object(srv, "_run", side_effect=fake):
-            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "item-3239")
+            ok, err = srv._checkout_or_create_head_branch("processa", "staging", "item-3239")
         self.assertTrue(ok, err)
         fetch = next(i for i, c in enumerate(calls) if "git fetch origin staging" in c)
         base = next(i for i, c in enumerate(calls) if "git checkout -f -B staging FETCH_HEAD" in c)
@@ -1410,7 +1410,7 @@ class TestCheckoutTakesWhatWasJustFetched(unittest.TestCase):
         def fake(cmd, **kw):
             calls.append(cmd); return self._fake(True)(cmd, **kw)
         with patch.object(srv, "_run", side_effect=fake):
-            ok, err = srv._checkout_or_create_head_branch("one_bpmn", "staging", "item-3239")
+            ok, err = srv._checkout_or_create_head_branch("processa", "staging", "item-3239")
         self.assertTrue(ok, err)
         self.assertTrue(any("git checkout -f -B item-3239 FETCH_HEAD" in c for c in calls))
         self.assertFalse(any("origin/item-3239" in c for c in calls))
@@ -1424,7 +1424,7 @@ class TestCheckoutTakesWhatWasJustFetched(unittest.TestCase):
                 return _FakeCompletedProcess(0, stdout="https://github.com/o/r.git\n")
             return _FakeCompletedProcess(0)
         with patch.object(srv, "_run", side_effect=fake):
-            ok, err = srv._checkout_target_branch("one_bpmn", "staging")
+            ok, err = srv._checkout_target_branch("processa", "staging")
         self.assertTrue(ok, err)
         self.assertTrue(any("git checkout -f -B staging FETCH_HEAD" in c for c in calls))
 
@@ -1442,8 +1442,8 @@ class TestCheckoutForcesPastBakeTimeDrift(unittest.TestCase):
 
     def test_every_fetch_head_checkout_site_forces_past_a_dirty_tree(self):
         for fn, args in (
-            (srv._checkout_target_branch, ("one_bpmn", "staging")),
-            (srv._checkout_or_create_head_branch, ("one_bpmn", "staging", "item-3239")),
+            (srv._checkout_target_branch, ("processa", "staging")),
+            (srv._checkout_or_create_head_branch, ("processa", "staging", "item-3239")),
         ):
             calls = []
             def fake(cmd, **kw):
@@ -1498,7 +1498,7 @@ class TestAgentNameThreading(unittest.TestCase):
 
     def setUp(self):
         self.bench_dir = os.path.realpath(tempfile.mkdtemp())
-        self.app_dir = os.path.join(self.bench_dir, "apps", "one_bpmn")
+        self.app_dir = os.path.join(self.bench_dir, "apps", "processa")
         os.makedirs(self.app_dir)
         self.bench_dir_patch = patch.object(srv, "BENCH_DIR", self.bench_dir)
         self.bench_dir_patch.start()
@@ -1509,7 +1509,7 @@ class TestAgentNameThreading(unittest.TestCase):
 
     def _payload(self, action, args, agent_name=None):
         payload = {
-            "action": action, "target_app": "one_bpmn", "git_branch": "staging",
+            "action": action, "target_app": "processa", "git_branch": "staging",
             "work_item_description": "Fix the thing.", "args": args, "github_token": "gh-token",
         }
         if agent_name is not None:
@@ -1559,7 +1559,7 @@ class TestAgentNameThreading(unittest.TestCase):
             return _FakeCompletedProcess(0)
 
         with patch.object(srv, "_run", side_effect=fake_run), patch.object(srv, "_authed_remote"):
-            srv._commit_and_push("one_bpmn", "wi-branch", "a.py", "write_file via Bug Agent", "Bug Agent")
+            srv._commit_and_push("processa", "wi-branch", "a.py", "write_file via Bug Agent", "Bug Agent")
         commit_cmd = next(c for c in commands if "commit -q -m" in c)
         self.assertIn("user.email=bug-agent@sandbox", commit_cmd)
         self.assertIn("user.name='Bug Agent'", commit_cmd)
@@ -1572,7 +1572,7 @@ class TestAgentNameThreading(unittest.TestCase):
         with patch.object(srv, "_collect_changed_files", return_value={"a.py": "x"}), patch.object(
             srv, "_run_tests", return_value=(True, "", "", [])
         ), patch.object(srv, "_open_pr", return_value=("https://github.com/x/y/pull/1", None)) as open_pr:
-            srv._tool_open_pull_request("one_bpmn", {"summary": "did it"}, run_ctx)
+            srv._tool_open_pull_request("processa", {"summary": "did it"}, run_ctx)
         self.assertEqual(open_pr.call_args.kwargs["agent_name"], "Bug Agent")
 
     def test_open_pr_title_fallback_uses_agent_name_without_a_work_item_id(self):
@@ -1590,7 +1590,7 @@ class TestAgentNameThreading(unittest.TestCase):
             srv, "_github_request", side_effect=fake_request
         ):
             srv._open_pr(
-                "one_bpmn", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "r",
+                "processa", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "r",
                 agent_name="Bug Agent",
             )
         pr = next(b for m, u, b in sent if m == "POST" and u.endswith("/pulls"))
@@ -1610,7 +1610,7 @@ class TestAgentNameThreading(unittest.TestCase):
         with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/one_bpmn"), patch.object(
             srv, "_github_request", side_effect=fake_request
         ):
-            srv._open_pr("one_bpmn", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "r")
+            srv._open_pr("processa", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "r")
         pr = next(b for m, u, b in sent if m == "POST" and u.endswith("/pulls"))
         self.assertTrue(pr["title"].startswith("Dev Agent: "))
 
@@ -1619,12 +1619,12 @@ class TestNodeTestsForTheVueApp(unittest.TestCase):
     def setUp(self):
         self.app_dir = os.path.realpath(tempfile.mkdtemp())
         files = {
-            "spiff/src/uiPolish.test.mjs": 'source("components/ProcessFilter.vue")',
-            "spiff/src/utils/formatters.test.mjs": "import { f } from './formatters.mjs'",
-            "spiff/src/utils/formatters.mjs": "",
-            "spiff/src/components/ProcessFilter.vue": "",
-            "spiff/src/components/Other.vue": "",
-            "one_bpmn/utils.py": "",
+            "frontend/src/uiPolish.test.mjs": 'source("components/ProcessFilter.vue")',
+            "frontend/src/utils/formatters.test.mjs": "import { f } from './formatters.mjs'",
+            "frontend/src/utils/formatters.mjs": "",
+            "frontend/src/components/ProcessFilter.vue": "",
+            "frontend/src/components/Other.vue": "",
+            "processa/utils.py": "",
         }
         for rel, text in files.items():
             path = os.path.join(self.app_dir, rel)
@@ -1636,46 +1636,46 @@ class TestNodeTestsForTheVueApp(unittest.TestCase):
         shutil.rmtree(self.app_dir, ignore_errors=True)
 
     def test_a_changed_test_file_is_its_own_target(self):
-        self.assertEqual(srv._node_tests_for(self.app_dir, ["spiff/src/uiPolish.test.mjs"]), ["src/uiPolish.test.mjs"])
+        self.assertEqual(srv._node_tests_for(self.app_dir, ["frontend/src/uiPolish.test.mjs"]), ["src/uiPolish.test.mjs"])
 
     def test_the_test_beside_a_changed_source_file_is_a_target(self):
         self.assertEqual(
-            srv._node_tests_for(self.app_dir, ["spiff/src/utils/formatters.mjs"]), ["src/utils/formatters.test.mjs"]
+            srv._node_tests_for(self.app_dir, ["frontend/src/utils/formatters.mjs"]), ["src/utils/formatters.test.mjs"]
         )
 
     def test_a_test_that_names_a_changed_component_is_a_target(self):
         self.assertEqual(
-            srv._node_tests_for(self.app_dir, ["spiff/src/components/ProcessFilter.vue"]), ["src/uiPolish.test.mjs"]
+            srv._node_tests_for(self.app_dir, ["frontend/src/components/ProcessFilter.vue"]), ["src/uiPolish.test.mjs"]
         )
 
     def test_a_change_and_its_test_together_run_the_test_once(self):
-        paths = ["spiff/src/components/ProcessFilter.vue", "spiff/src/uiPolish.test.mjs"]
+        paths = ["frontend/src/components/ProcessFilter.vue", "frontend/src/uiPolish.test.mjs"]
         self.assertEqual(srv._node_tests_for(self.app_dir, paths), ["src/uiPolish.test.mjs"])
 
     def test_a_file_no_test_covers_and_paths_outside_the_vue_app_map_to_nothing(self):
-        self.assertEqual(srv._node_tests_for(self.app_dir, ["spiff/src/components/Other.vue", "one_bpmn/utils.py"]), [])
+        self.assertEqual(srv._node_tests_for(self.app_dir, ["frontend/src/components/Other.vue", "processa/utils.py"]), [])
 
     def test_an_app_without_a_vue_app_maps_to_nothing(self):
-        shutil.rmtree(os.path.join(self.app_dir, "spiff"))
-        self.assertEqual(srv._node_tests_for(self.app_dir, ["spiff/src/uiPolish.test.mjs"]), [])
+        shutil.rmtree(os.path.join(self.app_dir, "frontend"))
+        self.assertEqual(srv._node_tests_for(self.app_dir, ["frontend/src/uiPolish.test.mjs"]), [])
 
 
 class TestRunTestsRunsTheNodeTests(unittest.TestCase):
     def _run_tests(self, node_tests, modules=(), results=()):
-        with patch.object(srv, "_changed_paths", return_value=["spiff/src/a.vue"]), patch.object(
+        with patch.object(srv, "_changed_paths", return_value=["frontend/src/a.vue"]), patch.object(
             srv, "_test_modules_for", return_value=list(modules)
         ), patch.object(srv, "_node_tests_for", return_value=list(node_tests)), patch.object(
             srv, "_run", side_effect=list(results)
         ) as run:
-            outcome = srv._run_tests("one_bpmn", "staging")
+            outcome = srv._run_tests("processa", "staging")
         return outcome, run
 
-    def test_a_vue_change_runs_node_in_the_spiff_folder_and_not_bench(self):
+    def test_a_vue_change_runs_node_in_the_frontend_folder_and_not_bench(self):
         ok = srv.subprocess.CompletedProcess("c", 0, "# pass 1\n", "")
         (passed, stdout, _err, failing), run = self._run_tests(["src/uiPolish.test.mjs"], results=[ok])
         run.assert_called_once()
         command = run.call_args.args[0]
-        self.assertIn("/apps/one_bpmn/spiff", command)
+        self.assertIn("/apps/processa/frontend", command)
         self.assertIn("node --test src/uiPolish.test.mjs", command)
         self.assertNotIn("run-tests", command)
         self.assertTrue(passed)
@@ -1721,19 +1721,19 @@ class TestExtractFailingTests(unittest.TestCase):
     def test_finds_fail_and_error_lines(self):
         text = (
             "======================================================================\n"
-            "FAIL: test_something (one_bpmn.tests.test_x.TestX)\n"
+            "FAIL: test_something (processa.tests.test_x.TestX)\n"
             "----------------------------------------------------------------------\n"
             "Traceback (most recent call last):\n"
             "AssertionError: 1 != 2\n"
             "\n"
             "======================================================================\n"
-            "ERROR: test_other (one_bpmn.tests.test_y.TestY)\n"
+            "ERROR: test_other (processa.tests.test_y.TestY)\n"
             "----------------------------------------------------------------------\n"
             "ValueError: boom\n"
         )
         self.assertEqual(
             srv._extract_failing_tests(text),
-            ["test_something (one_bpmn.tests.test_x.TestX)", "test_other (one_bpmn.tests.test_y.TestY)"],
+            ["test_something (processa.tests.test_x.TestX)", "test_other (processa.tests.test_y.TestY)"],
         )
 
     def test_no_failures_returns_empty_list(self):
@@ -1769,10 +1769,10 @@ class TestRunTestsReturnsFailingTests(unittest.TestCase):
         result = srv.subprocess.CompletedProcess(
             "bench run-tests", 1, "FAIL: test_thing (mod.TestThing)\n", "",
         )
-        with patch.object(srv, "_changed_paths", return_value=["one_bpmn/test_a.py"]), patch.object(
-            srv, "_test_modules_for", return_value=["one_bpmn.test_a"]
+        with patch.object(srv, "_changed_paths", return_value=["processa/test_a.py"]), patch.object(
+            srv, "_test_modules_for", return_value=["processa.test_a"]
         ), patch.object(srv, "_run", return_value=result):
-            passed, stdout, stderr, failing_tests = srv._run_tests("one_bpmn")
+            passed, stdout, stderr, failing_tests = srv._run_tests("processa")
         self.assertFalse(passed)
         self.assertEqual(failing_tests, ["test_thing (mod.TestThing)"])
 
@@ -1780,12 +1780,12 @@ class TestRunTestsReturnsFailingTests(unittest.TestCase):
         with patch.object(
             srv, "_tests_for_tree", return_value=(False, "out", "err", ["test_thing (mod.TestThing)"])
         ):
-            result = srv._tool_run_tests("one_bpmn", {})
+            result = srv._tool_run_tests("processa", {})
         self.assertEqual(result["failing_tests"], ["test_thing (mod.TestThing)"])
 
     def test_tool_run_tests_empty_failing_tests_on_a_pass(self):
         with patch.object(srv, "_tests_for_tree", return_value=(True, "out", "err", [])):
-            result = srv._tool_run_tests("one_bpmn", {})
+            result = srv._tool_run_tests("processa", {})
         self.assertEqual(result["failing_tests"], [])
 
 

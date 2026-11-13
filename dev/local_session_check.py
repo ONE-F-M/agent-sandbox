@@ -17,15 +17,15 @@ import frappe
 SITE = os.environ.get("SANDBOX_CHECK_SITE", "onefm.localhost")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 frappe.init(site=SITE, sites_path=os.getcwd()); frappe.connect()
-from one_bpmn.one_bpmn.connectors import agent_sandbox_job as job, agent_sandbox_session as sessions
+from processa.agents_sandbox.sandbox import job, session as sessions
 
 def git(cwd, *a): return subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
 root = os.path.realpath(tempfile.mkdtemp())
 origin, seed, bench = (os.path.join(root, n) for n in ("origin.git", "seed", "bench"))
 os.makedirs(seed); git(root, "init", "-q", "--bare", origin); git(seed, "init", "-q", "-b", "staging")
-os.makedirs(os.path.join(seed, "one_bpmn")); open(os.path.join(seed, "one_bpmn/a.py"), "w").write("one two\n")
+os.makedirs(os.path.join(seed, "processa")); open(os.path.join(seed, "processa/a.py"), "w").write("one two\n")
 git(seed, "add", "-A"); git(seed, "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-q", "-m", "seed"); git(seed, "push", "-q", origin, "staging")
-app = os.path.join(bench, "apps", "one_bpmn"); os.makedirs(os.path.dirname(app)); git(root, "clone", "-q", origin, app)
+app = os.path.join(bench, "apps", "processa"); os.makedirs(os.path.dirname(app)); git(root, "clone", "-q", origin, app)
 git(app, "config", "user.email", "a@b"); git(app, "config", "user.name", "t")
 
 captured = {}
@@ -33,7 +33,7 @@ def fake_start(session_name, token):
     captured.update(session=session_name, token=token); return "local-execution"
 frappe.flags.in_test = False
 with patch.object(job, "start_execution", fake_start):
-    session = sessions.ensure_session(work_item="WI-E2E-1", target_app="one_bpmn", git_branch="staging", agent_name="Dev Agent", caller_instance=None)
+    session = sessions.ensure_session(work_item="WI-E2E-1", target_app="processa", git_branch="staging", agent_name="Dev Agent", caller_instance=None)
 frappe.db.commit()
 print("session", session.name, frappe.db.get_value(sessions.SESSION, session.name, "state"))
 
@@ -43,14 +43,14 @@ ok = True
 def check(label, cond, extra=""):
     global ok; ok = ok and bool(cond); print(("PASS " if cond else "FAIL ") + label, extra)
 try:
-    cmd = sessions.enqueue(session, "tool", "read_file", {"args": {"path": "one_bpmn/a.py"}})
+    cmd = sessions.enqueue(session, "tool", "read_file", {"args": {"path": "processa/a.py"}})
     answer = sessions.wait_for(cmd, timeout=90)
     check("first command is answered by the real agent over HTTP", answer and answer.get("content") == "one two\n", answer)
     check("session registered and active", frappe.db.get_value(sessions.SESSION, session.name, "state") in ("registered", "active"), frappe.db.get_value(sessions.SESSION, session.name, "state"))
-    cmd = sessions.enqueue(session, "tool", "edit_file", {"args": {"path": "one_bpmn/a.py", "old_string": "two", "new_string": "2"}})
+    cmd = sessions.enqueue(session, "tool", "edit_file", {"args": {"path": "processa/a.py", "old_string": "two", "new_string": "2"}})
     answer = sessions.wait_for(cmd, timeout=60)
     check("an edit is applied", answer and answer.get("edited") is True, answer)
-    check("the edit is committed locally and not yet on origin", "edit_file via Dev Agent" in git(app, "log", "-1", "--format=%s") and git(origin, "show", "WI-E2E-1:one_bpmn/a.py") == "one two")
+    check("the edit is committed locally and not yet on origin", "edit_file via Dev Agent" in git(app, "log", "-1", "--format=%s") and git(origin, "show", "WI-E2E-1:processa/a.py") == "one two")
     cmd = sessions.enqueue(session, "tool", "grep_files", {"args": {"pattern": "two", "literal": True}})
     answer = sessions.wait_for(cmd, timeout=60)
     check("a search runs on the checkout", answer and answer.get("matches") is not None, answer and answer.get("count"))
@@ -59,7 +59,7 @@ try:
     sessions.close(frappe.get_doc(sessions.SESSION, session.name))
     code = agent.wait(timeout=60)
     check("close makes the agent push and exit cleanly", code == 0, code)
-    check("the work reached origin at the checkpoint", git(origin, "show", "WI-E2E-1:one_bpmn/a.py") == "one 2")
+    check("the work reached origin at the checkpoint", git(origin, "show", "WI-E2E-1:processa/a.py") == "one 2")
     check("the session is closed", frappe.db.get_value(sessions.SESSION, session.name, "state") == "closed", frappe.db.get_value(sessions.SESSION, session.name, "state"))
 finally:
     if agent.poll() is None: agent.kill()

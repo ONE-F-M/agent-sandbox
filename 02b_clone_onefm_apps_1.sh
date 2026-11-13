@@ -4,7 +4,7 @@
 #
 # This stage: the first half of the private ONE-F-M org apps. Split from
 # 02c's half specifically to keep one_fm (a large, mature app) in its own
-# stage rather than sharing a layer with one_bpmn (also large) — a rough
+# stage rather than sharing a layer with processa (also large) — a rough
 # size balance across 02b/02c, not a functional grouping.
 #
 # GITHUB_TOKEN required — these are private repos. The remote is rewritten

@@ -14,8 +14,9 @@ import frappe
 frappe.init(site=os.environ.get("SANDBOX_CHECK_SITE", "onefm.localhost"), sites_path=os.getcwd())
 frappe.connect()
 frappe.set_user("Administrator")
-from one_bpmn.one_bpmn.connectors.agent_sandbox_reaper import reap, reap_sessions
-from one_bpmn.tasks import poll_a2a_tasks, process_timer_catch_events
+from processa.a2a.poller import poll_a2a_tasks
+from processa.agents_sandbox.sandbox.reaper import reap, reap_sessions
+from processa.processa_engine.timers import process_timer_catch_events
 
 rounds = int(sys.argv[1]) if len(sys.argv) > 1 else 30
 for n in range(rounds):

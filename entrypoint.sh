@@ -7,7 +7,7 @@
 # generic, config-free dev_agent_server.py driver (see that file — it carries
 # no baked-in agent prompt/tools of its own; those arrive per-request from
 # Processa). Explicit commands still work for local debugging, e.g.:
-#   docker run ... bench --site SITE run-tests --app one_bpmn
+#   docker run ... bench --site SITE run-tests --app processa
 
 set -e
 [ -f /env ] && set -a && . /env && set +a
@@ -24,7 +24,7 @@ ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin}"
 MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-root}"
 
 # Apps installed onto SITE_NAME, in dependency order (erpnext before
-# hrms/lending; telephony before helpdesk; one_bpmn before onefm_mcp;
+# hrms/lending; telephony before helpdesk; processa before onefm_mcp;
 # lms before one_lms — one_lms imports it directly, confirmed by a real
 # bake failure (ModuleNotFoundError: No module named 'lms') before this
 # was added; one_fm last — it depends on erpnext). See each app's
@@ -39,7 +39,7 @@ MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-root}"
 # target_app for the coding loop; it never gets installed onto SITE_NAME.
 INSTALL_APPS=(
   erpnext hrms lending telephony helpdesk payments wiki twilio_integration
-  one_fm_password_management onefm_sso frappe_agile one_bpmn onefm_mcp
+  one_fm_password_management onefm_sso frappe_agile processa onefm_mcp
   lms one_lms one_fm
 )
 
