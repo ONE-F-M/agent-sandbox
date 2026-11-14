@@ -125,7 +125,10 @@ class Session:
         """(status, result) for one command. An exception becomes an error result, so Processa always gets an answer."""
         timings = srv._Timings()
         try:
-            handler = {"tool": self._tool, "run_tests": self._run_tests, "finalize": self._finalize, "close": self._close}[command["kind"]]
+            handler = {
+                "tool": self._tool, "run_tests": self._run_tests, "finalize": self._finalize, "close": self._close,
+                "prepare_site": self._prepare_site, "checkout_pr_head": self._checkout_pr_head,
+            }[command["kind"]]
             status, result = handler(command, timings)
         except Exception as exc:  # noqa: BLE001 - reported to Processa as the command's result
             status, result = "error", {"error": f"{type(exc).__name__}: {str(exc)[:400]}"}
@@ -155,6 +158,16 @@ class Session:
             "stdout_tail": stdout, "stderr_tail": stderr, "failing_tests": failing,
             "commit": srv._head_commit(self.target_app),
         }
+
+    # Slow commands for the Testing Agent (WI-004005): the command is "ok" and the result's own status says how it went,
+    # the same shape run_tests uses, so Processa's park/resume handles them like any other slow command.
+    def _prepare_site(self, command, timings):
+        with timings.span("prepare_site"):
+            return "ok", srv.prepare_site(self.target_app, command["payload"])
+
+    def _checkout_pr_head(self, command, timings):
+        with timings.span("checkout_pr_head"):
+            return "ok", srv.checkout_pr_head(self.target_app, command["payload"])
 
     def _finalize(self, command, timings):
         with timings.span("git"):

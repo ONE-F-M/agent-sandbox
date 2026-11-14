@@ -500,6 +500,336 @@ def _migrate_site():
     return result.returncode == 0, result.stdout[-2000:], result.stderr[-2000:]
 
 
+# --- WI-004005: Testing Agent site preparation and PR-head startup -----------------------------
+# Two slow session commands (see session_agent.py). Everything below runs subprocesses as argument
+# lists, never shell strings, and only ever fetches and checks out: no commit, push or merge.
+SNAPSHOT_DIR = os.environ.get("SNAPSHOT_DIR", "/home/frappe/snapshots")
+SERVE_PORT = 8000
+READY_TIMEOUT_SECONDS = 180
+_RUN_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+_ROLE_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9 _-]{0,59}\Z")
+_SHA = re.compile(r"\A[0-9a-f]{40}\Z")
+_PASSWORD_MAX = 128
+# Where a change needs a Desk bundle rebuilt: the app's public/ assets, plus its own frontend folder.
+_FRONTEND_DIRS = {"one_bpmn": ("spiff/",)}
+
+
+def _exec(args, env=None, cwd=None, timeout=None):
+    """Run an argument list (no shell). A hung or missing command reads as a failed one, like _run."""
+    try:
+        return subprocess.run(args, capture_output=True, text=True, env=env, cwd=cwd, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        err = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return subprocess.CompletedProcess(args, 124, "", f"{err}\ntimed out after {exc.timeout:.0f}s".strip())
+    except OSError as exc:
+        return subprocess.CompletedProcess(args, 127, "", f"{type(exc).__name__}: {exc}")
+
+
+def _spawn(args, **kwargs):
+    return subprocess.Popen(args, **kwargs)
+
+
+def _tail(result, *secrets):
+    text = f"{result.stdout or ''}\n{result.stderr or ''}".strip()[-2000:]
+    for secret in filter(None, secrets):
+        text = text.replace(secret, "***")
+    return text
+
+
+def _check_run_id(run_id):
+    if not isinstance(run_id, str) or not _RUN_ID.match(run_id):
+        return f"run_id {run_id!r} is not valid (letters, digits, - and _, at most 64)."
+
+
+def _check_branch(name, label="base_branch"):
+    if not isinstance(name, str) or not _SAFE_REF.match(name) or ".." in name or name.endswith((".lock", "/", ".")):
+        return f"{label} {name!r} is not a valid branch name."
+
+
+def _check_pr_number(number):
+    if isinstance(number, bool) or not isinstance(number, (int, str)) or not re.fullmatch(r"[1-9][0-9]{0,8}", str(number)):
+        return f"pr_number {number!r} is not a valid pull request number."
+
+
+def _check_app(target_app):
+    if not _SAFE_APP.match(str(target_app or "")):
+        return f"target_app {target_app!r} is not a valid app name."
+
+
+def _snapshot_paths(run_id):
+    """(sql path, marker path) for a run; the run id is validated, and the result is checked to stay inside the snapshot dir."""
+    root = os.path.realpath(SNAPSHOT_DIR)
+    sql = os.path.realpath(os.path.join(root, f"{run_id}.sql"))
+    if os.path.dirname(sql) != root:
+        raise ValueError("snapshot path escapes the snapshot directory")
+    return sql, sql[:-4] + ".json"
+
+
+def _failed(step, error, **extra):
+    return {"status": "failed", "step": step, "error": error, **extra}
+
+
+def _site_db_credentials():
+    sites = os.path.join(BENCH_DIR, "sites")
+    conf = {}
+    for path in (os.path.join(sites, "common_site_config.json"), os.path.join(sites, SITE_NAME, "site_config.json")):
+        with open(path) as fh:
+            conf.update(json.load(fh))
+    if not conf.get("db_name") or not conf.get("db_password"):
+        raise RuntimeError("site_config has no db_name/db_password")
+    return conf["db_name"], conf["db_password"], str(conf.get("db_host") or "127.0.0.1"), str(conf.get("db_port") or 3306)
+
+
+# Runs inside the bench virtualenv (it needs frappe). The password and users arrive in the environment,
+# never in argv, so neither shows in a process list or a log. Re-running updates users in place.
+_ENSURE_USERS_SCRIPT = """
+import json, os, frappe
+users = json.loads(os.environ["SANDBOX_TEST_USERS"])
+password = os.environ["SANDBOX_TEST_PASSWORD"]
+frappe.init(site=os.environ["SANDBOX_SITE"], sites_path=".")
+frappe.connect()
+try:
+    frappe.set_user("Administrator")
+    out = []
+    for u in users:
+        if u["role"] and not frappe.db.exists("Role", u["role"]):
+            raise Exception("role does not exist: " + u["role"])
+        created = not frappe.db.exists("User", u["email"])
+        if created:
+            doc = frappe.new_doc("User")
+            doc.update({"email": u["email"], "first_name": u["first_name"], "send_welcome_email": 0, "user_type": "System User"})
+        else:
+            doc = frappe.get_doc("User", u["email"])
+        doc.enabled = 1
+        doc.new_password = password
+        doc.set("roles", [])
+        if u["role"]:
+            doc.append("roles", {"role": u["role"]})
+        doc.save(ignore_permissions=True)
+        out.append({"email": u["email"], "role": u["role"], "created": created})
+    frappe.db.commit()
+finally:
+    frappe.destroy()
+print("USERS_JSON=" + json.dumps(out))
+"""
+
+
+def _user_plan(run_id, roles):
+    """One user per unique role, plus one with none of them. Same run + role gives the same email, so a repeat finds it."""
+    plan, seen = [], set()
+    for role in dict.fromkeys(roles):
+        slug = re.sub(r"[^a-z0-9]+", "-", role.lower()).strip("-")
+        if slug in seen:
+            raise ValueError(f"role {role!r} collides with another role after normalising")
+        seen.add(slug)
+        plan.append({"email": f"{slug}.{run_id}@sandbox.test", "role": role, "first_name": f"Test {role}"})
+    plan.append({"email": f"norole.{run_id}@sandbox.test", "role": None, "first_name": "Test NoRole"})
+    return plan
+
+
+def _validate_prepare_site(target_app, payload):
+    roles, password = payload.get("roles"), payload.get("password")
+    error = (
+        _check_run_id(payload.get("run_id")) or _check_branch(payload.get("base_branch"))
+        or _check_pr_number(payload.get("pr_number")) or _check_app(target_app)
+    )
+    if error:
+        return error
+    if not isinstance(roles, list) or not roles or not all(isinstance(r, str) and _ROLE_NAME.match(r) for r in roles):
+        return "roles must be a non-empty list of valid role names."
+    if not isinstance(password, str) or not 8 <= len(password) <= _PASSWORD_MAX or password != password.strip():
+        return "password must be a string of 8 to 128 characters without surrounding whitespace."
+    return None
+
+
+def prepare_site(target_app, payload):
+    """AC1: base branch checked out, site migrated, one test user per role plus one with none, mute_emails on,
+    then a mysqldump of the site DB under SNAPSHOT_DIR. Returns a result dict; never contains the password."""
+    error = _validate_prepare_site(target_app, payload)
+    if error:
+        return _failed("validate", error)
+    run_id, base_branch, password = payload["run_id"], payload["base_branch"], payload["password"]
+    try:
+        plan = _user_plan(run_id, payload["roles"])
+    except ValueError as exc:
+        return _failed("validate", str(exc))
+    app_dir = f"{BENCH_DIR}/apps/{target_app}"
+    ok, err = _checkout_target_branch(target_app, base_branch)
+    if not ok:
+        return _failed("checkout_base", err)
+    base_sha = _exec(["git", "rev-parse", "HEAD"], cwd=app_dir).stdout.strip()
+    if not _SHA.match(base_sha):
+        return _failed("checkout_base", "could not resolve the base commit")
+
+    migrate = _exec(["bench", "--site", SITE_NAME, "migrate"], cwd=BENCH_DIR, timeout=1800)
+    if migrate.returncode != 0:
+        return _failed("migrate", "migration failed on the base branch", migration_tail=_tail(migrate, password))
+
+    env = {**os.environ, "SANDBOX_TEST_USERS": json.dumps(plan), "SANDBOX_TEST_PASSWORD": password, "SANDBOX_SITE": SITE_NAME}
+    users = _exec([f"{BENCH_DIR}/env/bin/python", "-c", _ENSURE_USERS_SCRIPT], env=env, cwd=f"{BENCH_DIR}/sites", timeout=300)
+    marker = next((l for l in (users.stdout or "").splitlines() if l.startswith("USERS_JSON=")), None)
+    if users.returncode != 0 or not marker:
+        return _failed("create_users", "creating the test users failed", detail=_tail(users, password))
+    created = json.loads(marker[len("USERS_JSON="):])
+
+    muted = _exec(["bench", "--site", SITE_NAME, "set-config", "mute_emails", "1"], cwd=BENCH_DIR, timeout=120)
+    if muted.returncode != 0:
+        return _failed("mute_emails", "could not set mute_emails", detail=_tail(muted, password))
+
+    try:
+        sql_path, marker_path = _snapshot_paths(run_id)
+        os.makedirs(SNAPSHOT_DIR, mode=0o700, exist_ok=True)
+        db_name, db_password, db_host, db_port = _site_db_credentials()
+    except (ValueError, OSError, RuntimeError, json.JSONDecodeError) as exc:
+        return _failed("snapshot", f"{type(exc).__name__}: {exc}")
+    part = sql_path + ".part"
+    dump = _exec(
+        ["mysqldump", "--single-transaction", "--routines", "--triggers", "-h", db_host, "-P", db_port, "-u", db_name,
+         f"--result-file={part}", db_name],
+        env={**os.environ, "MYSQL_PWD": db_password}, timeout=1800,
+    )
+    if dump.returncode != 0 or not os.path.isfile(part) or os.path.getsize(part) == 0:
+        with contextlib.suppress(OSError):
+            os.remove(part)
+        return _failed("snapshot", "mysqldump failed or produced an empty file", detail=_tail(dump, db_password, password))
+    os.replace(part, sql_path)  # only this run's own file name is ever replaced
+    size = os.path.getsize(sql_path)
+    with open(marker_path, "w") as fh:
+        json.dump({"run_id": run_id, "base_branch": base_branch, "base_sha": base_sha, "pr_number": int(payload["pr_number"]),
+                   "target_app": target_app, "snapshot": sql_path}, fh)
+    return {"status": "prepared", "run_id": run_id, "base_branch": base_branch, "base_sha": base_sha, "users": created,
+            "mute_emails": True, "snapshot_path": sql_path, "snapshot_bytes": size}
+
+
+def _frontend_changed(target_app, paths):
+    """Only the app's public/ assets or its own frontend folder need a bundle rebuild; a backend change does not."""
+    public = re.compile(rf"\A{re.escape(target_app)}/public/")
+    return any(public.match(p) or p.startswith(_FRONTEND_DIRS.get(target_app, ())) for p in paths)
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _stop_services(pids):
+    import signal
+    for pid in pids:
+        with contextlib.suppress(OSError):
+            os.killpg(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 10
+    while any(_pid_alive(p) for p in pids) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    for pid in pids:
+        if _pid_alive(pid):
+            with contextlib.suppress(OSError):
+                os.killpg(pid, signal.SIGKILL)
+
+
+def _ping(port=SERVE_PORT):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/method/ping", timeout=5) as response:
+            return response.status == 200 and json.loads(response.read()).get("message") == "pong"
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def _start_services():
+    """One bench serve on 8000 and one worker, each in its own session so they outlive the command.
+    Services from an earlier call are stopped first, so there is never a second set. Returns (pids, error)."""
+    state_file = os.path.join(BENCH_DIR, "logs", "sandbox_services.json")
+    os.makedirs(os.path.dirname(state_file), exist_ok=True)
+    try:
+        with open(state_file) as fh:
+            old = [p for p in json.load(fh).get("pids", []) if isinstance(p, int) and _pid_alive(p)]
+    except (OSError, ValueError):
+        old = []
+    _stop_services(old)
+    if _ping():
+        return None, f"port {SERVE_PORT} is already answering and is not a service this agent started"
+    pids = []
+    for name, args in (("serve", ["bench", "--site", SITE_NAME, "serve", "--port", str(SERVE_PORT)]),
+                       ("worker", ["bench", "worker", "--queue", "short,default,long"])):
+        with open(os.path.join(BENCH_DIR, "logs", f"sandbox_{name}.log"), "ab") as log:
+            try:
+                proc = _spawn(args, cwd=BENCH_DIR, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+            except OSError as exc:
+                _stop_services(pids)
+                return None, f"could not start {name}: {exc}"
+        pids.append(proc.pid)
+        with open(state_file, "w") as fh:
+            json.dump({"pids": pids}, fh)
+    deadline = time.monotonic() + READY_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if not all(_pid_alive(p) for p in pids):
+            break
+        if _ping():
+            return pids, None
+        time.sleep(2)
+    _stop_services(pids)
+    with open(state_file, "w") as fh:
+        json.dump({"pids": []}, fh)
+    log_tail = ""
+    with contextlib.suppress(OSError), open(os.path.join(BENCH_DIR, "logs", "sandbox_serve.log"), "rb") as fh:
+        log_tail = fh.read()[-1500:].decode(errors="replace")
+    return None, f"the site did not answer /api/method/ping on port {SERVE_PORT}: {log_tail}"
+
+
+def checkout_pr_head(target_app, payload):
+    """AC2-AC5: fetch refs/pull/<N>/head, check out that exact commit, rebuild assets only for frontend changes,
+    migrate, and only then start serve + one worker and wait for /api/method/ping. Fetch and checkout only."""
+    error = _check_run_id(payload.get("run_id")) or _check_pr_number(payload.get("pr_number")) or _check_app(target_app)
+    if error:
+        return _failed("validate", error)
+    run_id, number = payload["run_id"], int(payload["pr_number"])
+    app_dir = f"{BENCH_DIR}/apps/{target_app}"
+    try:
+        sql_path, marker_path = _snapshot_paths(run_id)
+        with open(marker_path) as fh:
+            prepared = json.load(fh)
+        assert os.path.getsize(sql_path) > 0 and prepared["pr_number"] == number and prepared["target_app"] == target_app
+    except (OSError, ValueError, KeyError, AssertionError):
+        return _failed("verify_base", "the site was not prepared for this run and pull request (run prepare_site first)")
+
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    with _authed_remote(app_dir, github_token):
+        fetch = _exec(["git", "fetch", "origin", f"refs/pull/{number}/head"], cwd=app_dir, timeout=600)
+    if fetch.returncode != 0:
+        return _failed("fetch", f"git fetch of refs/pull/{number}/head failed", detail=_tail(fetch, github_token))
+    sha = _exec(["git", "rev-parse", "--verify", "FETCH_HEAD^{commit}"], cwd=app_dir).stdout.strip()
+    if not _SHA.match(sha):
+        return _failed("fetch", "could not resolve the fetched pull request head")
+    checkout = _exec(["git", "checkout", "-f", "--detach", sha], cwd=app_dir)
+    if checkout.returncode != 0 or _exec(["git", "rev-parse", "HEAD"], cwd=app_dir).stdout.strip() != sha:
+        return _failed("checkout", f"git checkout of {sha} failed", detail=_tail(checkout, github_token))
+
+    diff = _exec(["git", "diff", "--name-only", prepared["base_sha"], sha], cwd=app_dir)
+    if diff.returncode != 0:
+        return _failed("diff", "git diff of base against the pull request head failed", detail=_tail(diff, github_token))
+    paths = [p for p in diff.stdout.splitlines() if p]
+    built = _frontend_changed(target_app, paths)
+    if built:
+        build = _exec(["bench", "build", "--app", target_app], cwd=BENCH_DIR, timeout=3600)
+        if build.returncode != 0:
+            return _failed("build", "bench build failed", build_tail=_tail(build), pr_head_sha=sha)
+
+    migrate = _exec(["bench", "--site", SITE_NAME, "migrate"], cwd=BENCH_DIR, timeout=1800)
+    if migrate.returncode != 0:
+        return _failed("migrate", "migration failed on the pull request head", migration_tail=_tail(migrate), pr_head_sha=sha)
+
+    pids, error = _start_services()
+    if error:
+        return _failed("start_services", error, pr_head_sha=sha)
+    return {"status": "ready", "run_id": run_id, "pr_number": number, "pr_head_sha": sha, "base_sha": prepared["base_sha"],
+            "changed_files": len(paths), "built_assets": built, "port": SERVE_PORT, "serve_pid": pids[0], "worker_pid": pids[1],
+            "ping": "pong"}
+
+
 _TEST_FAILURE_LINE = re.compile(r"^(?:FAIL|ERROR): (.+)$", re.MULTILINE)
 _NODE_FAILURE_LINE = re.compile(r"^\s*not ok \d+ - (.+)$", re.MULTILINE)
 
