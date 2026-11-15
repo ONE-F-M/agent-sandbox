@@ -299,6 +299,359 @@ class TestTheLoop(SessionCase):
             session.run()
 
 
+PASSWORD = "Tp-s3cret-pw!"
+
+
+class TestingAgentCase(SessionCase):
+    """prepare_site / checkout_pr_head with real git (a local origin) and faked bench, mysqldump, services and HTTP."""
+
+    def setUp(self):
+        super().setUp()
+        self.snapshots = os.path.join(self.root, "snapshots")
+        for target, value in (("SNAPSHOT_DIR", self.snapshots), ("READY_TIMEOUT_SECONDS", 4)):
+            patcher = patch.object(srv, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        sites = os.path.join(self.bench, "sites")
+        os.makedirs(os.path.join(sites, "sandbox"))
+        for path, conf in (("common_site_config.json", {"db_host": "127.0.0.1"}), ("sandbox/site_config.json", {"db_name": "_db1", "db_password": "dbsecret"})):
+            with open(os.path.join(sites, path), "w") as fh:
+                json.dump(conf, fh)
+        self.calls, self.broken, self.dump_bytes = [], set(), "-- dump\n"
+        self.pinged, self.stopped, self.popen = [False, True], [], []
+        self.session, self.client = self._session()
+        self.base_sha = git(self.origin, "rev-parse", "staging")
+        # The pull request: one commit on top of staging, published only as refs/pull/5/head (no branch).
+        pr = os.path.join(self.root, "pr")
+        git(self.root, "clone", "-q", self.origin, pr)
+        self.pr = pr
+        self._repoint_pr("one_bpmn/b.py", "backend\n")
+        for target, side_effect in (("_exec", self._fake_exec), ("_ping", lambda *a: self.pinged.pop(0) if self.pinged else True),
+                                    ("_pid_alive", lambda pid: True), ("_stop_services", lambda pids: self.stopped.append(list(pids)))):
+            patcher = patch.object(srv, target, side_effect=side_effect)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(srv.time, "sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(srv, "_spawn", side_effect=self._fake_popen)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _repoint_pr(self, path, text):
+        """Make the PR head a new commit on top of base touching only `path`, and publish it as refs/pull/5/head."""
+        git(self.pr, "fetch", "-q", "origin", "staging")
+        git(self.pr, "checkout", "-q", "-f", "-B", "work", "FETCH_HEAD")
+        full = os.path.join(self.pr, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as fh:
+            fh.write(text)
+        git(self.pr, "add", "-A")
+        git(self.pr, "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-q", "-m", "pr")
+        git(self.pr, "push", "-q", "-f", "origin", "HEAD:refs/pull/5/head")
+        self.pr_sha = git(self.pr, "rev-parse", "HEAD")
+
+    def _fake_exec(self, args, env=None, cwd=None, timeout=None):
+        self.calls.append((list(args), dict(env or {})))
+        done = lambda out="", rc=0, err="": subprocess.CompletedProcess(args, rc, out, err)
+        if args[0] == "git":
+            return subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+        if args[0].endswith("python"):
+            key = "users"
+        elif args[0] == "mysqldump":
+            key = "mysqldump"
+        elif args[1] == "build":
+            key = "build"
+        else:
+            key = args[3]  # bench --site sandbox <migrate|set-config>
+        if key in self.broken:
+            return done("out-line", 1, f"{key} blew up, db_password=dbsecret {PASSWORD}")
+        if key == "users":
+            plan = json.loads(env["SANDBOX_TEST_USERS"])
+            return done("noise\nUSERS_JSON=" + json.dumps([{**u, "created": True} for u in plan]) + "\n")
+        if key == "mysqldump":
+            with open(next(a.split("=", 1)[1] for a in args if a.startswith("--result-file=")), "w") as fh:
+                fh.write(self.dump_bytes)
+        return done()
+
+    def _fake_popen(self, args, **kwargs):
+        self.popen.append((list(args), kwargs))
+        return MagicMock(pid=4000 + len(self.popen))
+
+    def prepare(self, **over):
+        payload = {"base_branch": "staging", "pr_number": 5, "run_id": "run-1", "roles": ["Sales User", "HR Manager"], "password": PASSWORD, **over}
+        return self.session.execute(self._command(1, "prepare_site", **payload))
+
+    def checkout(self, **over):
+        return self.session.execute(self._command(2, "checkout_pr_head", **{"pr_number": 5, "run_id": "run-1", **over}))
+
+    def argv(self, *prefix):
+        return [a for a, _ in self.calls if a[: len(prefix)] == list(prefix)]
+
+
+class TestPrepareSite(TestingAgentCase):
+    def test_the_payload_is_validated_before_anything_runs(self):
+        bad = ({"run_id": "../x"}, {"run_id": "a/b"}, {"pr_number": "5; rm"}, {"pr_number": 0}, {"pr_number": True}, {"base_branch": "a..b"},
+               {"base_branch": "-x"}, {"roles": []}, {"roles": "Sales"}, {"roles": ["ok", "bad;role"]}, {"password": "short"},
+               {"password": " padded-password "}, {"roles": ["A B", "A-B"]})
+        for over in bad:
+            status, result = self.prepare(**over)
+            self.assertEqual((status, result["status"], result["step"]), ("ok", "failed", "validate"), over)
+        self.assertEqual(self.calls, [])
+        _status, result = self.session.execute(self._command(3, "prepare_site", base_branch="staging"))
+        self.assertEqual(result["step"], "validate")
+
+    def test_it_checks_out_base_migrates_then_makes_one_user_per_role_plus_one_with_none(self):
+        status, result = self.prepare(roles=["Sales User", "HR Manager", "Sales User"])
+        self.assertEqual((status, result["status"]), ("ok", "prepared"))
+        self.assertEqual(self.argv("bench", "--site", "sandbox", "migrate"), [["bench", "--site", "sandbox", "migrate"]])
+        self.assertEqual(result["base_sha"], self.base_sha)
+        self.assertEqual(git(self.app, "rev-parse", "HEAD"), self.base_sha)
+        self.assertEqual([u["role"] for u in result["users"]], ["Sales User", "HR Manager", None])
+        self.assertEqual(len({u["email"] for u in result["users"]}), 3)
+        order = [a[0] for a, _ in self.calls if a[0] != "git"]
+        self.assertEqual(order, ["bench", f"{self.bench}/env/bin/python", "bench", "mysqldump"])
+
+    def test_one_password_from_the_payload_is_used_for_every_user_and_never_leaks(self):
+        _status, result = self.prepare()
+        users_env = next(env for args, env in self.calls if args[0].endswith("python"))
+        self.assertEqual(users_env["SANDBOX_TEST_PASSWORD"], PASSWORD)
+        self.assertEqual(len(json.loads(users_env["SANDBOX_TEST_USERS"])), 3)
+        self.assertNotIn(PASSWORD, "".join(a for args, _ in self.calls for a in args))
+        self.assertNotIn(PASSWORD, json.dumps(result))
+        self.assertNotIn(PASSWORD, json.dumps(self.client.sent))
+
+    def test_the_user_script_creates_each_user_once_with_that_role_and_updates_on_a_repeat(self):
+        db = {}
+
+        class Doc:
+            def update(self, values):
+                self.__dict__.update(values)
+
+            def set(self, key, value):
+                setattr(self, key, value)
+
+            def append(self, key, row):
+                getattr(self, key).append(row)
+
+            def save(self, ignore_permissions=False):
+                db[self.email] = self
+
+        fake = MagicMock()
+        fake.db.exists.side_effect = lambda doctype, name: (doctype == "Role" and name != "Ghost") or (doctype == "User" and name in db)
+        fake.new_doc.side_effect = lambda doctype: Doc()
+        fake.get_doc.side_effect = lambda doctype, name: db[name]
+        env = {"SANDBOX_TEST_USERS": json.dumps(srv._user_plan("run-1", ["Sales User", "HR Manager"])), "SANDBOX_TEST_PASSWORD": PASSWORD, "SANDBOX_SITE": "sandbox"}
+        for _ in range(2):
+            with patch.dict("sys.modules", {"frappe": fake}), patch.dict(os.environ, env), patch("builtins.print") as out:
+                exec(compile(srv._ENSURE_USERS_SCRIPT, "script", "exec"), {})
+        self.assertEqual(len(db), 3)
+        self.assertEqual(sorted(len(u.roles) for u in db.values()), [0, 1, 1])
+        self.assertEqual({u.new_password for u in db.values()}, {PASSWORD})
+        self.assertFalse(json.loads(out.call_args.args[0].split("=", 1)[1])[0]["created"])
+        ghost = {**env, "SANDBOX_TEST_USERS": json.dumps([{"email": "g@x.test", "role": "Ghost", "first_name": "G"}])}
+        with patch.dict("sys.modules", {"frappe": fake}), patch.dict(os.environ, ghost), self.assertRaisesRegex(Exception, "role does not exist"):
+            exec(compile(srv._ENSURE_USERS_SCRIPT, "script", "exec"), {})
+
+    def test_mute_emails_is_set_before_the_snapshot(self):
+        self.prepare()
+        self.assertEqual(len(self.argv("bench", "--site", "sandbox", "set-config", "mute_emails", "1")), 1)
+        names = [" ".join(a) for a, _ in self.calls if a[0] != "git"]
+        self.assertLess(next(i for i, n in enumerate(names) if "mute_emails" in n), next(i for i, n in enumerate(names) if n.startswith("mysqldump")))
+
+    def test_the_snapshot_is_a_non_empty_dump_taken_before_pr_checkout_with_no_db_password_in_args(self):
+        _status, result = self.prepare()
+        path = os.path.join(self.snapshots, "run-1.sql")
+        self.assertEqual((result["snapshot_path"], result["snapshot_bytes"]), (path, len("-- dump\n")))
+        self.assertFalse(os.path.exists(path + ".part"))
+        args, env = next((a, e) for a, e in self.calls if a[0] == "mysqldump")
+        self.assertNotIn("dbsecret", " ".join(args))
+        self.assertEqual(env["MYSQL_PWD"], "dbsecret")
+        self.assertEqual(git(self.app, "rev-parse", "HEAD"), self.base_sha)  # still on base; PR not fetched
+        self.assertEqual(self.argv("git", "fetch", "origin", "refs/pull/5/head"), [])
+
+    def test_an_empty_or_failed_dump_fails_loudly_and_leaves_no_file(self):
+        self.dump_bytes = ""
+        _status, result = self.prepare()
+        self.assertEqual((result["status"], result["step"]), ("failed", "snapshot"))
+        self.assertEqual(os.listdir(self.snapshots), [])
+        self.dump_bytes = "-- dump\n"
+        self.broken.add("mysqldump")
+        _status, result = self.prepare()
+        self.assertEqual(result["step"], "snapshot")
+        self.assertNotIn("dbsecret", json.dumps(result))
+        self.assertNotIn(PASSWORD, json.dumps(result))
+        self.assertEqual(os.listdir(self.snapshots), [])
+
+    def test_a_repeat_run_does_not_duplicate_users_and_each_run_keeps_its_own_snapshot(self):
+        self.prepare()
+        first = open(os.path.join(self.snapshots, "run-1.sql")).read()
+        self.dump_bytes = "-- other\n"
+        self.prepare(run_id="run-2")
+        self.assertEqual(open(os.path.join(self.snapshots, "run-1.sql")).read(), first)
+        self.assertEqual(sorted(os.listdir(self.snapshots)), ["run-1.json", "run-1.sql", "run-2.json", "run-2.sql"])
+        self.prepare()  # same run again: the same emails, so the script updates rather than inserts
+        plans = [json.loads(e["SANDBOX_TEST_USERS"]) for a, e in self.calls if a[0].endswith("python")]
+        self.assertEqual([plans[0], plans[2]], [srv._user_plan("run-1", ["Sales User", "HR Manager"])] * 2)
+        self.assertNotEqual(plans[0], plans[1])
+
+    def test_each_step_failing_is_reported_with_its_step_and_stops_the_rest(self):
+        for key, step in (("migrate", "migrate"), ("users", "create_users"), ("set-config", "mute_emails")):
+            self.calls.clear()
+            self.broken = {key}
+            _status, result = self.prepare()
+            self.assertEqual((result["status"], result["step"]), ("failed", step), key)
+            self.assertNotIn(PASSWORD, json.dumps(result))
+            self.assertEqual(self.argv("mysqldump"), [])
+        self.broken = set()
+        with patch.object(srv, "_checkout_target_branch", return_value=(False, "git fetch failed")):
+            _status, result = self.prepare()
+        self.assertEqual((result["step"], result["error"]), ("checkout_base", "git fetch failed"))
+
+    def test_a_missing_base_branch_fails_at_checkout(self):
+        _status, result = self.prepare(base_branch="nope")
+        self.assertEqual((result["status"], result["step"]), ("failed", "checkout_base"))
+
+
+class TestCheckoutPrHead(TestingAgentCase):
+    def setUp(self):
+        super().setUp()
+        self.prepare()
+        self.calls.clear()
+
+    def test_it_refuses_to_run_unless_the_site_was_prepared_for_that_run_and_pr(self):
+        for over in ({"run_id": "never"}, {"pr_number": 6}):
+            _status, result = self.checkout(**over)
+            self.assertEqual((result["status"], result["step"]), ("failed", "verify_base"), over)
+        for over in ({"pr_number": "x"}, {"run_id": "../../etc"}, {"pr_number": -1}):
+            self.assertEqual(self.checkout(**over)[1]["step"], "validate")
+        open(os.path.join(self.snapshots, "run-1.sql"), "w").close()
+        self.assertEqual(self.checkout()[1]["step"], "verify_base")
+        self.assertEqual(self.calls, [])
+
+    def test_the_pull_ref_is_fetched_and_that_exact_commit_is_checked_out(self):
+        _status, result = self.checkout()
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(len(self.argv("git", "fetch", "origin", "refs/pull/5/head")), 1)
+        self.assertEqual(result["pr_head_sha"], self.pr_sha)
+        self.assertEqual(git(self.app, "rev-parse", "HEAD"), self.pr_sha)
+        # a later push to the PR does not move what was checked out: it is a commit, not a branch name
+        self._repoint_pr("one_bpmn/b.py", "moved\n")
+        self.assertNotEqual(git(self.app, "rev-parse", "HEAD"), self.pr_sha)
+
+    def test_frontend_or_public_changes_trigger_one_build_and_backend_only_does_not(self):
+        self.assertFalse(self.checkout()[1]["built_assets"])
+        self.assertEqual(self.argv("bench", "build"), [])
+        for path in ("spiff/src/App.vue", "one_bpmn/public/js/x.js"):
+            self.calls.clear()
+            self.pinged[:] = [False, True]
+            self._repoint_pr(path, "x\n")
+            _status, result = self.checkout()
+            self.assertEqual(self.argv("bench", "build"), [["bench", "build", "--app", "one_bpmn"]], path)
+            self.assertTrue(result["built_assets"])
+        for path in ("one_bpmn/api/x.py", "docs/public.md", "one_bpmn/publicity/x.js", "spiffy/x.js"):
+            self.calls.clear()
+            self.pinged[:] = [False, True]
+            self._repoint_pr(path, "x\n")
+            self.assertFalse(self.checkout()[1]["built_assets"], path)
+            self.assertEqual(self.argv("bench", "build"), [], path)
+
+    def test_a_failing_build_stops_before_migrate(self):
+        self._repoint_pr("spiff/src/App.vue", "x\n")
+        self.broken = {"build"}
+        _status, result = self.checkout()
+        self.assertEqual((result["status"], result["step"]), ("failed", "build"))
+        self.assertEqual(self.popen, [])
+        self.assertEqual(self.argv("bench", "--site", "sandbox", "migrate"), [])
+
+    def test_a_failed_migration_returns_the_log_tail_and_starts_nothing(self):
+        self.broken = {"migrate"}
+        _status, result = self.checkout()
+        self.assertEqual((result["status"], result["step"]), ("failed", "migrate"))
+        self.assertIn("migrate blew up", result["migration_tail"])
+        self.assertNotIn("ping", result)
+        self.assertEqual(self.popen, [])
+
+    def test_services_start_after_migrate_one_serve_on_8000_and_exactly_one_worker(self):
+        _status, result = self.checkout()
+        self.assertEqual([a for a, _ in self.popen], [["bench", "--site", "sandbox", "serve", "--port", "8000"], ["bench", "worker", "--queue", "short,default,long"]])
+        self.assertTrue(all(k["start_new_session"] for _, k in self.popen))
+        flat = " ".join(" ".join(a) for a, _ in self.popen)
+        for banned in ("bench start", "redis", "watch", "socketio"):
+            self.assertNotIn(banned, flat)
+        self.assertEqual((result["port"], result["serve_pid"], result["worker_pid"], result["ping"]), (8000, 4001, 4002, "pong"))
+        with open(os.path.join(self.bench, "logs", "sandbox_services.json")) as fh:
+            self.assertEqual(json.load(fh), {"pids": [4001, 4002]})
+
+    def test_a_second_call_replaces_the_first_services_instead_of_adding_more(self):
+        self.checkout()
+        self.pinged[:] = [False, True]
+        self.checkout()
+        self.assertEqual(self.stopped[0], [])
+        self.assertEqual(self.stopped[1], [4001, 4002])
+        self.assertEqual(len(self.popen), 4)
+        with open(os.path.join(self.bench, "logs", "sandbox_services.json")) as fh:
+            self.assertEqual(json.load(fh), {"pids": [4003, 4004]})
+
+    def test_success_waits_for_a_real_ping_answer(self):
+        self.pinged[:] = [False, False, False, True]  # occupancy check, then two misses, then pong
+        self.assertEqual(self.checkout()[1]["status"], "ready")
+        self.assertEqual(self.pinged, [])
+
+    def test_a_site_that_never_answers_stops_the_services_and_reports_failure(self):
+        ticks = iter(range(0, 1000, 2))
+        with patch.object(srv, "_ping", return_value=False), patch.object(srv.time, "monotonic", side_effect=lambda: next(ticks)):
+            _status, result = self.checkout()
+        self.assertEqual((result["status"], result["step"]), ("failed", "start_services"))
+        self.assertIn("ping", result["error"])
+        self.assertEqual(self.stopped[-1], [4001, 4002])
+
+    def test_a_service_that_cannot_start_fails_and_an_occupied_port_is_refused(self):
+        with patch.object(srv, "_spawn", side_effect=FileNotFoundError("bench")):
+            self.assertEqual(self.checkout()[1]["step"], "start_services")
+        self.pinged[:] = [True]
+        _status, result = self.checkout()
+        self.assertIn("already answering", result["error"])
+        self.assertEqual(self.popen, [])
+
+
+class TestPing(unittest.TestCase):
+    def test_ping_accepts_only_a_pong_answer_from_port_8000(self):
+        for body, status, expected in ((b'{"message": "pong"}', 200, True), (b'{"message": "nope"}', 200, False), (b"<html>", 200, False), (b"{}", 502, False)):
+            response = MagicMock(status=status)
+            response.read.return_value = body
+            response.__enter__ = lambda s: s
+            response.__exit__ = lambda *a: False
+            with patch("urllib.request.urlopen", return_value=response) as opened:
+                self.assertIs(srv._ping(), expected)
+                self.assertEqual(opened.call_args.args[0], "http://127.0.0.1:8000/api/method/ping")
+        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
+            self.assertFalse(srv._ping())
+
+
+class TestNoWritesToGit(TestingAgentCase):
+    def test_neither_command_ever_commits_pushes_or_merges(self):
+        self.prepare()
+        self._repoint_pr("spiff/src/App.vue", "x\n")
+        self.checkout()
+        verbs = {a[1] for a, _ in self.calls if a[0] == "git"}
+        self.assertFalse(verbs & {"commit", "push", "merge", "reset", "rebase", "tag"}, verbs)
+        self.assertEqual(git(self.origin, "rev-parse", "staging"), self.base_sha)
+
+    def test_the_new_kinds_are_dispatched_and_the_existing_ones_still_are(self):
+        with patch.object(srv, "prepare_site", return_value={"status": "prepared"}) as prep, patch.object(srv, "checkout_pr_head", return_value={"status": "ready"}) as head:
+            self.assertEqual(self.session.execute(self._command(1, "prepare_site", run_id="r"))[1]["status"], "prepared")
+            self.assertEqual(self.session.execute(self._command(2, "checkout_pr_head", run_id="r"))[1]["status"], "ready")
+        self.assertEqual((prep.call_args.args[0], head.call_args.args[0]), ("one_bpmn", "one_bpmn"))
+        with patch.object(srv, "_tests_for_tree", return_value=(True, "", "", [])):
+            self.assertEqual(self.session.execute(self._command(3, "run_tests", "run_tests", args={}))[1]["status"], "tests_passed")
+
+    def test_an_exception_inside_a_new_command_is_still_an_error_result(self):
+        with patch.object(srv, "prepare_site", side_effect=RuntimeError("boom")):
+            status, result = self.session.execute(self._command(1, "prepare_site"))
+        self.assertEqual((status, result["error"]), ("error", "RuntimeError: boom"))
+
+
 class TestTheClient(unittest.TestCase):
     def _response(self, payload):
         response = MagicMock()
