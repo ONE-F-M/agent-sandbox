@@ -1571,7 +1571,203 @@ def upload_videos(target_app, args):
             "criteria": sorted(videos), "deleted": _delete_videos(run_dir)}
 
 
-SPEC_TOOLS = {"write_spec": write_spec, "browser_snapshot": browser_snapshot, "trigger_job": trigger_job}
+# --- Testing Agent: seed test data through the controllers --------------------------------------
+# seed_docs inserts the documents the Testing Agent generates with frappe.get_doc(...).insert(), as Administrator, so they pass the
+# same controller validation as real data. A factory such as make_employee is called only when it is on the allowed list. Nothing
+# in a payload is ever evaluated: documents are plain data, and a factory is looked up by its dotted path only after that check.
+# seed_context tells the agent what a DocType needs before it writes the data. Both run inside Frappe, like trigger_job.
+SEED_FACTORIES_DEFAULT = ("one_fm.one_fm.tests.utils.make_employee",)
+_FACTORY_DOCTYPES = {"one_fm.one_fm.tests.utils.make_employee": "Employee"}
+SEED_MAX_DOCS = 50  # a fast command answers within 60 seconds, so large seed lists go in batches of this size
+SEED_MAX_DOCTYPES = 10
+SEED_TIMEOUT_SECONDS = 55
+SEED_MAX_BYTES = 200_000
+_DOCTYPE_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9 _/-]{0,139}\Z")
+_FACTORY_PATH = re.compile(r"\A[A-Za-z_]\w*(?:\.[A-Za-z_]\w*){1,8}\Z")
+
+# Data is data, but a document of one of these types would run code later (a script, a patch, a scheduled job).
+_SEED_SCRIPT_COMMON = """
+import json, os, frappe
+payload = json.loads(os.environ["SEED_PAYLOAD"])
+allowed = set(json.loads(os.environ["SEED_FACTORIES"]))
+hints = json.loads(os.environ["SEED_FACTORY_HINTS"])
+frappe.init(site=os.environ["SANDBOX_SITE"], sites_path=".")
+frappe.connect()
+"""
+
+_SEED_DOCS_SCRIPT = _SEED_SCRIPT_COMMON + """
+DENIED = {"Server Script", "Client Script", "Custom Script", "Patch Log", "Scheduled Job Type", "Console Log", "System Console"}
+results = []
+try:
+    frappe.set_user("Administrator")
+    for index, entry in enumerate(payload):
+        point = "seed_%d" % index
+        frappe.db.savepoint(point)
+        try:
+            if "factory" in entry:
+                path = entry["factory"]
+                if path not in allowed:
+                    raise Exception("factory %s is not on the sandbox's allowed list of test factories" % path)
+                made = frappe.get_attr(path)(**(entry.get("args") or {}))
+                name = made if isinstance(made, str) else getattr(made, "name", None)
+                results.append({"index": index, "factory": path, "name": name})
+            else:
+                if entry.get("doctype") in DENIED:
+                    raise Exception("documents of type %s are not seeded: they would run code" % entry.get("doctype"))
+                doc = frappe.get_doc(entry).insert()
+                results.append({"index": index, "doctype": doc.doctype, "name": doc.name})
+        except Exception as exc:
+            frappe.db.rollback(save_point=point)
+            results.append({"index": index, "doctype": entry.get("doctype"), "factory": entry.get("factory"), "error": str(exc)[:500]})
+    frappe.db.commit()
+finally:
+    frappe.destroy()
+print("SEED_JSON=" + json.dumps(results))
+"""
+
+_SEED_CONTEXT_SCRIPT = _SEED_SCRIPT_COMMON + """
+import inspect
+from frappe.test_runner import get_dependencies
+LAYOUT = {"Section Break", "Column Break", "Tab Break", "HTML", "Button", "Heading", "Image", "Fold"}
+order, seen, problems = [], set(), {}
+
+def visit(doctype):
+    if doctype in seen or len(seen) >= 60:
+        return
+    seen.add(doctype)
+    try:
+        for dependency in get_dependencies(doctype) or []:
+            visit(dependency)
+    except Exception as exc:
+        problems[doctype] = str(exc)[:200]
+    order.append(doctype)
+
+def describe(doctype):
+    meta = frappe.get_meta(doctype)
+    fields = [f for f in meta.fields if f.fieldtype not in LAYOUT]
+    try:
+        validate = getattr(frappe.get_controller(doctype), "validate", None)
+        source = inspect.getsource(validate)[:6000] if validate else ""
+    except Exception:
+        source = ""
+    return {
+        "required": [{"fieldname": f.fieldname, "fieldtype": f.fieldtype, "options": f.options} for f in fields if f.reqd],
+        "links": [{"fieldname": f.fieldname, "target": f.options} for f in fields if f.fieldtype == "Link"],
+        "tables": [{"fieldname": f.fieldname, "child": f.options} for f in fields if f.fieldtype in ("Table", "Table MultiSelect")],
+        "selects": {f.fieldname: [o for o in (f.options or "").split("\\n") if o] for f in fields if f.fieldtype == "Select"},
+        "mandatory_depends_on": {f.fieldname: f.mandatory_depends_on for f in fields if f.mandatory_depends_on},
+        "validate": source,
+        "factories": sorted(path for path in allowed if hints.get(path) == doctype),
+    }
+
+try:
+    for name in payload:
+        visit(name)
+    out = {}
+    for doctype in order:
+        try:
+            out[doctype] = describe(doctype)
+        except Exception as exc:
+            out[doctype] = {"error": str(exc)[:200]}
+finally:
+    frappe.destroy()
+print("SEED_JSON=" + json.dumps({"order": order, "doctypes": out, "problems": problems, "factories": sorted(allowed)}))
+"""
+
+
+def _seed_factories():
+    """The factories a seed list may call: the default list, or SEED_FACTORIES (a JSON list) where an operator sets it."""
+    try:
+        configured = json.loads(os.environ.get("SEED_FACTORIES", ""))
+        if isinstance(configured, list) and all(isinstance(p, str) and _FACTORY_PATH.match(p) for p in configured):
+            return set(configured)
+    except ValueError:
+        pass
+    return set(SEED_FACTORIES_DEFAULT)
+
+
+def _seed_run(script, payload):
+    """Run a seed script in the bench's Python. Returns (parsed result, error)."""
+    env = {**os.environ, "SANDBOX_SITE": SITE_NAME, "SEED_PAYLOAD": json.dumps(payload), "SEED_FACTORIES": json.dumps(sorted(_seed_factories())),
+           "SEED_FACTORY_HINTS": json.dumps(_FACTORY_DOCTYPES)}
+    run = _exec([f"{BENCH_DIR}/env/bin/python", "-c", script], env=env, cwd=f"{BENCH_DIR}/sites", timeout=SEED_TIMEOUT_SECONDS)
+    if run.returncode == 124:
+        return None, f"it did not finish within {SEED_TIMEOUT_SECONDS} seconds: send fewer documents per call"
+    line = next((l for l in (run.stdout or "").splitlines() if l.startswith("SEED_JSON=")), None)
+    if run.returncode != 0 or not line:
+        return None, f"the sandbox site could not run it: {_tail(run)}"
+    return json.loads(line[len("SEED_JSON="):]), None
+
+
+def _seed_ready(args):
+    """The run's marker when the head site is prepared and checked out, else an error answer."""
+    run_id = args.get("run_id")
+    error = _check_run_id(run_id)
+    if error:
+        return None, {"error": error}
+    marker = _load_prepared(run_id)
+    if not marker or "head_sha" not in marker:
+        return None, {"error": _NOT_PREPARED}
+    return marker, None
+
+
+def seed_docs(target_app, args):
+    """AC1-AC4: insert each document through its controller, in order, and report the name or the error for each. A document
+    that fails does not stop the ones after it, and nothing in the payload is evaluated."""
+    docs = args.get("docs")
+    error = _check_app(target_app)
+    if not error and (not isinstance(docs, list) or not docs or len(docs) > SEED_MAX_DOCS):
+        error = f"docs must be a list of 1 to {SEED_MAX_DOCS} documents: split larger lists into batches."
+    if not error:
+        for i, entry in enumerate(docs):
+            if not isinstance(entry, dict):
+                error = f"docs[{i}] must be an object."
+            elif ("factory" in entry) == ("doctype" in entry):
+                error = f"docs[{i}] must have either a doctype (a document) or a factory (a test factory), not both or neither."
+            elif "factory" in entry and (not isinstance(entry["factory"], str) or not _FACTORY_PATH.match(entry["factory"])
+                                         or not isinstance(entry.get("args", {}), dict)):
+                error = f"docs[{i}] names a factory that is not a dotted path, or its args are not an object."
+            elif "doctype" in entry and (not isinstance(entry["doctype"], str) or not _DOCTYPE_NAME.match(entry["doctype"])):
+                error = f"docs[{i}] has an invalid doctype name."
+            if error:
+                break
+    if not error:
+        try:
+            if len(json.dumps(docs)) > SEED_MAX_BYTES:
+                error = f"the documents are over {SEED_MAX_BYTES // 1000} KB: send fewer per call."
+        except (TypeError, ValueError):
+            error = "the documents must be plain JSON data."
+    if error:
+        return {"error": error}
+    _marker, not_ready = _seed_ready(args)
+    if not_ready:
+        return not_ready
+    results, error = _seed_run(_SEED_DOCS_SCRIPT, docs)
+    if error:
+        return {"error": f"seed_docs: {error}"}
+    failed = [r for r in results if r.get("error")]
+    return {"results": results, "inserted": len(results) - len(failed), "failed": len(failed)}
+
+
+def seed_context(target_app, args):
+    """AC5: what to know before seeding each DocType, dependencies first: required fields, Link targets, Select options,
+    mandatory_depends_on, the controller's validate source and the factories that make it."""
+    names = args.get("doctypes")
+    error = _check_app(target_app)
+    if not error and (not isinstance(names, list) or not names or len(names) > SEED_MAX_DOCTYPES
+                      or not all(isinstance(n, str) and _DOCTYPE_NAME.match(n) for n in names)):
+        error = f"doctypes must be a list of 1 to {SEED_MAX_DOCTYPES} DocType names."
+    if error:
+        return {"error": error}
+    _marker, not_ready = _seed_ready(args)
+    if not_ready:
+        return not_ready
+    context, error = _seed_run(_SEED_CONTEXT_SCRIPT, names)
+    return {"error": f"seed_context: {error}"} if error else context
+
+
+SPEC_TOOLS = {"write_spec": write_spec, "browser_snapshot": browser_snapshot, "trigger_job": trigger_job,
+              "seed_docs": seed_docs, "seed_context": seed_context}
 
 
 _TEST_FAILURE_LINE = re.compile(r"^(?:FAIL|ERROR): (.+)$", re.MULTILINE)
