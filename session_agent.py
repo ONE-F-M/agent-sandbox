@@ -129,6 +129,7 @@ class Session:
                 "tool": self._tool, "run_tests": self._run_tests, "finalize": self._finalize, "close": self._close,
                 "prepare_site": self._prepare_site, "checkout_pr_head": self._checkout_pr_head,
                 "run_specs": self._run_specs, "run_specs_on_base": self._run_specs_on_base,
+                "upload_videos": self._upload_videos,
             }[command["kind"]]
             status, result = handler(command, timings)
         except Exception as exc:  # noqa: BLE001 - reported to Processa as the command's result
@@ -177,6 +178,10 @@ class Session:
     def _run_specs(self, command, timings):
         with timings.span("run_specs"):
             return "ok", srv.run_specs(self.target_app, self._args(command))
+
+    def _upload_videos(self, command, timings):
+        with timings.span("upload_videos"):
+            return "ok", srv.upload_videos(self.target_app, self._args(command))
 
     def _run_specs_on_base(self, command, timings):
         with timings.span("run_specs_on_base"):

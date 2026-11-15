@@ -319,6 +319,7 @@ class TestingAgentCase(SessionCase):
                 json.dump(conf, fh)
         self.calls, self.broken, self.dump_bytes = [], set(), "-- dump\n"
         self.timeouts, self.report, self.npx_rc, self.restored, self.scheduled = {}, None, 0, None, {"processa.tasks.daily"}
+        self.gh_rc, self.gh_out = 0, "https://github.com/ONE-F-M/one_bpmn/pull/5#issuecomment-99\n"
         self.pinged, self.stopped, self.popen = [False, True], [], []
         self.session, self.client = self._session()
         self.base_sha = git(self.origin, "rev-parse", "staging")
@@ -360,6 +361,8 @@ class TestingAgentCase(SessionCase):
             return subprocess.run(args, cwd=cwd, capture_output=True, text=True)
         if args[0] in self.broken:
             return done("out-line", 1, f"{args[0]} blew up {env and env.get('TEST_PASSWORD')}")
+        if args[0] == "gh":
+            return done(self.gh_out, self.gh_rc, "gh refused" if self.gh_rc else "")
         if args[0] == "npx":
             out = env["SPEC_OUTPUT_DIR"]
             os.makedirs(out, exist_ok=True)
@@ -875,6 +878,19 @@ class TestSpecs(TestingAgentCase):
         self.assertEqual((marker["head_sha"], marker["built_assets"]), (self.pr_sha, False))
         self.assertEqual(open(os.path.join(self.snapshots, "run-1.pw")).read(), PASSWORD)
 
+    def test_running_the_base_does_not_delete_the_heads_output_or_results(self):
+        self.write()
+        self.report = pw_report(("ac1.spec.js", "AC1 @changed-behavior", "desktop", "expected", [("passed", None, None)]))
+        srv.run_specs("processa", {"run_id": "run-1"})
+        head_report = os.path.join(self.run_dir, "out-head", "report.json")
+        self.assertTrue(os.path.isfile(head_report))
+        self.assertEqual(json.load(open(os.path.join(self.run_dir, "results-head.json")))[0]["criterion"], "AC1")
+        self.pinged[:] = [False, True]
+        srv.run_specs_on_base("processa", {"run_id": "run-1"})
+        self.assertTrue(os.path.isfile(head_report))
+        self.assertTrue(os.path.isfile(os.path.join(self.run_dir, "out-base", "report.json")))
+        self.assertTrue(os.path.isfile(os.path.join(self.run_dir, "results-base.json")))
+
     def test_the_new_kinds_are_dispatched_and_nothing_is_ever_committed(self):
         with patch.object(srv, "run_specs", return_value={"status": "specs_run"}) as head, patch.object(srv, "run_specs_on_base", return_value={"status": "specs_run"}) as base:
             self.assertEqual(self.session.execute(self._command(1, "run_specs", "run_specs", args={"run_id": "r"}))[1]["status"], "specs_run")
@@ -884,6 +900,151 @@ class TestSpecs(TestingAgentCase):
         verbs = {a[1] for a, _ in self.calls if a[0] == "git"}
         self.assertFalse(verbs & {"commit", "push", "merge", "reset", "rebase", "tag"}, verbs)
 
+
+
+TOKEN = "ghp_" + "x" * 36  # built at run time: not a real credential, and no credential-shaped literal in the file
+
+
+class TestUploadVideos(TestingAgentCase):
+    """upload_videos with a fake GitHub: the repository lookup and upload calls are recorded, the files are real."""
+
+    def setUp(self):
+        super().setUp()
+        self.run_dir = os.path.join(self.root, "specs", "run-1")
+        self.http = []
+        self.replies = {}
+        patcher = patch.object(srv, "_http", side_effect=self._fake_http)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _fake_http(self, method, url, token, data=None, headers=None, timeout=300):
+        body = data.read() if hasattr(data, "read") else data
+        self.http.append({"method": method, "url": url, "token": token, "body": body, "headers": headers or {}})
+        for needle, reply in self.replies.items():
+            if needle in url:
+                return reply(len(self.http)) if callable(reply) else reply
+        if url.endswith("/repos/ONE-F-M/one_bpmn"):
+            return 200, {"id": 424242}
+        return 200, {"url": f"https://github.com/user-attachments/assets/{len(self.http)}"}
+
+    def make_videos(self, specs):
+        """specs: (criterion, viewport, bytes or None). Writes the video files and results-head.json."""
+        results = []
+        for i, (criterion, viewport, size) in enumerate(specs):
+            video = None
+            if size is not None:
+                folder = os.path.join(self.run_dir, "out-head", "artifacts", f"{criterion}-{viewport}-{i}")
+                os.makedirs(folder, exist_ok=True)
+                video = os.path.join(folder, "video.webm")
+                with open(video, "wb") as fh:
+                    fh.truncate(size) if size > 10_000 else fh.write(b"w" * size)
+            results.append({"criterion": criterion, "file": f"{criterion.lower()}.spec.js", "viewport": viewport, "status": "passed", "video": video})
+        os.makedirs(self.run_dir, exist_ok=True)
+        with open(os.path.join(self.run_dir, "results-head.json"), "w") as fh:
+            json.dump(results, fh)
+        return results
+
+    def upload(self, **over):
+        args = {"run_id": "run-1", "repository": "ONE-F-M/one_bpmn", "pr_number": 5, "token": TOKEN, **over}
+        return srv.upload_videos("processa", args)
+
+    def left(self):
+        return [os.path.join(r, f) for r, _d, fs in os.walk(self.run_dir) for f in fs if f.endswith(".webm")] if os.path.isdir(self.run_dir) else []
+
+    def test_one_video_per_criterion_is_uploaded_to_the_repository_and_the_urls_come_back(self):
+        self.make_videos([("AC1", "desktop", 500), ("AC1", "mobile", 600), ("AC2", "desktop", 700)])
+        result = self.upload()
+        self.assertEqual((result["status"], result["path"]), ("videos_uploaded", "upload_endpoint"))
+        self.assertEqual([u["criterion"] for u in result["uploads"]], ["AC1", "AC2"])
+        self.assertTrue(all(u["url"].startswith("https://github.com/user-attachments/assets/") for u in result["uploads"]))
+        lookup, first, second = self.http
+        self.assertEqual((lookup["method"], lookup["url"]), ("GET", "https://api.github.com/repos/ONE-F-M/one_bpmn"))
+        self.assertTrue(first["url"].startswith("https://uploads.github.com/user-attachments/assets?"))
+        for part in ("name=AC1.webm", "content_type=video%2Fwebm", "repository_id=424242"):
+            self.assertIn(part, first["url"])
+        self.assertEqual((first["body"], second["body"]), (b"w" * 500, b"w" * 700))  # the desktop video, not the mobile one
+        self.assertEqual(first["headers"]["Content-Type"], "application/octet-stream")
+
+    def test_the_local_videos_are_deleted_only_after_every_upload_worked(self):
+        self.make_videos([("AC1", "desktop", 500), ("AC2", "desktop", 700), ("AC2", "mobile", 800)])
+        self.assertEqual(len(self.left()), 3)
+        result = self.upload()
+        self.assertEqual((result["status"], result["deleted"]), ("videos_uploaded", 3))
+        self.assertEqual(self.left(), [])
+
+    def test_a_video_over_100_mb_or_a_failed_upload_is_reported_for_its_criterion_and_the_rest_continue(self):
+        self.make_videos([("AC1", "desktop", 101 * 1024 * 1024), ("AC2", "desktop", 500), ("AC3", "desktop", 600)])
+        self.replies["name=AC3"] = (500, {"message": f"boom {TOKEN}"})
+        result = self.upload()
+        self.assertEqual((result["status"], result["step"]), ("failed", "upload"))
+        self.assertEqual([u["criterion"] for u in result["uploads"]], ["AC2"])
+        errors = {e["criterion"]: e["error"] for e in result["errors"]}
+        self.assertIn("over the 100 MB limit", errors["AC1"])
+        self.assertIn("upload failed (500)", errors["AC3"])
+        self.assertNotIn(TOKEN, json.dumps(result))
+        self.assertEqual(len(self.left()), 3)  # nothing deleted: a retry still has every file
+        self.assertEqual(len([h for h in self.http if h["method"] == "POST"]), 2)  # the 101 MB one was never sent
+
+    def test_when_the_endpoint_refuses_the_token_the_machine_user_posts_the_whole_comment_with_gh(self):
+        self.make_videos([("AC1", "desktop", 500), ("AC2", "desktop", 700)])
+        self.replies["user-attachments"] = (404, {"message": "Not Found"})
+        result = self.upload(comment_body="Acceptance test: 1 of 2 criteria passed")
+        self.assertEqual((result["status"], result["path"]), ("videos_uploaded", "gh_pr_comment"))
+        self.assertEqual(result["comment_url"], "https://github.com/ONE-F-M/one_bpmn/pull/5#issuecomment-99")
+        args, env = next((a, e) for a, e in self.calls if a[0] == "gh")
+        self.assertEqual(args[:7], ["gh", "pr", "comment", "5", "--repo", "ONE-F-M/one_bpmn", "--body"])
+        self.assertEqual(args[7], "Acceptance test: 1 of 2 criteria passed")
+        self.assertEqual(args.count("--attach"), 2)
+        self.assertEqual(env["GH_TOKEN"], TOKEN)
+        self.assertNotIn(TOKEN, " ".join(args))
+        self.assertEqual(self.left(), [])
+
+    def test_a_refused_token_on_the_repository_lookup_also_takes_the_gh_path_and_a_gh_failure_is_a_failure(self):
+        self.make_videos([("AC1", "desktop", 500)])
+        self.replies["/repos/"] = (401, {"message": "Bad credentials"})
+        self.gh_rc = 1
+        result = self.upload()
+        self.assertEqual((result["status"], result["step"], result["path"]), ("failed", "fallback", "gh_pr_comment"))
+        self.assertNotIn(TOKEN, json.dumps(result))
+        self.assertEqual(len(self.left()), 1)  # nothing posted, nothing deleted
+        self.gh_rc, self.calls[:] = 0, []
+        self.assertEqual(self.upload()["path"], "gh_pr_comment")
+        self.assertEqual([h for h in self.http if h["method"] == "POST"], [])  # no upload is attempted once the lookup was refused
+
+    def test_a_lookup_failure_that_is_not_a_refusal_is_reported_and_nothing_is_posted(self):
+        self.make_videos([("AC1", "desktop", 500)])
+        self.replies["/repos/"] = (500, {"message": "oops"})
+        result = self.upload()
+        self.assertEqual((result["status"], result["step"]), ("failed", "repository"))
+        self.assertEqual([a for a, _ in self.calls if a[0] == "gh"], [])
+
+    def test_the_payload_is_validated_and_a_run_without_videos_is_refused(self):
+        self.make_videos([("AC1", "desktop", 500)])
+        for over in ({"run_id": "../x"}, {"repository": "evil/repo"}, {"repository": "ONE-F-M/a/b"}, {"repository": "ONE-F-M"}, {"pr_number": "x"},
+                     {"token": ""}, {"token": " spaced "}, {"token": None}):
+            self.assertEqual(self.upload(**over)["step"], "validate", over)
+        self.assertEqual(self.http, [])
+        self.assertEqual(srv.upload_videos("processa", {"run_id": "other", "repository": "ONE-F-M/one_bpmn", "pr_number": 5, "token": TOKEN})["step"], "no_videos")
+        self.make_videos([("AC1", "desktop", None)])
+        self.assertEqual(self.upload()["step"], "no_videos")
+
+    def test_the_token_is_never_in_an_argument_a_result_or_a_file(self):
+        self.make_videos([("AC1", "desktop", 500)])
+        result = self.upload()
+        self.assertNotIn(TOKEN, json.dumps(result))
+        for root, _d, files in os.walk(self.root):
+            for name in files:
+                if name.endswith((".json", ".js", ".sql", ".pw")):
+                    with open(os.path.join(root, name), errors="ignore") as fh:
+                        self.assertNotIn(TOKEN, fh.read(), name)
+
+    def test_the_session_dispatches_the_command_and_it_commits_nothing(self):
+        self.make_videos([("AC1", "desktop", 500)])
+        status, result = self.session.execute(self._command(9, "upload_videos", "upload_videos", args={"run_id": "run-1", "repository": "ONE-F-M/one_bpmn", "pr_number": 5, "token": TOKEN}))
+        self.assertEqual((status, result["status"]), ("ok", "videos_uploaded"))
+        self.assertNotIn(TOKEN, json.dumps(result) + json.dumps(self.client.sent))
+        verbs = {a[1] for a, _ in self.calls if a[0] == "git"}
+        self.assertFalse(verbs & {"commit", "push", "merge", "reset", "rebase", "tag"}, verbs)
 
 
 class TestTheClient(unittest.TestCase):
