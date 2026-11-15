@@ -392,7 +392,7 @@ class TestingAgentCase(SessionCase):
 class TestPrepareSite(TestingAgentCase):
     def test_the_payload_is_validated_before_anything_runs(self):
         bad = ({"run_id": "../x"}, {"run_id": "a/b"}, {"pr_number": "5; rm"}, {"pr_number": 0}, {"pr_number": True}, {"base_branch": "a..b"},
-               {"base_branch": "-x"}, {"roles": []}, {"roles": "Sales"}, {"roles": ["ok", "bad;role"]}, {"password": "short"},
+               {"base_branch": "-x"}, {"roles": []}, {"roles": 5}, {"roles": ["ok", "bad;role"]}, {"password": "short"},
                {"password": " padded-password "}, {"roles": ["A B", "A-B"]})
         for over in bad:
             status, result = self.prepare(**over)
@@ -645,6 +645,18 @@ class TestNoWritesToGit(TestingAgentCase):
         self.assertEqual((prep.call_args.args[0], head.call_args.args[0]), ("processa", "processa"))
         with patch.object(srv, "_tests_for_tree", return_value=(True, "", "", [])):
             self.assertEqual(self.session.execute(self._command(3, "run_tests", "run_tests", args={}))[1]["status"], "tests_passed")
+
+    def test_the_arguments_are_read_from_payload_args_as_processa_sends_them(self):
+        sent = {"args": {"run_id": "r", "pr_number": "5"}, "work_item_description": "Test it."}
+        with patch.object(srv, "checkout_pr_head", return_value={"status": "ready"}) as head:
+            self.session.execute({"seq": 1, "kind": "checkout_pr_head", "action": "checkout_pr_head", "payload": sent})
+        self.assertEqual(head.call_args.args[1], {"run_id": "r", "pr_number": "5"})
+
+    def test_roles_from_a_text_field_are_split_into_one_user_each(self):
+        _status, result = self.prepare(roles="Sales User\nHR Manager, Sales User\n")
+        self.assertEqual(result["status"], "prepared")
+        self.assertEqual([u["role"] for u in result["users"]], ["Sales User", "HR Manager", None])
+        self.assertEqual(self.prepare(roles=" , \n")[1]["step"], "validate")
 
     def test_an_exception_inside_a_new_command_is_still_an_error_result(self):
         with patch.object(srv, "prepare_site", side_effect=RuntimeError("boom")):
