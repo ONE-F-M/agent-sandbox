@@ -788,6 +788,136 @@ def _start_services():
     return None, f"the site did not answer /api/method/ping on port {SERVE_PORT}: {log_tail}"
 
 
+# --- Testing Agent: the mobile app as a web app against the sandbox site -----------------------
+# mobile_app_ionic is not a Frappe app, so its pull request is built with vite instead of `bench build`, pointed at the
+# sandbox site and served with `vite preview`. VITE_BASE_URL is the router's base PATH in that app
+# (createWebHistory(import.meta.env.VITE_BASE_URL)), which every .env file keeps as "/": it is not an address, and a
+# site URL there breaks every route, so only VITE_BASE_API_URL points at the sandbox.
+MOBILE_APP = "mobile_app_ionic"
+MOBILE_PORT = 8100
+MOBILE_URL = f"http://127.0.0.1:{MOBILE_PORT}"
+MOBILE_API_PREFIX = "/api/method/one_fm.api."
+_PRODUCTION_HOST = re.compile(rb"[\w:/.@-]*one-fm\.com[\w/.\-]*", re.I)
+# The only mentions of the production host that are allowed in a build: a link the app opens for a person to read, never one it
+# calls. DataUsePage.vue hard-codes the privacy policy address, so without this every build would fail. Add to it deliberately.
+_PRODUCTION_LINKS_ALLOWED = ("https://app.one-fm.com/privacy_policy",)
+_CONSENT_VERSION = re.compile(r"DATA_USE_POLICY_VERSION\s*=\s*[\"']([^\"']+)[\"']")
+
+
+def _http_ok(url, timeout=5):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return 200 <= response.status < 400
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def _write_sandbox_env(app_dir):
+    """.env.sandbox, copied from .env.staging (not .env.example, whose API prefix lacks the trailing dot) with the API
+    pointed at the sandbox site. Returns an error string, or None."""
+    try:
+        with open(os.path.join(app_dir, ".env.staging")) as fh:
+            lines = [l.rstrip("\n") for l in fh]
+    except OSError:
+        return ".env.staging is missing from the app, so there is nothing to build the sandbox environment from"
+    overrides = {"VITE_BASE_API_URL": f"http://127.0.0.1:{SERVE_PORT}", "VITE_API_PREFIX": MOBILE_API_PREFIX}
+    seen, out = set(), []
+    for line in lines:
+        key = line.split("=", 1)[0].strip()
+        if key in overrides and not line.lstrip().startswith("#"):
+            out.append(f"{key}={overrides[key]}")
+            seen.add(key)
+        else:
+            out.append(line)
+    out += [f"{k}={v}" for k, v in overrides.items() if k not in seen]
+    with open(os.path.join(app_dir, ".env.sandbox"), "w") as fh:
+        fh.write("\n".join(out) + "\n")
+    return None
+
+
+def _production_references(dist):
+    """(relative path, snippet) for every built file that mentions the production host."""
+    found = []
+    for root, _dirs, files in os.walk(dist):
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                continue
+            for match in _PRODUCTION_HOST.finditer(data):
+                mention = match.group(0).decode(errors="replace")
+                if not mention.lower().startswith(tuple(_PRODUCTION_LINKS_ALLOWED)):
+                    found.append((os.path.relpath(path, dist), mention))
+                    break
+    return found
+
+
+def _build_mobile(app_dir):
+    """Install, build with --mode sandbox, and refuse a build that mentions production. yarn.lock is put back whatever happens,
+    so the install never reaches the pull request. Returns None, or a failure result."""
+    try:
+        if _exec(["yarn", "check", "--integrity"], cwd=app_dir, timeout=300).returncode != 0:
+            install = _exec(["yarn", "install"], cwd=app_dir, timeout=1800)
+            if install.returncode != 0:
+                return _failed("install", "yarn install failed", build_tail=_tail(install))
+        if error := _write_sandbox_env(app_dir):
+            return _failed("env", error)
+        build = _exec(["yarn", "vite", "build", "--mode", "sandbox"], cwd=app_dir, timeout=1800)
+        if build.returncode != 0:
+            return _failed("build", "the mobile web build failed", build_tail=_tail(build))
+        dist = os.path.join(app_dir, "dist")
+        if not os.path.isdir(dist):
+            return _failed("build", "the build produced no dist folder", build_tail=_tail(build))
+        if found := _production_references(dist):
+            return _failed("production_url", f"{len(found)} built file(s) mention one-fm.com, so tests could reach production: "
+                           + "; ".join(f"{path} ({mention!r})" for path, mention in found[:5]), files=[path for path, _ in found][:20])
+        return None
+    finally:
+        _exec(["git", "checkout", "--", "yarn.lock"], cwd=app_dir)
+
+
+def _consent_version(app_dir):
+    """The data-use policy version the app is checked out at; the stored consent only counts when it equals this."""
+    try:
+        with open(os.path.join(app_dir, "src", "composable", "useDataUseConsent.js")) as fh:
+            found = _CONSENT_VERSION.search(fh.read())
+        return found.group(1) if found else None
+    except OSError:
+        return None
+
+
+def _start_preview(app_dir, state_file):
+    """vite preview on the mobile port, tracked beside the site's own processes so the next run stops it too."""
+    log_path = os.path.join(BENCH_DIR, "logs", "sandbox_preview.log")
+    with open(log_path, "ab") as log:
+        try:
+            proc = _spawn(["yarn", "vite", "preview", "--host", "127.0.0.1", "--port", str(MOBILE_PORT), "--strictPort"], cwd=app_dir,
+                          stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+        except OSError as exc:
+            return None, f"could not start vite preview: {exc}"
+    try:
+        with open(state_file) as fh:
+            pids = json.load(fh).get("pids", [])
+    except (OSError, ValueError):
+        pids = []
+    with open(state_file, "w") as fh:
+        json.dump({"pids": [*pids, proc.pid]}, fh)
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if not _pid_alive(proc.pid):
+            break
+        if _http_ok(MOBILE_URL + "/"):
+            return proc.pid, None
+        time.sleep(2)
+    _stop_services([proc.pid])
+    tail = ""
+    with contextlib.suppress(OSError), open(log_path, "rb") as fh:
+        tail = fh.read()[-800:].decode(errors="replace")
+    return None, f"the mobile preview did not answer on {MOBILE_URL}: {tail}"
+
+
 def checkout_pr_head(target_app, payload):
     """AC2-AC5: fetch refs/pull/<N>/head, check out that exact commit, rebuild assets only for frontend changes,
     migrate, and only then start serve + one worker and wait for /api/method/ping. Fetch and checkout only."""
@@ -820,24 +950,39 @@ def checkout_pr_head(target_app, payload):
     if diff.returncode != 0:
         return _failed("diff", "git diff of base against the pull request head failed", detail=_tail(diff, github_token))
     paths = [p for p in diff.stdout.splitlines() if p]
-    built = _frontend_changed(target_app, paths)
-    if built:
-        build = _exec(["bench", "build", "--app", target_app], cwd=BENCH_DIR, timeout=3600)
-        if build.returncode != 0:
-            return _failed("build", "bench build failed", build_tail=_tail(build), pr_head_sha=sha)
-
-    migrate = _exec(["bench", "--site", SITE_NAME, "migrate"], cwd=BENCH_DIR, timeout=1800)
-    if migrate.returncode != 0:
-        return _failed("migrate", "migration failed on the pull request head", migration_tail=_tail(migrate), pr_head_sha=sha)
+    mobile = target_app == MOBILE_APP
+    built = True if mobile else _frontend_changed(target_app, paths)
+    if mobile:  # a web app, not a Frappe app: nothing to bench build or migrate, so it is built with vite and served beside the site
+        if failure := _build_mobile(app_dir):
+            return {**failure, "pr_head_sha": sha}
+        cors = _exec(["bench", "--site", SITE_NAME, "set-config", "allow_cors", MOBILE_URL], cwd=BENCH_DIR, timeout=120)
+        if cors.returncode != 0:
+            return _failed("cors", "could not allow the preview origin on the sandbox site", detail=_tail(cors), pr_head_sha=sha)
+    else:
+        if built:
+            build = _exec(["bench", "build", "--app", target_app], cwd=BENCH_DIR, timeout=3600)
+            if build.returncode != 0:
+                return _failed("build", "bench build failed", build_tail=_tail(build), pr_head_sha=sha)
+        migrate = _exec(["bench", "--site", SITE_NAME, "migrate"], cwd=BENCH_DIR, timeout=1800)
+        if migrate.returncode != 0:
+            return _failed("migrate", "migration failed on the pull request head", migration_tail=_tail(migrate), pr_head_sha=sha)
 
     pids, error = _start_services()
     if error:
         return _failed("start_services", error, pr_head_sha=sha)
+    record = {**prepared, "head_sha": sha, "built_assets": built}
+    extra = {}
+    if mobile:
+        preview_pid, error = _start_preview(app_dir, os.path.join(BENCH_DIR, "logs", "sandbox_services.json"))
+        if error:
+            return _failed("start_preview", error, pr_head_sha=sha)
+        record["mobile"] = {"url": MOBILE_URL, "consent_version": _consent_version(app_dir)}
+        extra = {"mobile_url": MOBILE_URL, "preview_pid": preview_pid}
     with open(marker_path, "w") as fh:
-        json.dump({**prepared, "head_sha": sha, "built_assets": built}, fh)
+        json.dump(record, fh)
     return {"status": "ready", "run_id": run_id, "pr_number": number, "pr_head_sha": sha, "base_sha": prepared["base_sha"],
             "changed_files": len(paths), "built_assets": built, "port": SERVE_PORT, "serve_pid": pids[0], "worker_pid": pids[1],
-            "ping": "pong"}
+            "ping": "pong", **extra}
 
 
 # --- Testing Agent: writing and running Playwright specs ---------------------------------------
@@ -1030,8 +1175,12 @@ def _spec_env(run_id, run_dir, code="head"):
     pw_path = _snapshot_paths(run_id)[0][:-4] + ".pw"
     with open(pw_path) as fh:
         password = fh.read()
-    return {**os.environ, "SPEC_BASE_URL": f"http://127.0.0.1:{SERVE_PORT}", "SPEC_OUTPUT_DIR": os.path.join(run_dir, f"out-{code}"),
-            "TEST_PASSWORD": password}
+    env = {**os.environ, "SPEC_BASE_URL": f"http://127.0.0.1:{SERVE_PORT}", "SPEC_OUTPUT_DIR": os.path.join(run_dir, f"out-{code}"),
+           "TEST_PASSWORD": password}
+    mobile = (_load_prepared(run_id) or {}).get("mobile")
+    if mobile:  # the web build of the app is on its own port; specs open it with openApp() from mobile-helpers.js
+        env.update({"SPEC_MOBILE_URL": mobile["url"], "SPEC_MOBILE_CONSENT_VERSION": mobile.get("consent_version") or ""})
+    return env
 
 
 def _criterion(*texts):
@@ -1071,6 +1220,95 @@ def _parse_report(report):
     return results
 
 
+# Written into the run folder for mobile_app_ionic runs. The app keeps its session in localStorage (the pinia stores `user` and
+# `auth`, whose guard needs a user and a token) and its data-use consent as CapacitorStorage.data_use_consent, which only counts
+# when it equals the app's current policy version (read from the source at checkout, as SPEC_MOBILE_CONSENT_VERSION). To seed a
+# session it makes the app's own login call, so the stored user is exactly what the app would have stored; the password
+# comes from the caller and is never put in an error message.
+_MOBILE_HELPERS = """// mobile-helpers.js: written by the sandbox for mobile_app_ionic runs. Do not edit it; use it:
+//   const m = require('./mobile-helpers');
+//   await m.seedSession(page, { employeeId, password });  await m.openApp(page, '/home');
+const MOBILE = process.env.SPEC_MOBILE_URL;
+const API = process.env.SPEC_BASE_URL;
+
+// The app's own login call. No cookie jar is kept, because the app signs requests with the token only.
+async function apiLogin(employeeId, password) {
+  const res = await fetch(API + '/api/method/one_fm.api.v1.authentication.user_login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
+    body: new URLSearchParams({ employee_id: String(employeeId), password: String(password) }),
+  });
+  const body = await res.json().catch(() => ({}));
+  const data = body.data || (body.message && (body.message.data || body.message));
+  if (!res.ok || !data || !data.token) throw new Error('mobile login failed: HTTP ' + res.status);
+  return data;
+}
+
+// The data-use notice is shown until the stored consent equals the app's current policy version.
+async function allowDataUse(page) {
+  await page.addInitScript((version) => { if (version) localStorage.setItem('CapacitorStorage.data_use_consent', version); }, process.env.SPEC_MOBILE_CONSENT_VERSION || '');
+}
+
+// Put the user, the token and the consent in localStorage before the app loads, so it opens signed in on the home screen.
+// Give { employeeId, password } to log in through the API, or { user, token } to use a token you already have
+// (the Bearer token from user_login, or 'token <api_key>:<api_secret>').
+async function seedSession(page, who) {
+  const data = who.token && who.user ? { ...who.user, token: who.token } : await apiLogin(who.employeeId, who.password);
+  const user = { user: data, token: data.token, refreshToken: data.refresh_token || null, isEndpointEnabled: 1 };
+  const auth = { employeeId: data.employee_id || who.employeeId || null, isRegistered: true };
+  await page.addInitScript(([u, a]) => { localStorage.setItem('user', u); localStorage.setItem('auth', a); }, [JSON.stringify(user), JSON.stringify(auth)]);
+  await allowDataUse(page);
+  return data;
+}
+
+async function openApp(page, path) {
+  await page.goto(MOBILE + (path || '/'));
+  await page.waitForLoadState('networkidle');
+}
+
+module.exports = { apiLogin, allowDataUse, seedSession, openApp };
+"""
+
+# The one smoke spec: log in through the Employee ID screen and the password screen and reach the home screen. It skips, with its
+# reason, until a seeded employee is given in SPEC_MOBILE_EMPLOYEE_ID and SPEC_MOBILE_EMPLOYEE_PASSWORD.
+_MOBILE_SMOKE = """// mobile-smoke.spec.js: written by the sandbox for mobile_app_ionic runs.
+const { test, expect } = require('@playwright/test');
+const m = require('./mobile-helpers');
+
+test('Mobile smoke: the Employee ID and password screens lead to the home screen @ui @mobile-smoke', async ({ page }) => {
+  const id = process.env.SPEC_MOBILE_EMPLOYEE_ID, password = process.env.SPEC_MOBILE_EMPLOYEE_PASSWORD;
+  test.skip(!id || !password, 'no seeded employee: SPEC_MOBILE_EMPLOYEE_ID and SPEC_MOBILE_EMPLOYEE_PASSWORD are not set');
+  await m.allowDataUse(page);
+  await m.openApp(page, '/');
+  await page.locator('ion-input input').first().fill(id);
+  await page.getByRole('button', { name: /next/i }).click();
+  await page.locator('ion-input input[type="password"]').fill(password);
+  await page.getByRole('button', { name: /log ?in|sign in|submit/i }).click();
+  await expect(page).toHaveURL(/\\/home|\\/dashboard/, { timeout: 30000 });
+});
+"""
+
+_NATIVE_TAG = "@native-device"
+_TEST_TITLE = re.compile(r"""\btest(?:\.\w+)?\(\s*(?P<q>['"`])(?P<title>.*?)(?P=q)""")
+
+
+def _native_device_results(run_dir):
+    """A criterion that needs the camera, face enrollment, push or another native feature cannot be tested in a browser. Its
+    spec is tagged @native-device, is not run, and is reported as Could not test with the reason native_device."""
+    found = []
+    for name in sorted(os.listdir(run_dir)):
+        if not SPEC_FILE.match(name):
+            continue
+        with open(os.path.join(run_dir, name)) as fh:
+            text = fh.read()
+        for match in _TEST_TITLE.finditer(text):
+            if _NATIVE_TAG in match.group("title"):
+                found.append({"file": name, "criterion": _criterion(match.group("title"), name), "title": match.group("title"),
+                              "viewport": "mobile", "status": "could_not_test", "reason": "native_device", "failing_assertion": None,
+                              "duration_ms": 0, "video": None})
+    return found
+
+
 def _run_playwright(run_id, run_dir, extra_args, code="head"):
     """Run the run folder's specs. Returns (results, error). The head and the base each keep their own output folder and
     results file, so running the base never deletes the head's videos that upload_videos still has to send."""
@@ -1080,13 +1318,22 @@ def _run_playwright(run_id, run_dir, extra_args, code="head"):
         fh.write(_SPEC_CONFIG)
     with open(os.path.join(run_dir, "frappe-helpers.js"), "w") as fh:  # rewritten every run, so a spec cannot change it
         fh.write(_FRAPPE_HELPERS)
-    run = _exec(["npx", "playwright", "test", "--config", "playwright.config.js", *extra_args],
+    if (_load_prepared(run_id) or {}).get("mobile"):
+        for name, text in (("mobile-helpers.js", _MOBILE_HELPERS), ("mobile-smoke.spec.js", _MOBILE_SMOKE)):
+            with open(os.path.join(run_dir, name), "w") as fh:
+                fh.write(text)
+    native = _native_device_results(run_dir)
+    run = _exec(["npx", "playwright", "test", "--config", "playwright.config.js", "--grep-invert", _NATIVE_TAG, *extra_args],
                 env=_spec_env(run_id, run_dir, code), cwd=run_dir, timeout=SPEC_TIMEOUT_SECONDS)
     report_path = os.path.join(out, "report.json")
-    if run.returncode not in (0, 1) or not os.path.isfile(report_path):  # 1 only means some spec failed
+    if not os.path.isfile(report_path) and native and "No tests found" in f"{run.stdout}{run.stderr}":
+        results = []  # every spec was native-only, so nothing ran and there is nothing else to report
+    elif run.returncode not in (0, 1) or not os.path.isfile(report_path):  # 1 only means some spec failed
         return None, f"playwright did not produce a report (exit {run.returncode}): {_tail(run, _spec_env(run_id, run_dir)['TEST_PASSWORD'])}"
-    with open(report_path) as fh:
-        results = _parse_report(json.load(fh))
+    else:
+        with open(report_path) as fh:
+            results = _parse_report(json.load(fh))
+    results = results + native
     with open(os.path.join(run_dir, f"results-{code}.json"), "w") as fh:
         json.dump(results, fh)
     return results, None
