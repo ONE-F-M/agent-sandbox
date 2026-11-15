@@ -3,7 +3,7 @@
 # 02a_clone_public_apps.sh for why this is split into four files at all).
 #
 # This stage: the second half of the private ONE-F-M org apps (see
-# 02b_clone_onefm_apps_1.sh for why one_fm and one_bpmn specifically sit in
+# 02b_clone_onefm_apps_1.sh for why one_fm and processa specifically sit in
 # different stages).
 #
 # GITHUB_TOKEN required — these are private repos. The remote is rewritten
@@ -23,6 +23,6 @@ source /lib_pin_apps.sh
 source /lib_clone_functions.sh
 cd "$BENCH_PATH"
 
-clone_app one_bpmn https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/one_bpmn.git staging https://github.com/${GITHUB_ORG}/one_bpmn.git
+clone_app processa https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/one_bpmn.git staging https://github.com/${GITHUB_ORG}/one_bpmn.git
 clone_app onefm_mcp https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/onefm_mcp.git staging https://github.com/${GITHUB_ORG}/onefm_mcp.git
 clone_app frappe_agile https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/frappe_agile.git staging https://github.com/${GITHUB_ORG}/frappe_agile.git

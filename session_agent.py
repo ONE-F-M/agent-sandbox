@@ -21,7 +21,7 @@ import urllib.request
 
 import dev_agent_server as srv
 
-API = "/api/method/one_bpmn.api.sandbox_session"
+API = "/api/method/processa.api.sandbox_session"
 POLL_MIN_SECONDS = 0.3
 POLL_MAX_SECONDS = 2.0
 CHECKPOINT_SECONDS = 300

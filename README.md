@@ -1,6 +1,6 @@
 # agent-sandbox
 
-A disposable Cloud Run sandbox for the "Dev Agent" feature in `one_bpmn`
+A disposable Cloud Run sandbox for the "Dev Agent" feature in `processa`
 (Processa). It **is** the coding agent: given a work order, a model, a live
 API key, and a GitHub token — all supplied fresh in the request that
 dispatches it — it checks out the target app's branch, runs its own bounded
@@ -87,7 +87,7 @@ compromised sandbox should only ever expose what it strictly needs.
 2. **Resource owner**: `ONE-F-M`.
 3. **Repository access**: select only the private repos the 02a-02d clone stages
    actually clone: `one_fm`, `onefm_sso`, `one_fm_password_management` (repo name
-   `password_management`), `one_bpmn`, `onefm_mcp`, `frappe_agile`, `one_lms`,
+   `password_management`), `processa`, `onefm_mcp`, `frappe_agile`, `one_lms`,
    `mobile_app_ionic`.
 4. **Permissions → Repository permissions → Contents: Read-only.** Nothing else. This
    token only ever clones/fetches — it is never the one used to open a PR (see
@@ -340,8 +340,7 @@ The layers sit after the clone and requirements layers, so changing them never r
 | Fonts | `fonts-noto-core` and `fonts-noto-ui-core` (Noto Naskh, Kufi and Sans Arabic) |
 | Desk assets | `bench build --apps "${DESK_BUILD_APPS}"`, set by the `DESK_BUILD_APPS` build ARG. Helpdesk is deliberately not built (its build breaks, see `03_install_requirements.sh`) |
 
-`DESK_BUILD_APPS` is `frappe,erpnext,hrms,one_bpmn,one_fm`. When the app is renamed (WI-004405), change `one_bpmn` to
-`processa` there, and only there. To upgrade Playwright, change `PLAYWRIGHT_VERSION`; the Chromium build comes from the
+`DESK_BUILD_APPS` is `frappe,erpnext,hrms,processa,one_fm`. To upgrade Playwright, change `PLAYWRIGHT_VERSION`; the Chromium build comes from the
 same CLI, so the two cannot drift apart.
 
 **Checks.** `browser_smoke/verify_browser_env.sh` runs during the build and fails it if `gh`, the pinned Playwright, the
@@ -596,8 +595,8 @@ With it ticked, a Job that cannot start or does not answer makes the call fail (
   Only the tests that import a changed file (and any changed spec) run, so a failing test elsewhere in the repo does not
   decide the result, and a change no test covers passes with "No test files found". Before that, `yarn check --integrity`
   decides whether a `yarn install` is needed, and `yarn.lock` is restored afterwards so the install never reaches the pull request.
-- **`one_bpmn` Vue tests run with plain Node, for the files a change affects.** A change under `spiff/src/` runs
-  `node --test` in `spiff/` on: a changed `*.test.mjs`, the `.test.mjs` beside a changed source file, and any test that names
+- **`processa` Vue tests run with plain Node, for the files a change affects.** A change under `frontend/src/` runs
+  `node --test` in `frontend/` on: a changed `*.test.mjs`, the `.test.mjs` beside a changed source file, and any test that names
   the changed file's path. These tests read source text, so they need no installed packages. Only those files run, because the
   whole directory has a test that fails on its own, and a change no test covers still reports "no tests ran".
 - **`lms` is installed at its pinned commit, not the branch tip.** `clone_app` normally installs the branch tip and pins

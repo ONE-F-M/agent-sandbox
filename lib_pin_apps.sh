@@ -24,7 +24,8 @@ declare -A PINNED_SHA=(
     [one_fm_password_management]="38d67fe2fb6ad925cfa7bdc75215921bdbff2251"
     [one_fm]="c1f8e7e7c07027e82309c4fd5ce14c7a32886dcc"
     [onefm_sso]="26ba468fe4b5262844b5d87f89b24fb8424bc1a9"
-    [one_bpmn]="2dd3c7cdeaf3c8f86879810e40e551ab7cd4eec2"
+    # First commit with the processa package; re-capture once it is on staging.
+    [processa]="5e3a0f98140b65fa21433acaa81dc5e75322a370"
     [onefm_mcp]="f83812cd07bfa3e51966c4d2c5ef94fc9fff6b6a"
     [frappe_agile]="79ca4b3c4f4504aeb1589987b3f441d431727ae9"
     # Captured 2026-09-01, branch tip at the time these apps were first

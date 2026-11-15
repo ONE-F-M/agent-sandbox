@@ -8,7 +8,7 @@ arrives fresh in the POST /run body's "agent_config" (system_prompt, model,
 api_key) and "tools" (Anthropic-format schemas), resolved by Processa on
 every dispatch: agent_config from the "Dev Agent" AI Agent Configuration and
 its linked AI Model, tools from the shapes of the BPMN map's own
-"sandbox_tool_defs" ad-hoc sub-process (see one_bpmn's
+"sandbox_tool_defs" ad-hoc sub-process (see processa's
 agent_sandbox_ops.py::dispatch and api/compilation.py::_resolve_sandbox_tool_shapes).
 This process never invents behavior, a tool set, or a credential the caller
 didn't supply — only WHICH tools exist is decided elsewhere; EXECUTING each
@@ -109,7 +109,7 @@ REQUIRED_TOOL_FIELDS = ("name", "description", "input_schema")
 # Every tool name this process actually knows how to execute. The tool SET
 # itself is no longer fixed here — it arrives per-dispatch in payload["tools"],
 # defined as real shapes in the "sandbox_tool_defs" ad-hoc sub-process on the
-# Dev Agent BPMN map (see one_bpmn's api/compilation.py::_resolve_sandbox_tool_shapes
+# Dev Agent BPMN map (see processa's api/compilation.py::_resolve_sandbox_tool_shapes
 # and agent_sandbox_ops.py::dispatch). This set exists purely so a diagram
 # that names a tool this process has no implementation for fails the dispatch
 # loudly at validation time, rather than the model discovering it mid-loop as
@@ -560,7 +560,7 @@ def _run_tests(target_app, base_branch=None):
     # Custom Field — one_fm_project — that only exists as live, un-exported
     # data, not a fixture) — crashing every test run on a fresh site
     # regardless of what the actual change touches. Confirmed live: a real
-    # dispatch whose only change was adding a docstring to one_bpmn/utils.py
+    # dispatch whose only change was adding a docstring to processa/utils.py
     # still failed here. This is a workaround for that unrelated fixture
     # gap, not a fix for it — one_fm's own bug is untouched and would still
     # break a real Company/Warehouse creation anywhere else it happens.
@@ -581,9 +581,9 @@ def _run_tests(target_app, base_branch=None):
         out += result.stdout[-4000:]
         err += result.stderr[-4000:]
     if node_tests:
-        spiff_dir = f"{app_dir}/spiff"
+        frontend_dir = f"{app_dir}/frontend"
         node = ["node", "--test", *node_tests[:_MAX_TEST_MODULES]]
-        result = _run(f"cd {shlex.quote(spiff_dir)} && " + shlex.join(node), timeout=300)
+        result = _run(f"cd {shlex.quote(frontend_dir)} && " + shlex.join(node), timeout=300)
         passed = passed and result.returncode == 0
         out += result.stdout[-4000:]
         err += result.stderr[-4000:]
@@ -624,8 +624,8 @@ _NODE_TEST_SUFFIX = ".test.mjs"
 
 def _node_tests_for(app_dir, paths):
     """The Vue app's node tests for the changed files: a changed test, the test beside a changed file, or a test that names it."""
-    src = os.path.join(app_dir, "spiff", "src")
-    changed = [path[len("spiff/src/") :] for path in paths if path.startswith("spiff/src/")]
+    src = os.path.join(app_dir, "frontend", "src")
+    changed = [path[len("frontend/src/") :] for path in paths if path.startswith("frontend/src/")]
     if not changed or not os.path.isdir(src):
         return []
     tests = {}
@@ -1057,7 +1057,7 @@ def _tool_apply_edits(app_dir, args):
     return {"edited": True, "applied": len(edits), "paths": list(dict.fromkeys(paths))}
 
 
-# Confirmed live: one_bpmn alone (one target app, not the whole bench) already
+# Confirmed live: processa alone (one target app, not the whole bench) already
 # has 738 files under its own tree — a 500 cap silently truncated a real
 # listing, and the model never acted on the "truncated": true it was given,
 # spent its whole turn budget guessing narrower path_prefix values for a
@@ -1214,7 +1214,7 @@ _CHANGING_RESULT_KEYS = {"write_file": "written", "edit_file": "edited", "delete
 
 
 def _apply_tool(app_dir, target_app, action, args):
-    # search_frontend reports bench paths ("one_bpmn/spiff/..."); the app's own package keeps its "one_bpmn/..." paths.
+    # search_frontend reports bench paths ("processa/frontend/..."); the app's own package keeps its "processa/..." paths.
     prefix = f"{target_app}/"
     for key in ("path", "path_prefix"):
         value = args.get(key)
@@ -1352,7 +1352,7 @@ def _run_coding_loop(target_app, work_item_description, agent_config, tools, run
     turn — Processa has no other way to see what this loop actually cost,
     since it runs entirely outside Frappe), trace (one entry per turn —
     {role, content, tool_calls: [{name, arguments, result, status}], token/
-    latency fields — matching the shape one_bpmn's own step-driven loop
+    latency fields — matching the shape processa's own step-driven loop
     already produces, so Processa can turn each turn into a real AI Agent
     Step via record_ai_step() without any new shape to reconcile), started_at/
     ended_at (unix seconds).

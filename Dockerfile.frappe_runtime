@@ -23,7 +23,7 @@ RUN rm -rf /var/lib/apt/lists/* && apt-get clean && \
     pip cache purge || true
 
 # Install Node.js 20 (LTS) and npm — 18 is NOT enough: helpdesk's frontend
-# needs >=20.19.0, and apps/one_bpmn's own CLAUDE.md states 20.x as its
+# needs >=20.19.0, and apps/processa's own CLAUDE.md states 20.x as its
 # stack requirement. onefm-ai-agent's Dockerfile uses 18 safely only because
 # it never installs either of those two apps.
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
@@ -146,8 +146,7 @@ USER frappe
 # Desk bundles (AC2). The ARG is declared in the same stage, right above the RUN
 # that uses it, so it is in scope here without any shell state from an earlier layer.
 # helpdesk is deliberately not in the list (its build breaks — see 03_install_requirements.sh).
-# WI-004405 changes one_bpmn -> processa here, and only here.
-ARG DESK_BUILD_APPS=frappe,erpnext,hrms,one_bpmn,one_fm
+ARG DESK_BUILD_APPS=frappe,erpnext,hrms,processa,one_fm
 RUN cd /home/frappe/frappe-bench && bench build --apps "${DESK_BUILD_APPS}"
 
 COPY --chown=frappe:frappe browser_smoke/ /opt/playwright-smoke/
