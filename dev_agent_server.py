@@ -500,7 +500,7 @@ def _migrate_site():
     return result.returncode == 0, result.stdout[-2000:], result.stderr[-2000:]
 
 
-# --- WI-004005: Testing Agent site preparation and PR-head startup -----------------------------
+# --- Testing Agent: site preparation and PR-head startup ---------------------------------------
 # Two slow session commands (see session_agent.py). Everything below runs subprocesses as argument
 # lists, never shell strings, and only ever fetches and checks out: no commit, push or merge.
 SNAPSHOT_DIR = os.environ.get("SNAPSHOT_DIR", "/home/frappe/snapshots")

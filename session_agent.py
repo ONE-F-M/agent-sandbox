@@ -159,7 +159,7 @@ class Session:
             "commit": srv._head_commit(self.target_app),
         }
 
-    # Slow commands for the Testing Agent (WI-004005): the command is "ok" and the result's own status says how it went,
+    # Slow commands for the Testing Agent: the command is "ok" and the result's own status says how it went,
     # the same shape run_tests uses, so Processa's park/resume handles them like any other slow command.
     def _prepare_site(self, command, timings):
         with timings.span("prepare_site"):
