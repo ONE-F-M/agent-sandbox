@@ -22,12 +22,12 @@ declare -A PINNED_SHA=(
     [twilio_integration]="cb474c54d794c3a58a8c5287d387cf3d41e5ed0a"
     [lending]="c29f527c0e8ca7eaf95e8d3c74eb502404f2f1ff"
     [one_fm_password_management]="38d67fe2fb6ad925cfa7bdc75215921bdbff2251"
-    [one_fm]="c1f8e7e7c07027e82309c4fd5ce14c7a32886dcc"
+    [one_fm]="8e89ed19f15781ed346f938d27e826f0021c0183"
     [onefm_sso]="26ba468fe4b5262844b5d87f89b24fb8424bc1a9"
-    # First commit with the processa package; re-capture once it is on staging.
-    [processa]="5e3a0f98140b65fa21433acaa81dc5e75322a370"
-    [onefm_mcp]="f83812cd07bfa3e51966c4d2c5ef94fc9fff6b6a"
-    [frappe_agile]="79ca4b3c4f4504aeb1589987b3f441d431727ae9"
+    # processa, one_fm, onefm_mcp and frappe_agile: staging after processa-refactor merged (2026-11-15).
+    [processa]="04702c96e79bd89e932dbf6e52995e736613ae78"
+    [onefm_mcp]="d5ac51d3f6adb6bce6f3934b9bfee287d92a984f"
+    [frappe_agile]="a76ed5073ab3fcf6f800c88c35960b89a6ab3e4c"
     # Captured 2026-09-01, branch tip at the time these apps were first
     # added to the sandbox — not "what this bench was running" like the
     # others above, since none of them were ever installed here.
