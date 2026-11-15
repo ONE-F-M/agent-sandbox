@@ -320,6 +320,8 @@ class TestingAgentCase(SessionCase):
         self.calls, self.broken, self.dump_bytes = [], set(), "-- dump\n"
         self.timeouts, self.report, self.npx_rc, self.restored, self.scheduled = {}, None, 0, None, {"processa.tasks.daily"}
         self.gh_rc, self.gh_out = 0, "https://github.com/ONE-F-M/one_bpmn/pull/5#issuecomment-99\n"
+        self.yarn_check_rc, self.yarn_install_rc, self.vite_rc, self.npx_out = 1, 0, 0, ""
+        self.dist_text = "const api = 'http://127.0.0.1:8000'; const route = '/home';\n"
         self.pinged, self.stopped, self.popen = [False, True], [], []
         self.session, self.client = self._session()
         self.base_sha = git(self.origin, "rev-parse", "staging")
@@ -363,13 +365,27 @@ class TestingAgentCase(SessionCase):
             return done("out-line", 1, f"{args[0]} blew up {env and env.get('TEST_PASSWORD')}")
         if args[0] == "gh":
             return done(self.gh_out, self.gh_rc, "gh refused" if self.gh_rc else "")
+        if args[0] == "yarn":
+            if args[1] == "check":
+                return done("", self.yarn_check_rc)
+            if args[1] == "install":
+                with open(os.path.join(cwd, "yarn.lock"), "a") as fh:
+                    fh.write("changed by yarn install\n")
+                return done("", self.yarn_install_rc, "install failed" if self.yarn_install_rc else "")
+            if args[1:3] == ["vite", "build"]:
+                if self.vite_rc:
+                    return done("", self.vite_rc, "build failed")
+                os.makedirs(os.path.join(cwd, "dist", "assets"), exist_ok=True)
+                with open(os.path.join(cwd, "dist", "assets", "app.js"), "w") as fh:
+                    fh.write(self.dist_text)
+                return done("built")
         if args[0] == "npx":
             out = env["SPEC_OUTPUT_DIR"]
             os.makedirs(out, exist_ok=True)
             if self.report is not None:
                 with open(os.path.join(out, "report.json"), "w") as fh:
                     json.dump(self.report, fh)
-            return done("", self.npx_rc)
+            return done(self.npx_out, self.npx_rc)
         if args[0] == "mysql":
             self.restored = stdin.read()
             return done()
@@ -1112,6 +1128,251 @@ class TestUploadVideos(TestingAgentCase):
         self.assertNotIn(TOKEN, json.dumps(result) + json.dumps(self.client.sent))
         verbs = {a[1] for a, _ in self.calls if a[0] == "git"}
         self.assertFalse(verbs & {"commit", "push", "merge", "reset", "rebase", "tag"}, verbs)
+
+
+class TestMobileWebBuild(TestingAgentCase):
+    """mobile_app_ionic: built with vite against the sandbox site, served with vite preview, no bench build or migrate."""
+
+    STAGING_ENV = ("VITE_BASE_API_URL=https://staging.one-fm.com\nVITE_API_PREFIX=/api/method/one_fm.api.\nVITE_BASE_URL=/\n\n"
+                   "VITE_FIREBASE_PROJECT_ID=one-fm-70641\nVITE_FIREBASE_AUTH_DOMAIN=one-fm-70641.firebaseapp.com\n")
+
+    def setUp(self):
+        super().setUp()
+        origin, seed = os.path.join(self.root, "mobile_origin.git"), os.path.join(self.root, "mobile_seed")
+        os.makedirs(seed)
+        git(self.root, "init", "-q", "--bare", origin)
+        git(seed, "init", "-q", "-b", "staging")
+        for name, text in ((".env.staging", self.STAGING_ENV), ("yarn.lock", "committed lock\n"), ("package.json", "{}\n"),
+                           ("src/composable/useDataUseConsent.js", 'export const DATA_USE_POLICY_VERSION = "2026-10-22";\n'), ("src/App.vue", "a\n")):
+            path = os.path.join(seed, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as fh:
+                fh.write(text)
+        git(seed, "add", "-A")
+        git(seed, "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-q", "-m", "seed")
+        git(seed, "push", "-q", origin, "staging")
+        self.mobile_dir = os.path.join(self.bench, "apps", "mobile_app_ionic")
+        git(self.root, "clone", "-q", origin, self.mobile_dir)
+        with open(os.path.join(seed, "src/App.vue"), "w") as fh:
+            fh.write("changed\n")
+        git(seed, "-c", "user.email=a@b", "-c", "user.name=t", "commit", "-q", "-am", "pr")
+        git(seed, "push", "-q", origin, "HEAD:refs/pull/5/head")
+        self.m_pr_sha = git(seed, "rev-parse", "HEAD")
+        self.http_ok = True
+        patcher = patch.object(srv, "_http_ok", side_effect=lambda url, timeout=5: self.http_ok)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.run_dir = os.path.join(self.root, "specs", "run-m")
+
+    def prepare_mobile(self):
+        payload = {"base_branch": "staging", "pr_number": 5, "run_id": "run-m", "roles": ["Sales User"], "password": PASSWORD}
+        return srv.prepare_site("mobile_app_ionic", payload)
+
+    def head(self):
+        self.pinged[:] = [False, True]
+        return srv.checkout_pr_head("mobile_app_ionic", {"run_id": "run-m", "pr_number": 5})
+
+    def ready(self):
+        self.assertEqual(self.prepare_mobile()["status"], "prepared")
+        self.calls.clear()
+        self.popen.clear()
+        return self.head()
+
+    def lock(self):
+        return open(os.path.join(self.mobile_dir, "yarn.lock")).read()
+
+    def test_it_builds_with_the_sandbox_env_from_staging_and_serves_with_vite_preview_and_runs_no_bench_build_or_migrate(self):
+        result = self.ready()
+        self.assertEqual((result["status"], result["mobile_url"], result["pr_head_sha"]), ("ready", "http://127.0.0.1:8100", self.m_pr_sha))
+        env = dict(l.split("=", 1) for l in open(os.path.join(self.mobile_dir, ".env.sandbox")).read().splitlines() if "=" in l)
+        self.assertEqual(env["VITE_BASE_API_URL"], "http://127.0.0.1:8000")
+        self.assertEqual(env["VITE_API_PREFIX"], "/api/method/one_fm.api.")  # with the trailing dot, as .env.staging has it
+        self.assertEqual(env["VITE_BASE_URL"], "/")  # the router's base path: a site address here would break every route
+        self.assertEqual((env["VITE_FIREBASE_PROJECT_ID"], env["VITE_FIREBASE_AUTH_DOMAIN"]), ("one-fm-70641", "one-fm-70641.firebaseapp.com"))
+        self.assertNotIn("staging.one-fm.com", open(os.path.join(self.mobile_dir, ".env.sandbox")).read())
+        self.assertEqual(self.argv("yarn", "vite", "build"), [["yarn", "vite", "build", "--mode", "sandbox"]])
+        preview = [a for a, _ in self.popen if a[:3] == ["yarn", "vite", "preview"]]
+        self.assertEqual(preview, [["yarn", "vite", "preview", "--host", "127.0.0.1", "--port", "8100", "--strictPort"]])
+        self.assertEqual((self.argv("bench", "build"), self.argv("bench", "--site", "sandbox", "migrate")), ([], []))
+        self.assertEqual(git(self.mobile_dir, "rev-parse", "HEAD"), self.m_pr_sha)
+
+    def test_the_preview_is_tracked_with_the_sites_processes_and_the_marker_records_the_app_and_its_consent_version(self):
+        result = self.ready()
+        self.assertEqual(result["preview_pid"], 4003)
+        with open(os.path.join(self.bench, "logs", "sandbox_services.json")) as fh:
+            self.assertEqual(json.load(fh), {"pids": [4001, 4002, 4003]})
+        marker = json.load(open(os.path.join(self.snapshots, "run-m.json")))
+        self.assertEqual(marker["mobile"], {"url": "http://127.0.0.1:8100", "consent_version": "2026-10-22"})
+
+    def test_the_preview_origin_is_allowed_by_the_site_before_the_preview_starts(self):
+        self.ready()
+        self.assertEqual(self.argv("bench", "--site", "sandbox", "set-config", "allow_cors"), [["bench", "--site", "sandbox", "set-config", "allow_cors", "http://127.0.0.1:8100"]])
+        self.prepare_mobile()
+        self.calls.clear()
+        self.popen.clear()
+        self.broken.add("set-config")
+        result = self.head()
+        self.assertEqual((result["status"], result["step"]), ("failed", "cors"))
+        self.assertEqual([a for a, _ in self.popen if a[:3] == ["yarn", "vite", "preview"]], [])
+
+    def test_a_build_that_mentions_production_fails_and_nothing_is_served(self):
+        for text in ("fetch('https://one-fm.com/api')", "const u = 'https://staging.one-fm.com'", "x = 'HTTPS://ONE-FM.COM'"):
+            self.dist_text = text
+            self.assertEqual(self.prepare_mobile()["status"], "prepared")
+            self.popen.clear()
+            result = self.head()
+            self.assertEqual((result["status"], result["step"]), ("failed", "production_url"), text)
+            self.assertIn("assets/app.js", json.dumps(result))
+            self.assertEqual(self.popen, [])  # not even the site was started
+
+    def test_the_privacy_policy_link_the_app_opens_is_allowed_but_any_other_mention_of_the_host_is_not(self):
+        self.dist_text = "const PRIVACY_POLICY_URL = 'https://app.one-fm.com/privacy_policy/';"
+        self.assertEqual(self.ready()["status"], "ready")  # DataUsePage.vue hard-codes this, so every real build contains it
+        for text in ("fetch('https://app.one-fm.com/api/method/x')", "const m = 'support@one-fm.com'",
+                     "const a = 'https://app.one-fm.com/privacy_policy/'; const b = 'https://one-fm.com'"):
+            self.dist_text = text
+            self.assertEqual(self.prepare_mobile()["status"], "prepared")
+            self.popen.clear()
+            result = self.head()
+            self.assertEqual((result["status"], result["step"]), ("failed", "production_url"), text)
+            self.assertEqual(self.popen, [])
+
+    def test_a_firebase_domain_is_not_mistaken_for_production(self):
+        self.dist_text = "const d = 'one-fm-70641.firebaseapp.com'; const s = 'mobile.one-fm-70641.example'"
+        self.assertEqual(self.ready()["status"], "ready")
+
+    def test_yarn_lock_is_put_back_whether_the_build_works_or_not(self):
+        self.prepare_mobile()
+        self.assertEqual(self.head()["status"], "ready")
+        self.assertEqual(self.lock(), "committed lock\n")  # yarn install appended to it; it was restored
+        self.assertEqual(git(self.mobile_dir, "status", "--short", "--", "yarn.lock"), "")
+        for attr, value, step in (("vite_rc", 1, "build"), ("yarn_install_rc", 1, "install")):
+            self.prepare_mobile()
+            setattr(self, attr, value)
+            result = self.head()
+            self.assertEqual((result["status"], result["step"]), ("failed", step))
+            self.assertEqual(self.lock(), "committed lock\n")
+            self.vite_rc = self.yarn_install_rc = 0
+
+    def test_a_preview_that_never_answers_is_stopped_and_reported(self):
+        self.prepare_mobile()
+        self.http_ok = False
+        result = self.head()
+        self.assertEqual((result["status"], result["step"]), ("failed", "start_preview"))
+        self.assertIn(4003, self.stopped[-1])
+
+    def test_a_missing_staging_env_is_reported_rather_than_building_with_the_wrong_one(self):
+        empty = os.path.join(self.root, "no_env_app")
+        os.makedirs(empty)
+        self.assertIn(".env.staging is missing", srv._write_sandbox_env(empty))
+        self.assertFalse(os.path.exists(os.path.join(empty, ".env.sandbox")))  # nothing is written to build with
+        self.prepare_mobile()  # checks the base out, which is where .env.staging comes from
+        self.assertIsNone(srv._write_sandbox_env(self.mobile_dir))
+
+    def _specs(self):
+        self.ready()
+        srv.write_spec("mobile_app_ionic", {"run_id": "run-m", "file": "ac1.spec.js", "content": "test('AC1 shows the home screen', async () => {});\n"})
+        self.report = pw_report(("ac1.spec.js", "AC1 shows the home screen", "desktop", "expected", [("passed", None, None)]))
+
+    def test_mobile_helpers_and_the_smoke_spec_exist_only_for_a_mobile_run_and_the_specs_get_the_apps_address_and_consent_version(self):
+        self._specs()
+        srv.run_specs("mobile_app_ionic", {"run_id": "run-m"})
+        for name in ("mobile-helpers.js", "mobile-smoke.spec.js", "frappe-helpers.js"):
+            self.assertTrue(os.path.isfile(os.path.join(self.run_dir, name)), name)
+        env = next(e for a, e in self.calls if a[0] == "npx")
+        self.assertEqual((env["SPEC_MOBILE_URL"], env["SPEC_MOBILE_CONSENT_VERSION"], env["SPEC_BASE_URL"]), ("http://127.0.0.1:8100", "2026-10-22", "http://127.0.0.1:8000"))
+        self.assertNotIn(PASSWORD, " ".join(next(a for a, _ in self.calls if a[0] == "npx")))
+
+    def test_a_frappe_apps_run_gets_no_mobile_files_or_variables(self):
+        self.prepare()
+        self.checkout()
+        self.write(name="ac1.spec.js") if hasattr(self, "write") else srv.write_spec("processa", {"run_id": "run-1", "file": "ac1.spec.js", "content": "test('AC1', async () => {});\n"})
+        self.report = pw_report(("ac1.spec.js", "AC1", "desktop", "expected", [("passed", None, None)]))
+        srv.run_specs("processa", {"run_id": "run-1"})
+        run_dir = os.path.join(self.root, "specs", "run-1")
+        self.assertFalse(os.path.exists(os.path.join(run_dir, "mobile-helpers.js")) or os.path.exists(os.path.join(run_dir, "mobile-smoke.spec.js")))
+        self.assertNotIn("SPEC_MOBILE_URL", next(e for a, e in self.calls if a[0] == "npx"))
+
+    def _node(self, script, env=None):
+        import shutil as _sh
+        if not _sh.which("node"):
+            self.skipTest("node is not installed here")
+        os.makedirs(self.run_dir, exist_ok=True)
+        with open(os.path.join(self.run_dir, "mobile-helpers.js"), "w") as fh:
+            fh.write(srv._MOBILE_HELPERS)
+        return subprocess.run(["node", "-e", script], cwd=self.run_dir, capture_output=True, text=True,
+                              env={**os.environ, "SPEC_MOBILE_URL": "http://127.0.0.1:8100", "SPEC_BASE_URL": "http://127.0.0.1:8000",
+                                   "SPEC_MOBILE_CONSENT_VERSION": "2026-10-22", **(env or {})})
+
+    STUB = """
+        const m = require('./mobile-helpers'); const seen = { init: [], fetch: [] };
+        globalThis.fetch = async (url, o) => { seen.fetch.push([url, String(o.body), o.method]);
+          const ok = process.env.LOGIN_OK !== '0';
+          return { ok, status: ok ? 200 : 401, json: async () => ({ data: { token: 'Bearer abc', refresh_token: 'r1', employee_id: 'E1', enrolled: 1 } }) }; };
+        const page = { addInitScript: async (fn, arg) => { const store = {}; globalThis.localStorage = { setItem: (k, v) => { store[k] = v; } }; fn(arg); seen.init.push(store); },
+          goto: async (u) => seen.goto = u, waitForLoadState: async () => {} };
+    """
+
+    def test_a_seeded_session_has_the_user_the_token_and_the_consent_the_app_looks_for(self):
+        run = self._node(self.STUB + "(async () => { await m.seedSession(page, { employeeId: 'E1', password: 'pw-1234567' }); console.log(JSON.stringify(seen)); })();")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        seen = json.loads(run.stdout)
+        self.assertEqual(seen["fetch"][0][0], "http://127.0.0.1:8000/api/method/one_fm.api.v1.authentication.user_login")
+        self.assertEqual(seen["fetch"][0][1:], ["employee_id=E1&password=pw-1234567", "POST"])
+        stores = {k: v for store in seen["init"] for k, v in store.items()}
+        user, auth = json.loads(stores["user"]), json.loads(stores["auth"])
+        self.assertEqual((user["token"], user["refreshToken"], user["user"]["employee_id"]), ("Bearer abc", "r1", "E1"))
+        self.assertTrue(user["user"] and user["token"])  # the app's guard: authenticated means a user and a token
+        self.assertEqual((auth["employeeId"], auth["isRegistered"]), ("E1", True))
+        self.assertEqual(stores["CapacitorStorage.data_use_consent"], "2026-10-22")  # the current policy version, not a made-up value
+
+    def test_a_token_you_already_have_skips_the_login_call_and_a_refused_login_never_shows_the_password(self):
+        run = self._node(self.STUB + "(async () => { await m.seedSession(page, { user: { employee_id: 'E9' }, token: 'token k:s' }); console.log(JSON.stringify(seen)); })();")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        seen = json.loads(run.stdout)
+        self.assertEqual(seen["fetch"], [])
+        self.assertEqual(json.loads(next(s["user"] for s in seen["init"] if "user" in s))["token"], "token k:s")
+        refused = self._node(self.STUB + "m.seedSession(page, { employeeId: 'E1', password: 'pw-1234567' }).catch((e) => { console.error(e.message); process.exit(3); });", {"LOGIN_OK": "0"})
+        self.assertEqual(refused.returncode, 3)
+        self.assertIn("HTTP 401", refused.stderr)
+        self.assertNotIn("pw-1234567", refused.stderr + refused.stdout)
+
+    def test_the_helper_and_the_smoke_spec_are_valid_javascript_and_the_smoke_spec_skips_without_an_employee(self):
+        import shutil as _sh
+        if not _sh.which("node"):
+            self.skipTest("node is not installed here")
+        os.makedirs(self.run_dir, exist_ok=True)
+        for name, text in (("mobile-helpers.js", srv._MOBILE_HELPERS), ("mobile-smoke.spec.js", srv._MOBILE_SMOKE)):
+            with open(os.path.join(self.run_dir, name), "w") as fh:
+                fh.write(text)
+            self.assertEqual(subprocess.run(["node", "--check", name], cwd=self.run_dir, capture_output=True, text=True).returncode, 0, name)
+        self.assertIn("test.skip(!id || !password", srv._MOBILE_SMOKE)
+        self.assertIn("@ui", srv._MOBILE_SMOKE)  # it also runs at the phone size
+
+    def test_a_criterion_that_needs_a_native_feature_is_could_not_test_with_the_reason_native_device_and_is_never_run(self):
+        self.prepare()
+        self.checkout()
+        srv.write_spec("processa", {"run_id": "run-1", "file": "ac1.spec.js", "content": "test('AC1 shows the list', async () => {});\n"})
+        srv.write_spec("processa", {"run_id": "run-1", "file": "ac2.spec.js", "content": "test.fixme('AC2 enrols a face with the camera @native-device', async () => {});\n"})
+        self.report = pw_report(("ac1.spec.js", "AC1 shows the list", "desktop", "expected", [("passed", None, None)]))
+        result = srv.run_specs("processa", {"run_id": "run-1"})
+        npx = next(a for a, _ in self.calls if a[0] == "npx")
+        self.assertEqual(npx[npx.index("--grep-invert") + 1], "@native-device")
+        native = [r for r in result["results"] if r["status"] == "could_not_test"]
+        self.assertEqual(len(native), 1)
+        self.assertEqual((native[0]["criterion"], native[0]["reason"], native[0]["file"], native[0]["video"]), ("AC2", "native_device", "ac2.spec.js", None))
+        self.assertEqual(result["summary"], {"passed": 1, "could_not_test": 1})
+        self.assertEqual(json.load(open(os.path.join(self.root, "specs", "run-1", "results-head.json")))[-1]["reason"], "native_device")
+
+    def test_a_run_of_only_native_specs_reports_them_instead_of_failing_on_no_tests_found(self):
+        self.prepare()
+        self.checkout()
+        srv.write_spec("processa", {"run_id": "run-1", "file": "ac1.spec.js", "content": "test('AC1 sends a push @native-device', async () => {});\n"})
+        self.report, self.npx_rc, self.npx_out = None, 1, "Error: No tests found"
+        result = srv.run_specs("processa", {"run_id": "run-1"})
+        self.assertEqual((result["status"], result["summary"]), ("specs_run", {"could_not_test": 1}))
+        self.assertEqual(result["results"][0]["reason"], "native_device")
+
 
 
 class TestTheClient(unittest.TestCase):
