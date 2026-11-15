@@ -891,6 +891,73 @@ class TestSpecs(TestingAgentCase):
         self.assertTrue(os.path.isfile(os.path.join(self.run_dir, "out-base", "report.json")))
         self.assertTrue(os.path.isfile(os.path.join(self.run_dir, "results-base.json")))
 
+    def _node(self, script, env=None):
+        import shutil as _sh
+        if not _sh.which("node"):
+            self.skipTest("node is not installed here")
+        os.makedirs(self.run_dir, exist_ok=True)
+        with open(os.path.join(self.run_dir, "frappe-helpers.js"), "w") as fh:
+            fh.write(srv._FRAPPE_HELPERS)
+        return subprocess.run(["node", "-e", script], cwd=self.run_dir, capture_output=True, text=True,
+                              env={**os.environ, "SPEC_BASE_URL": "http://127.0.0.1:8000", "TEST_PASSWORD": PASSWORD, **(env or {})})
+
+    STUB_PAGE = """
+        const h = require('./frappe-helpers'); const calls = [];
+        const loc = (sel) => ({ first() { return this; }, filter(o) { calls.push(['filter', o.hasText]); return this; },
+          async fill(v) { calls.push(['fill', sel, v]); }, async blur() { calls.push(['blur']); }, async click() { calls.push(['click', sel]); },
+          async pressSequentially(t) { calls.push(['type', t]); }, async waitFor() { calls.push(['waitFor', sel]); } });
+        const status = Number(process.env.LOGIN_STATUS || 200);
+        const page = { request: { post: async (url, o) => { calls.push(['post', url, o.form]); return { ok: () => status === 200, status: () => status }; } },
+          goto: async (u) => calls.push(['goto', u]), waitForFunction: async () => calls.push(['idle']), locator: (sel) => loc(sel),
+          evaluate: async () => calls.push(['blur-active']) };
+    """
+
+    def test_the_frappe_helper_file_is_written_into_every_run_folder_and_cannot_be_replaced_by_a_spec(self):
+        self.write()
+        self.report = pw_report(("ac1.spec.js", "AC1", "desktop", "expected", [("passed", None, None)]))
+        srv.run_specs("processa", {"run_id": "run-1"})
+        helper = os.path.join(self.run_dir, "frappe-helpers.js")
+        self.assertEqual(open(helper).read(), srv._FRAPPE_HELPERS)
+        with open(helper, "w") as fh:
+            fh.write("tampered")
+        self.pinged[:] = [False, True]
+        srv.run_specs_on_base("processa", {"run_id": "run-1"})
+        self.assertEqual(open(helper).read(), srv._FRAPPE_HELPERS)  # rewritten for the base run too
+        self.assertIn("error", self.write(name="frappe-helpers.js"))  # not a .spec file, so write_spec refuses it
+
+    def test_the_helper_is_valid_javascript_that_loads_without_playwright_and_exports_the_documented_functions(self):
+        run = self._node("const h = require('./frappe-helpers'); console.log(Object.keys(h).sort().join(','))")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.strip(), "field,fillField,fillLink,loginAs,openForm,openList,saveForm,waitForDialog,waitForFrappeIdle")
+
+    def test_login_posts_to_the_api_with_the_password_from_the_environment_and_a_refusal_never_shows_it(self):
+        run = self._node(self.STUB_PAGE + "(async () => { await h.loginAs(page, 'a@b.test'); console.log(JSON.stringify(calls)); })();")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout)[0], ["post", "http://127.0.0.1:8000/api/method/login", {"usr": "a@b.test", "pwd": PASSWORD}])
+        refused = self._node(self.STUB_PAGE + "h.loginAs(page, 'a@b.test').catch((e) => { console.error(e.message); process.exit(3); });", {"LOGIN_STATUS": "401"})
+        self.assertEqual(refused.returncode, 3)
+        self.assertIn("HTTP 401", refused.stderr)
+        self.assertNotIn(PASSWORD, refused.stderr + refused.stdout)
+
+    def test_the_helpers_wait_blur_and_open_dropdowns_in_the_order_frappe_needs(self):
+        script = self.STUB_PAGE + """(async () => {
+            await h.openForm(page, 'Work Item'); await h.openForm(page, 'Work Item', 'WI 1'); await h.openList(page, 'Work Item');
+            calls.length = 0;
+            await h.fillField(page, 'title', 'x'); const afterField = calls.map((c) => c[0]).join(' ');
+            calls.length = 0; await h.fillLink(page, 'epic', 'WI-1'); const afterLink = calls.map((c) => c[0]).join(' ');
+            calls.length = 0; await h.saveForm(page); const afterSave = calls.map((c) => c.join(':')).join(' ');
+            console.log(JSON.stringify({ afterField, afterLink, afterSave }));
+        })();"""
+        run = self._node(script)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        seen = json.loads(run.stdout)
+        self.assertEqual(seen["afterField"], "fill blur idle")  # fill, blur the field, then wait for Frappe
+        self.assertEqual(seen["afterLink"], "click type filter waitFor click idle")  # type, wait for the dropdown, pick, settle
+        self.assertTrue(seen["afterSave"].startswith("blur-active idle click:.page-actions .primary-action:visible"), seen["afterSave"])
+        urls = self._node(self.STUB_PAGE + """(async () => { await h.openForm(page, 'Work Item'); await h.openForm(page, 'Work Item', 'WI 1');
+            await h.openList(page, 'Work Item'); console.log(JSON.stringify(calls.filter((c) => c[0] === 'goto').map((c) => c[1]))); })();""")
+        self.assertEqual(json.loads(urls.stdout), ["/app/work-item/new", "/app/work-item/WI%201", "/app/work-item"])
+
     def test_the_new_kinds_are_dispatched_and_nothing_is_ever_committed(self):
         with patch.object(srv, "run_specs", return_value={"status": "specs_run"}) as head, patch.object(srv, "run_specs_on_base", return_value={"status": "specs_run"}) as base:
             self.assertEqual(self.session.execute(self._command(1, "run_specs", "run_specs", args={"run_id": "r"}))[1]["status"], "specs_run")
