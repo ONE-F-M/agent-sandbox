@@ -45,6 +45,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -514,10 +515,11 @@ _PASSWORD_MAX = 128
 _FRONTEND_DIRS = {"processa": ("frontend/",)}
 
 
-def _exec(args, env=None, cwd=None, timeout=None):
+def _exec(args, env=None, cwd=None, timeout=None, stdin=None):
     """Run an argument list (no shell). A hung or missing command reads as a failed one, like _run."""
     try:
-        return subprocess.run(args, capture_output=True, text=True, env=env, cwd=cwd, timeout=timeout)
+        extra = {"stdin": stdin} if stdin is not None else {}
+        return subprocess.run(args, capture_output=True, text=True, env=env, cwd=cwd, timeout=timeout, **extra)
     except subprocess.TimeoutExpired as exc:
         err = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
         return subprocess.CompletedProcess(args, 124, "", f"{err}\ntimed out after {exc.timeout:.0f}s".strip())
@@ -698,7 +700,11 @@ def prepare_site(target_app, payload):
     size = os.path.getsize(sql_path)
     with open(marker_path, "w") as fh:
         json.dump({"run_id": run_id, "base_branch": base_branch, "base_sha": base_sha, "pr_number": int(payload["pr_number"]),
-                   "target_app": target_app, "snapshot": sql_path}, fh)
+                   "target_app": target_app, "snapshot": sql_path,
+                   "users": [{"email": u["email"], "role": u["role"]} for u in created]}, fh)
+    # The spec steps log in as these users. The file is for this container only, owner-read, and never logged or returned.
+    with os.fdopen(os.open(sql_path[:-4] + ".pw", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
+        fh.write(password)
     return {"status": "prepared", "run_id": run_id, "base_branch": base_branch, "base_sha": base_sha, "users": created,
             "mute_emails": True, "snapshot_path": sql_path, "snapshot_bytes": size}
 
@@ -827,9 +833,299 @@ def checkout_pr_head(target_app, payload):
     pids, error = _start_services()
     if error:
         return _failed("start_services", error, pr_head_sha=sha)
+    with open(marker_path, "w") as fh:
+        json.dump({**prepared, "head_sha": sha, "built_assets": built}, fh)
     return {"status": "ready", "run_id": run_id, "pr_number": number, "pr_head_sha": sha, "base_sha": prepared["base_sha"],
             "changed_files": len(paths), "built_assets": built, "port": SERVE_PORT, "serve_pid": pids[0], "worker_pid": pids[1],
             "ping": "pong"}
+
+
+# --- Testing Agent: writing and running Playwright specs ---------------------------------------
+# Specs live outside every app checkout, so the file tools' commit-and-push never sees them, and nothing here touches git
+# except checking the base commit out. Videos stay in the container until upload_videos removes them.
+SPECS_DIR = os.environ.get("SPECS_DIR", "/home/frappe/specs")
+SPEC_FILE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,80}\.spec\.(?:js|mjs|ts)\Z")
+SPEC_MAX_BYTES = 100_000
+SPEC_TIMEOUT_SECONDS = 1800
+SNAPSHOT_TIMEOUT_SECONDS = 60
+_RESULT_MAX_CHARS = 900_000  # a command result is capped at 1 MB
+_NOT_PREPARED = "prepare the site first: run prepare_site, then checkout_pr_head, for this run"
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_METHOD = re.compile(r"\A[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+\Z")
+
+# Written by the sandbox, not by the model, so a spec file cannot weaken it. Every spec runs in Chromium with a 1280x720
+# webm; specs tagged @ui also run at 390x844. A spec that fails and then passes on the one rerun is reported "flaky".
+_SPEC_CONFIG = """const { defineConfig } = require('@playwright/test');
+const out = process.env.SPEC_OUTPUT_DIR;
+module.exports = defineConfig({
+  testDir: __dirname, outputDir: out + '/artifacts', reporter: [['json', { outputFile: out + '/report.json' }]],
+  workers: 1, retries: 1, timeout: 60000,
+  use: { baseURL: process.env.SPEC_BASE_URL, trace: 'off', launchOptions: { args: ['--no-sandbox', '--disable-dev-shm-usage'] } },
+  projects: [
+    { name: 'desktop', use: { viewport: { width: 1280, height: 720 }, video: { mode: 'on', size: { width: 1280, height: 720 } } } },
+    { name: 'mobile', grep: /@ui/, use: { viewport: { width: 390, height: 844 }, video: { mode: 'on', size: { width: 390, height: 844 } } } },
+  ],
+});
+"""
+
+# Logs in with POST /api/method/login (as frappe's own Playwright helpers do) and returns the page's accessibility snapshot
+# and a screenshot. The user and password come from the environment, never from argv.
+_SNAPSHOT_SCRIPT = """const { chromium } = require('@playwright/test');
+(async () => {
+  const base = process.env.SPEC_BASE_URL;
+  const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  try {
+    const context = await browser.newContext({ baseURL: base, viewport: { width: 1280, height: 720 } });
+    const login = await context.request.post(base + '/api/method/login', { form: { usr: process.env.SNAP_USER, pwd: process.env.SNAP_PASSWORD } });
+    if (!login.ok()) throw new Error('login failed: ' + login.status());
+    const page = await context.newPage();
+    page.setDefaultTimeout(45000);
+    await page.goto(process.env.SNAP_URL);
+    await page.waitForFunction(() => !window.frappe || !frappe.request || frappe.request.ajax_count === 0).catch(() => {});
+    const snapshot = await page.locator('body').ariaSnapshot();
+    const shot = await page.screenshot({ type: 'jpeg', quality: 60 });
+    process.stdout.write('SNAPSHOT_JSON=' + JSON.stringify({ snapshot: snapshot.slice(0, 200000), screenshot_base64: shot.toString('base64') }));
+  } finally { await browser.close(); }
+})().catch((e) => { console.error(String(e).slice(0, 500)); process.exit(2); });
+"""
+
+# Runs inside the bench virtualenv. Refuses before running anything unless the method is one of the target app's own
+# scheduled methods.
+_TRIGGER_SCRIPT = """
+import json, os, frappe
+frappe.init(site=os.environ["SANDBOX_SITE"], sites_path=".")
+frappe.connect()
+try:
+    events = frappe.get_hooks("scheduler_events", app_name=os.environ["JOB_APP"]) or {}
+    allowed = set()
+    for value in events.values():
+        for item in (value.values() if isinstance(value, dict) else [value]):
+            allowed.update(item if isinstance(item, (list, tuple)) else [item])
+    method = os.environ["JOB_METHOD"]
+    if method not in allowed:
+        print("JOB_JSON=" + json.dumps({"refused": True}))
+    else:
+        frappe.set_user("Administrator")
+        frappe.get_attr(method)()
+        frappe.db.commit()
+        print("JOB_JSON=" + json.dumps({"ran": True}))
+finally:
+    frappe.destroy()
+"""
+
+
+def _spec_run_dir(run_id):
+    root = os.path.realpath(SPECS_DIR)
+    path = os.path.realpath(os.path.join(root, run_id))
+    if os.path.dirname(path) != root:
+        raise ValueError("spec folder escapes the specs directory")
+    return path
+
+
+def write_spec(target_app, args):
+    """AC1: write one spec under /home/frappe/specs/<run>/. Never in an app checkout, so never committed or pushed."""
+    run_id, name, content = args.get("run_id"), args.get("file"), args.get("content")
+    error = _check_run_id(run_id)
+    if error:
+        return {"error": error}
+    if not isinstance(name, str) or not SPEC_FILE.match(name):
+        return {"error": f"file {name!r} must be a plain file name ending in .spec.js, .spec.mjs or .spec.ts."}
+    if not isinstance(content, str) or not content.strip() or len(content.encode()) > SPEC_MAX_BYTES:
+        return {"error": f"content must be non-empty text of at most {SPEC_MAX_BYTES} bytes."}
+    run_dir = _spec_run_dir(run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, name), "w") as fh:
+        fh.write(content)
+    return {"written": f"{run_id}/{name}", "bytes": len(content.encode())}
+
+
+def _load_prepared(run_id):
+    """The run's marker, or None when prepare_site has not run for it."""
+    try:
+        sql_path, marker_path = _snapshot_paths(run_id)
+        with open(marker_path) as fh:
+            marker = json.load(fh)
+        return marker if os.path.getsize(sql_path) > 0 else None
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _spec_env(run_id, run_dir):
+    pw_path = _snapshot_paths(run_id)[0][:-4] + ".pw"
+    with open(pw_path) as fh:
+        password = fh.read()
+    return {**os.environ, "SPEC_BASE_URL": f"http://127.0.0.1:{SERVE_PORT}", "SPEC_OUTPUT_DIR": os.path.join(run_dir, "out"),
+            "TEST_PASSWORD": password}
+
+
+def _criterion(*texts):
+    for text in texts:
+        found = re.search(r"\bAC\s*-?(\d+)\b", text or "", re.I)
+        if found:
+            return f"AC{found.group(1)}"
+    return None
+
+
+_TEST_STATUS = {"expected": "passed", "unexpected": "failed", "flaky": "flaky", "skipped": "skipped"}
+
+
+def _parse_report(report):
+    """One entry per spec and viewport: file, criterion id, status, failing assertion, duration and video path."""
+    results = []
+
+    def walk(suite, file):
+        file = suite.get("file") or file
+        for spec in suite.get("specs", []):
+            for test in spec.get("tests", []):
+                runs = test.get("results") or []
+                failing = next((r.get("error", {}).get("message") for r in runs if r.get("error")), None)
+                video = next((a.get("path") for r in reversed(runs) for a in r.get("attachments", []) if a.get("name") == "video"), None)
+                results.append({
+                    "file": spec.get("file") or file, "criterion": _criterion(spec.get("title"), spec.get("file") or file),
+                    "title": spec.get("title"), "viewport": "mobile" if test.get("projectName") == "mobile" else "desktop",
+                    "status": _TEST_STATUS.get(test.get("status"), "failed"),
+                    "failing_assertion": _ANSI.sub("", failing).strip()[:500] if failing else None,
+                    "duration_ms": int(sum(r.get("duration", 0) for r in runs)), "video": video,
+                })
+        for child in suite.get("suites", []):
+            walk(child, file)
+
+    for suite in report.get("suites", []):
+        walk(suite, None)
+    return results
+
+
+def _run_playwright(run_id, run_dir, extra_args):
+    """Run the run folder's specs. Returns (results, error)."""
+    out = os.path.join(run_dir, "out")
+    shutil.rmtree(out, ignore_errors=True)
+    with open(os.path.join(run_dir, "playwright.config.js"), "w") as fh:
+        fh.write(_SPEC_CONFIG)
+    run = _exec(["npx", "playwright", "test", "--config", "playwright.config.js", *extra_args],
+                env=_spec_env(run_id, run_dir), cwd=run_dir, timeout=SPEC_TIMEOUT_SECONDS)
+    report_path = os.path.join(out, "report.json")
+    if run.returncode not in (0, 1) or not os.path.isfile(report_path):  # 1 only means some spec failed
+        return None, f"playwright did not produce a report (exit {run.returncode}): {_tail(run, _spec_env(run_id, run_dir)['TEST_PASSWORD'])}"
+    with open(report_path) as fh:
+        return _parse_report(json.load(fh)), None
+
+
+def _spec_summary(results):
+    counts = {}
+    for entry in results:
+        counts[entry["status"]] = counts.get(entry["status"], 0) + 1
+    return counts
+
+
+def _spec_result(run_id, results, **extra):
+    body = {"status": "specs_run", "run_id": run_id, "results": results, "summary": _spec_summary(results), **extra}
+    if len(json.dumps(body)) > _RESULT_MAX_CHARS:
+        body["results"] = [{**r, "failing_assertion": (r["failing_assertion"] or "")[:100] or None} for r in results]
+    return body
+
+
+def run_specs(target_app, args):
+    """AC2, AC4, AC7: run the run folder's specs against the PR head site."""
+    run_id = args.get("run_id")
+    error = _check_run_id(run_id) or _check_app(target_app)
+    if error:
+        return _failed("validate", error)
+    if not _load_prepared(run_id) or not _ping():  # also covers a head site that was never started
+        return _failed("not_prepared", _NOT_PREPARED)
+    run_dir = _spec_run_dir(run_id)
+    if not (os.path.isdir(run_dir) and any(SPEC_FILE.match(f) for f in os.listdir(run_dir))):
+        return _failed("no_specs", "no specs were written for this run: call write_spec first")
+    results, error = _run_playwright(run_id, run_dir, [])
+    if error:
+        return _failed("run", error)
+    return _spec_result(run_id, results, code="head")
+
+
+def run_specs_on_base(target_app, args):
+    """AC3: restore the snapshot, check the base code out, restart the server, run only the changed-behavior specs."""
+    run_id = args.get("run_id")
+    error = _check_run_id(run_id) or _check_app(target_app)
+    if error:
+        return _failed("validate", error)
+    marker = _load_prepared(run_id)
+    if not marker or "head_sha" not in marker:
+        return _failed("not_prepared", _NOT_PREPARED)
+    run_dir = _spec_run_dir(run_id)
+    app_dir = f"{BENCH_DIR}/apps/{target_app}"
+    state_file = os.path.join(BENCH_DIR, "logs", "sandbox_services.json")
+    try:
+        with open(state_file) as fh:
+            _stop_services([p for p in json.load(fh).get("pids", []) if isinstance(p, int) and _pid_alive(p)])
+        db_name, db_password, db_host, db_port = _site_db_credentials()
+        with open(marker["snapshot"]) as dump:
+            restore = _exec(["mysql", "-h", db_host, "-P", db_port, "-u", db_name, db_name], env={**os.environ, "MYSQL_PWD": db_password},
+                            timeout=1800, stdin=dump)
+    except (OSError, ValueError, RuntimeError) as exc:
+        return _failed("restore", f"{type(exc).__name__}: {exc}")
+    if restore.returncode != 0:
+        return _failed("restore", "restoring the snapshot failed", detail=_tail(restore, db_password))
+    checkout = _exec(["git", "checkout", "-f", "--detach", marker["base_sha"]], cwd=app_dir)
+    if checkout.returncode != 0 or _exec(["git", "rev-parse", "HEAD"], cwd=app_dir).stdout.strip() != marker["base_sha"]:
+        return _failed("checkout_base", f"git checkout of {marker['base_sha']} failed", detail=_tail(checkout))
+    if marker.get("built_assets"):  # the head's bundle is still on disk; rebuild so the base is tested as itself
+        build = _exec(["bench", "build", "--app", target_app], cwd=BENCH_DIR, timeout=3600)
+        if build.returncode != 0:
+            return _failed("build", "bench build failed on the base", build_tail=_tail(build))
+    _pids, error = _start_services()
+    if error:
+        return _failed("start_services", error)
+    results, error = _run_playwright(run_id, run_dir, ["--grep", "@changed-behavior"])
+    if error:
+        return _failed("run", error)
+    return _spec_result(run_id, results, code="base", base_sha=marker["base_sha"])
+
+
+def browser_snapshot(target_app, args):
+    """AC5: the accessibility snapshot and a screenshot of a page, as a role's test user, within 60 seconds."""
+    run_id, url, role = args.get("run_id"), args.get("url"), args.get("role")
+    error = _check_run_id(run_id)
+    if error:
+        return {"error": error}
+    marker = _load_prepared(run_id)
+    if not marker or not _ping():
+        return {"error": _NOT_PREPARED}
+    base = f"http://127.0.0.1:{SERVE_PORT}"
+    if not isinstance(url, str) or not (url.startswith("/") and not url.startswith("//") or url.startswith(base + "/")):
+        return {"error": f"url must be a path on the test site (starting with /) or start with {base}/."}
+    user = next((u["email"] for u in marker.get("users", []) if u.get("role") == role), None)
+    if not user:
+        return {"error": f"role {role!r} has no test user for this run."}
+    script_path = os.path.join(_spec_run_dir(run_id), "_snapshot.js")
+    os.makedirs(os.path.dirname(script_path), exist_ok=True)
+    with open(script_path, "w") as fh:
+        fh.write(_SNAPSHOT_SCRIPT)
+    env = _spec_env(run_id, os.path.dirname(script_path))
+    env.update({"SNAP_USER": user, "SNAP_PASSWORD": env["TEST_PASSWORD"], "SNAP_URL": url})
+    run = _exec(["node", script_path], env=env, cwd=os.path.dirname(script_path), timeout=SNAPSHOT_TIMEOUT_SECONDS)
+    line = next((l for l in (run.stdout or "").splitlines() if l.startswith("SNAPSHOT_JSON=")), None) if run.returncode == 0 else None
+    if not line:
+        return {"error": f"the page could not be captured (exit {run.returncode}): {_tail(run, env['TEST_PASSWORD'])}"}
+    return {"url": url, "role": role, **json.loads(line[len("SNAPSHOT_JSON="):])}
+
+
+def trigger_job(target_app, args):
+    """AC6: run one of the target app's scheduled methods, and refuse any method not in its scheduler_events."""
+    method = args.get("method")
+    error = _check_app(target_app)
+    if error or not isinstance(method, str) or not _METHOD.match(method):
+        return {"error": error or f"method {method!r} is not a dotted method path."}
+    env = {**os.environ, "SANDBOX_SITE": SITE_NAME, "JOB_APP": target_app, "JOB_METHOD": method}
+    run = _exec([f"{BENCH_DIR}/env/bin/python", "-c", _TRIGGER_SCRIPT], env=env, cwd=f"{BENCH_DIR}/sites", timeout=600)
+    line = next((l for l in (run.stdout or "").splitlines() if l.startswith("JOB_JSON=")), None)
+    if run.returncode != 0 or not line:
+        return {"error": f"the job could not be run: {_tail(run)}"}
+    outcome = json.loads(line[len("JOB_JSON="):])
+    if outcome.get("refused"):
+        return {"error": f"{method} is not in {target_app}'s scheduler_events, so it is refused."}
+    return {"ran": method}
+
+
+SPEC_TOOLS = {"write_spec": write_spec, "browser_snapshot": browser_snapshot, "trigger_job": trigger_job}
 
 
 _TEST_FAILURE_LINE = re.compile(r"^(?:FAIL|ERROR): (.+)$", re.MULTILINE)

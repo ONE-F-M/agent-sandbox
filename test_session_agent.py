@@ -308,7 +308,7 @@ class TestingAgentCase(SessionCase):
     def setUp(self):
         super().setUp()
         self.snapshots = os.path.join(self.root, "snapshots")
-        for target, value in (("SNAPSHOT_DIR", self.snapshots), ("READY_TIMEOUT_SECONDS", 4)):
+        for target, value in (("SNAPSHOT_DIR", self.snapshots), ("SPECS_DIR", os.path.join(self.root, "specs")), ("READY_TIMEOUT_SECONDS", 4)):
             patcher = patch.object(srv, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -318,6 +318,7 @@ class TestingAgentCase(SessionCase):
             with open(os.path.join(sites, path), "w") as fh:
                 json.dump(conf, fh)
         self.calls, self.broken, self.dump_bytes = [], set(), "-- dump\n"
+        self.timeouts, self.report, self.npx_rc, self.restored, self.scheduled = {}, None, 0, None, {"processa.tasks.daily"}
         self.pinged, self.stopped, self.popen = [False, True], [], []
         self.session, self.client = self._session()
         self.base_sha = git(self.origin, "rev-parse", "staging")
@@ -351,11 +352,29 @@ class TestingAgentCase(SessionCase):
         git(self.pr, "push", "-q", "-f", "origin", "HEAD:refs/pull/5/head")
         self.pr_sha = git(self.pr, "rev-parse", "HEAD")
 
-    def _fake_exec(self, args, env=None, cwd=None, timeout=None):
+    def _fake_exec(self, args, env=None, cwd=None, timeout=None, stdin=None):
         self.calls.append((list(args), dict(env or {})))
+        self.timeouts[args[0]] = timeout
         done = lambda out="", rc=0, err="": subprocess.CompletedProcess(args, rc, out, err)
         if args[0] == "git":
             return subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+        if args[0] in self.broken:
+            return done("out-line", 1, f"{args[0]} blew up {env and env.get('TEST_PASSWORD')}")
+        if args[0] == "npx":
+            out = env["SPEC_OUTPUT_DIR"]
+            os.makedirs(out, exist_ok=True)
+            if self.report is not None:
+                with open(os.path.join(out, "report.json"), "w") as fh:
+                    json.dump(self.report, fh)
+            return done("", self.npx_rc)
+        if args[0] == "mysql":
+            self.restored = stdin.read()
+            return done()
+        if args[0] == "node":
+            return done("noise\nSNAPSHOT_JSON=" + json.dumps({"snapshot": "- heading 'Home'", "screenshot_base64": "abc"}))
+        if args[0].endswith("python") and "JOB_METHOD" in (env or {}):
+            ok = env["JOB_METHOD"] in self.scheduled
+            return done("JOB_JSON=" + json.dumps({"ran": True} if ok else {"refused": True}))
         if args[0].endswith("python"):
             key = "users"
         elif args[0] == "mysqldump":
@@ -489,7 +508,7 @@ class TestPrepareSite(TestingAgentCase):
         self.dump_bytes = "-- other\n"
         self.prepare(run_id="run-2")
         self.assertEqual(open(os.path.join(self.snapshots, "run-1.sql")).read(), first)
-        self.assertEqual(sorted(os.listdir(self.snapshots)), ["run-1.json", "run-1.sql", "run-2.json", "run-2.sql"])
+        self.assertEqual(sorted(os.listdir(self.snapshots)), ["run-1.json", "run-1.pw", "run-1.sql", "run-2.json", "run-2.pw", "run-2.sql"])
         self.prepare()  # same run again: the same emails, so the script updates rather than inserts
         plans = [json.loads(e["SANDBOX_TEST_USERS"]) for a, e in self.calls if a[0].endswith("python")]
         self.assertEqual([plans[0], plans[2]], [srv._user_plan("run-1", ["Sales User", "HR Manager"])] * 2)
@@ -662,6 +681,209 @@ class TestNoWritesToGit(TestingAgentCase):
         with patch.object(srv, "prepare_site", side_effect=RuntimeError("boom")):
             status, result = self.session.execute(self._command(1, "prepare_site"))
         self.assertEqual((status, result["error"]), ("error", "RuntimeError: boom"))
+
+
+def pw_report(*specs):
+    """A Playwright JSON report. Each spec is (file, title, project, status, [(result status, error, video)])."""
+    suites = []
+    for file, title, project, status, results in specs:
+        runs = [{"status": st, "duration": 500, "error": {"message": f"\x1b[31m{err}\x1b[0m\nmore"} if err else None,
+                 "attachments": [{"name": "video", "path": video}] if video else []} for st, err, video in results]
+        runs = [{k: v for k, v in r.items() if v} | {"duration": 500} for r in runs]
+        suites.append({"file": file, "suites": [], "specs": [{"title": title, "file": file, "tests": [
+            {"projectName": project, "status": status, "results": runs}]}]})
+    return {"suites": suites}
+
+
+class TestSpecs(TestingAgentCase):
+    def setUp(self):
+        super().setUp()
+        self.prepare()
+        self.checkout()
+        self.calls.clear()
+        self.run_dir = os.path.join(self.root, "specs", "run-1")
+
+    def write(self, name="ac1.spec.js", run_id="run-1", content="test('x', async () => {});\n"):
+        return srv.write_spec("processa", {"run_id": run_id, "file": name, "content": content})
+
+    def test_write_spec_writes_under_the_run_folder_and_never_touches_the_checkout_or_git(self):
+        head, remote = git(self.app, "rev-parse", "HEAD"), git(self.origin, "rev-parse", "staging")
+        status, result = self.session.execute(self._command(5, "tool", "write_spec", args={"run_id": "run-1", "file": "ac1.spec.js", "content": "// spec\n"}))
+        self.assertEqual((status, result["written"]), ("ok", "run-1/ac1.spec.js"))
+        self.assertEqual(open(os.path.join(self.run_dir, "ac1.spec.js")).read(), "// spec\n")
+        self.assertFalse(os.path.exists(os.path.join(self.app, "run-1")))
+        self.assertEqual((git(self.app, "rev-parse", "HEAD"), git(self.origin, "rev-parse", "staging")), (head, remote))
+        self.assertFalse(self.session.unpushed)
+        self.assertEqual([a for a, _ in self.calls if a[0] == "git"], [])
+
+    def test_write_spec_refuses_a_bad_run_a_path_a_non_spec_and_oversize_content(self):
+        for over in ({"run_id": "../x"}, {"run_id": "a/b"}, {"name": "../ac1.spec.js"}, {"name": "sub/ac1.spec.js"}, {"name": "ac1.js"},
+                     {"name": "playwright.config.js"}, {"name": ".spec.js"}, {"content": ""}, {"content": "x" * 200_000}):
+            args = {"name": "ac1.spec.js", "run_id": "run-1", "content": "t\n", **over}
+            result = self.write(name=args["name"], run_id=args["run_id"], content=args["content"])
+            self.assertIn("error", result, over)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "specs", "x")))
+        self.assertEqual(sorted(os.listdir(self.run_dir)) if os.path.isdir(self.run_dir) else [], [])
+
+    def test_run_specs_needs_a_prepared_head_site_and_specs_and_never_returns_an_empty_pass(self):
+        for run_id, ping in (("never-prepared", True), ("run-1", False)):
+            self.pinged[:] = [ping] if not ping else []
+            with patch.object(srv, "_ping", return_value=ping):
+                result = srv.run_specs("processa", {"run_id": run_id})
+            self.assertEqual((result["status"], result["step"]), ("failed", "not_prepared"))
+            self.assertIn("prepare the site first", result["error"])
+        self.pinged.clear()
+        result = srv.run_specs("processa", {"run_id": "run-1"})
+        self.assertEqual(result["step"], "no_specs")
+        self.assertEqual(self.argv("npx"), [])
+
+    def test_specs_run_in_chromium_with_the_fixed_config_and_report_json_per_spec(self):
+        self.write("ac1.spec.js"), self.write("ac2.spec.js")
+        self.report = pw_report(
+            ("ac1.spec.js", "AC1 creates a user @ui", "desktop", "expected", [("passed", None, "/o/v1.webm")]),
+            ("ac1.spec.js", "AC1 creates a user @ui", "mobile", "expected", [("passed", None, "/o/v1m.webm")]),
+            ("ac2.spec.js", "AC2 starts the site", "desktop", "unexpected", [("failed", "expect(received).toBe(1)", "/o/v2.webm"), ("failed", "expect(received).toBe(1)", None)]),
+        )
+        status, result = self.session.execute(self._command(6, "run_specs", "run_specs", args={"run_id": "run-1"}))
+        self.assertEqual((status, result["status"], result["code"]), ("ok", "specs_run", "head"))
+        by = {(r["file"], r["viewport"]): r for r in result["results"]}
+        self.assertEqual(set(by), {("ac1.spec.js", "desktop"), ("ac1.spec.js", "mobile"), ("ac2.spec.js", "desktop")})
+        failed = by[("ac2.spec.js", "desktop")]
+        self.assertEqual((failed["status"], failed["criterion"], failed["video"], failed["duration_ms"]), ("failed", "AC2", "/o/v2.webm", 1000))
+        self.assertEqual(failed["failing_assertion"], "expect(received).toBe(1)\nmore")  # colour codes stripped
+        self.assertEqual(by[("ac1.spec.js", "mobile")]["criterion"], "AC1")
+        self.assertEqual(result["summary"], {"passed": 2, "failed": 1})
+        config = open(os.path.join(self.run_dir, "playwright.config.js")).read()
+        for needle in ("width: 1280, height: 720", "width: 390, height: 844", "grep: /@ui/", "retries: 1", "mode: 'on'", "trace: 'off'"):
+            self.assertIn(needle, config)
+        self.assertNotIn("trace: 'on'", config)
+
+    def test_a_spec_that_fails_once_and_passes_on_the_rerun_is_flaky(self):
+        self.write()
+        self.report = pw_report(("ac1.spec.js", "AC1 flaky", "desktop", "flaky", [("failed", "timed out", "/o/a.webm"), ("passed", None, "/o/b.webm")]))
+        result = srv.run_specs("processa", {"run_id": "run-1"})
+        self.assertEqual(result["results"][0]["status"], "flaky")
+        self.assertEqual(result["results"][0]["video"], "/o/b.webm")
+        self.assertEqual(result["summary"], {"flaky": 1})
+
+    def test_the_password_reaches_playwright_only_through_the_environment(self):
+        self.write()
+        self.report = pw_report(("ac1.spec.js", "AC1", "desktop", "expected", [("passed", None, None)]))
+        srv.run_specs("processa", {"run_id": "run-1"})
+        args, env = self.argv("npx")[0], next(e for a, e in self.calls if a[0] == "npx")
+        self.assertEqual(env["TEST_PASSWORD"], PASSWORD)
+        self.assertNotIn(PASSWORD, " ".join(args))
+        self.assertNotIn(PASSWORD, json.dumps(self.client.sent))
+        self.assertEqual(oct(os.stat(os.path.join(self.snapshots, "run-1.pw")).st_mode & 0o777), "0o600")
+
+    def test_a_crashed_run_is_reported_as_failed_with_its_output_and_without_the_password(self):
+        self.write()
+        self.report, self.npx_rc = None, 2
+        result = srv.run_specs("processa", {"run_id": "run-1"})
+        self.assertEqual((result["status"], result["step"]), ("failed", "run"))
+        self.assertNotIn(PASSWORD, json.dumps(result))
+
+    def test_run_specs_on_base_restores_the_snapshot_checks_out_base_restarts_and_runs_only_changed_behavior(self):
+        self.write()
+        self.report = pw_report(("ac1.spec.js", "AC1 @changed-behavior", "desktop", "unexpected", [("failed", "no user", None)]))
+        self.stopped.clear()
+        self.popen.clear()
+        self.pinged[:] = [False, True]  # the port is free after the stop, then the restarted site answers
+        result = srv.run_specs_on_base("processa", {"run_id": "run-1"})
+        self.assertEqual((result["status"], result["code"], result["base_sha"]), ("specs_run", "base", self.base_sha))
+        self.assertEqual(self.restored, "-- dump\n")
+        self.assertEqual(git(self.app, "rev-parse", "HEAD"), self.base_sha)
+        self.assertEqual(self.stopped[-1], [4001, 4002])  # the head's server and worker, stopped before the restore
+        self.assertEqual([a for a, _ in self.popen][0], ["bench", "--site", "sandbox", "serve", "--port", "8000"])
+        npx = self.argv("npx")[0]
+        self.assertEqual(npx[-2:], ["--grep", "@changed-behavior"])
+        self.assertEqual(self.argv("bench", "build"), [])  # the head built no assets, so the base needs none
+        order = [a[0] for a, _ in self.calls if a[0] in ("mysql", "git", "npx")]
+        self.assertLess(order.index("mysql"), order.index("npx"))
+        _, env = next((a, e) for a, e in self.calls if a[0] == "mysql")
+        self.assertNotIn("dbsecret", " ".join(next(a for a, _ in self.calls if a[0] == "mysql")))
+        self.assertEqual(env["MYSQL_PWD"], "dbsecret")
+
+    def test_the_base_is_rebuilt_when_the_head_built_assets_and_a_failed_restore_stops_everything(self):
+        self.write()
+        marker = os.path.join(self.snapshots, "run-1.json")
+        data = json.load(open(marker))
+        json.dump({**data, "built_assets": True}, open(marker, "w"))
+        self.report = pw_report(("ac1.spec.js", "AC1", "desktop", "expected", [("passed", None, None)]))
+        self.pinged[:] = [False, True]
+        srv.run_specs_on_base("processa", {"run_id": "run-1"})
+        self.assertEqual(self.argv("bench", "build"), [["bench", "build", "--app", "processa"]])
+        self.calls.clear()
+        self.broken.add("mysql")
+        self.pinged[:] = [False, True]
+        result = srv.run_specs_on_base("processa", {"run_id": "run-1"})
+        self.assertEqual((result["status"], result["step"]), ("failed", "restore"))
+        self.assertEqual([a for a, _ in self.calls if a[0] in ("npx",) or a[:2] == ["git", "checkout"]], [])
+        self.assertNotIn(PASSWORD, json.dumps(result))
+
+    def test_run_specs_on_base_before_the_head_was_checked_out_says_prepare_first(self):
+        marker = os.path.join(self.snapshots, "run-1.json")
+        data = json.load(open(marker))
+        data.pop("head_sha")
+        json.dump(data, open(marker, "w"))
+        self.assertEqual(srv.run_specs_on_base("processa", {"run_id": "run-1"})["step"], "not_prepared")
+        self.assertEqual(srv.run_specs_on_base("processa", {"run_id": "nope"})["step"], "not_prepared")
+
+    def test_browser_snapshot_returns_the_snapshot_and_a_screenshot_for_a_role_user_within_60_seconds(self):
+        result = srv.browser_snapshot("processa", {"run_id": "run-1", "url": "/app/home", "role": "Sales User"})
+        self.assertEqual((result["snapshot"], result["screenshot_base64"]), ("- heading 'Home'", "abc"))
+        args, env = self.argv("node")[0], next(e for a, e in self.calls if a[0] == "node")
+        self.assertEqual((env["SNAP_USER"], env["SNAP_URL"], env["SNAP_PASSWORD"]), ("sales-user.run-1@sandbox.test", "/app/home", PASSWORD))
+        self.assertNotIn(PASSWORD, " ".join(args))
+        self.assertEqual(self.timeouts["node"], 60)
+
+    def test_browser_snapshot_refuses_other_hosts_unknown_roles_and_an_unprepared_run(self):
+        for url in ("https://evil.example/x", "//evil.example/x", "http://127.0.0.1:8001/x", "javascript:alert(1)", "app/home", None):
+            self.assertIn("error", srv.browser_snapshot("processa", {"run_id": "run-1", "url": url, "role": "Sales User"}), url)
+        self.assertIn("http://127.0.0.1:8000/app/x", srv.browser_snapshot("processa", {"run_id": "run-1", "url": "http://127.0.0.1:8000/app/x", "role": "HR Manager"}).get("url", ""))
+        self.assertIn("no test user", srv.browser_snapshot("processa", {"run_id": "run-1", "url": "/app", "role": "Ghost"})["error"])
+        self.assertIn("prepare the site first", srv.browser_snapshot("processa", {"run_id": "never", "url": "/app", "role": "Sales User"})["error"])
+
+    def test_trigger_job_runs_a_scheduled_method_and_refuses_any_other(self):
+        self.assertEqual(srv.trigger_job("processa", {"method": "processa.tasks.daily"}), {"ran": "processa.tasks.daily"})
+        refused = srv.trigger_job("processa", {"method": "frappe.client.delete"})
+        self.assertIn("scheduler_events", refused["error"])
+        self.calls.clear()
+        for bad in ("rm -rf /", "a", "a..b", "", None, "x.y; import os"):
+            self.assertIn("error", srv.trigger_job("processa", {"method": bad}), bad)
+        self.assertEqual(self.calls, [])  # a malformed method never reaches bench
+
+    def test_the_scheduler_check_reads_every_kind_of_scheduler_event_of_the_target_app(self):
+        fake = MagicMock()
+        fake.get_hooks.return_value = {"daily": ["pkg.mod.daily"], "cron": {"* * * * *": ["pkg.mod.minutely"]}, "all": ("pkg.mod.all",)}
+        ran = []
+        fake.get_attr.side_effect = lambda m: (lambda: ran.append(m))
+        out = []
+        for method in ("pkg.mod.daily", "pkg.mod.minutely", "pkg.mod.all", "pkg.mod.other"):
+            env = {"SANDBOX_SITE": "sandbox", "JOB_APP": "pkg", "JOB_METHOD": method}
+            with patch.dict("sys.modules", {"frappe": fake}), patch.dict(os.environ, env), patch("builtins.print") as printed:
+                exec(compile(srv._TRIGGER_SCRIPT, "script", "exec"), {})
+            out.append(json.loads(printed.call_args.args[0].split("=", 1)[1]))
+        self.assertEqual(out, [{"ran": True}] * 3 + [{"refused": True}])
+        self.assertEqual(ran, ["pkg.mod.daily", "pkg.mod.minutely", "pkg.mod.all"])
+        fake.get_hooks.assert_called_with("scheduler_events", app_name="pkg")
+
+    def test_prepare_site_keeps_the_users_and_a_private_password_file_and_checkout_records_the_head(self):
+        marker = json.load(open(os.path.join(self.snapshots, "run-1.json")))
+        self.assertEqual([u["role"] for u in marker["users"]], ["Sales User", "HR Manager", None])
+        self.assertNotIn(PASSWORD, json.dumps(marker))
+        self.assertEqual((marker["head_sha"], marker["built_assets"]), (self.pr_sha, False))
+        self.assertEqual(open(os.path.join(self.snapshots, "run-1.pw")).read(), PASSWORD)
+
+    def test_the_new_kinds_are_dispatched_and_nothing_is_ever_committed(self):
+        with patch.object(srv, "run_specs", return_value={"status": "specs_run"}) as head, patch.object(srv, "run_specs_on_base", return_value={"status": "specs_run"}) as base:
+            self.assertEqual(self.session.execute(self._command(1, "run_specs", "run_specs", args={"run_id": "r"}))[1]["status"], "specs_run")
+            self.assertEqual(self.session.execute(self._command(2, "run_specs_on_base", "run_specs_on_base", args={"run_id": "r"}))[1]["status"], "specs_run")
+        self.assertEqual((head.call_args.args[1], base.call_args.args[1]), ({"run_id": "r"}, {"run_id": "r"}))
+        self.write(), srv.run_specs("processa", {"run_id": "run-1"})
+        verbs = {a[1] for a, _ in self.calls if a[0] == "git"}
+        self.assertFalse(verbs & {"commit", "push", "merge", "reset", "rebase", "tag"}, verbs)
+
 
 
 class TestTheClient(unittest.TestCase):
