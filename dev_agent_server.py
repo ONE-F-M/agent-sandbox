@@ -950,11 +950,11 @@ def _load_prepared(run_id):
         return None
 
 
-def _spec_env(run_id, run_dir):
+def _spec_env(run_id, run_dir, code="head"):
     pw_path = _snapshot_paths(run_id)[0][:-4] + ".pw"
     with open(pw_path) as fh:
         password = fh.read()
-    return {**os.environ, "SPEC_BASE_URL": f"http://127.0.0.1:{SERVE_PORT}", "SPEC_OUTPUT_DIR": os.path.join(run_dir, "out"),
+    return {**os.environ, "SPEC_BASE_URL": f"http://127.0.0.1:{SERVE_PORT}", "SPEC_OUTPUT_DIR": os.path.join(run_dir, f"out-{code}"),
             "TEST_PASSWORD": password}
 
 
@@ -995,19 +995,23 @@ def _parse_report(report):
     return results
 
 
-def _run_playwright(run_id, run_dir, extra_args):
-    """Run the run folder's specs. Returns (results, error)."""
-    out = os.path.join(run_dir, "out")
+def _run_playwright(run_id, run_dir, extra_args, code="head"):
+    """Run the run folder's specs. Returns (results, error). The head and the base each keep their own output folder and
+    results file, so running the base never deletes the head's videos that upload_videos still has to send."""
+    out = os.path.join(run_dir, f"out-{code}")
     shutil.rmtree(out, ignore_errors=True)
     with open(os.path.join(run_dir, "playwright.config.js"), "w") as fh:
         fh.write(_SPEC_CONFIG)
     run = _exec(["npx", "playwright", "test", "--config", "playwright.config.js", *extra_args],
-                env=_spec_env(run_id, run_dir), cwd=run_dir, timeout=SPEC_TIMEOUT_SECONDS)
+                env=_spec_env(run_id, run_dir, code), cwd=run_dir, timeout=SPEC_TIMEOUT_SECONDS)
     report_path = os.path.join(out, "report.json")
     if run.returncode not in (0, 1) or not os.path.isfile(report_path):  # 1 only means some spec failed
         return None, f"playwright did not produce a report (exit {run.returncode}): {_tail(run, _spec_env(run_id, run_dir)['TEST_PASSWORD'])}"
     with open(report_path) as fh:
-        return _parse_report(json.load(fh)), None
+        results = _parse_report(json.load(fh))
+    with open(os.path.join(run_dir, f"results-{code}.json"), "w") as fh:
+        json.dump(results, fh)
+    return results, None
 
 
 def _spec_summary(results):
@@ -1035,7 +1039,7 @@ def run_specs(target_app, args):
     run_dir = _spec_run_dir(run_id)
     if not (os.path.isdir(run_dir) and any(SPEC_FILE.match(f) for f in os.listdir(run_dir))):
         return _failed("no_specs", "no specs were written for this run: call write_spec first")
-    results, error = _run_playwright(run_id, run_dir, [])
+    results, error = _run_playwright(run_id, run_dir, [], "head")
     if error:
         return _failed("run", error)
     return _spec_result(run_id, results, code="head")
@@ -1074,7 +1078,7 @@ def run_specs_on_base(target_app, args):
     _pids, error = _start_services()
     if error:
         return _failed("start_services", error)
-    results, error = _run_playwright(run_id, run_dir, ["--grep", "@changed-behavior"])
+    results, error = _run_playwright(run_id, run_dir, ["--grep", "@changed-behavior"], "base")
     if error:
         return _failed("run", error)
     return _spec_result(run_id, results, code="base", base_sha=marker["base_sha"])
@@ -1123,6 +1127,123 @@ def trigger_job(target_app, args):
     if outcome.get("refused"):
         return {"error": f"{method} is not in {target_app}'s scheduler_events, so it is refused."}
     return {"ran": method}
+
+
+# --- Testing Agent: upload the run's videos for the PR comment ---------------------------------
+# GitHub's attachment upload (the call gh makes for `gh pr comment --attach`) refuses the installation tokens of our own Apps
+# and accepts a user token, so this uses the machine user's classic token from the payload. The token is never logged,
+# returned or written to disk. The endpoint is undocumented: the request below follows gh's own client
+# (cli/cli internal/attachments/client.go). If it refuses the token, the machine user posts the whole comment with the
+# documented `gh pr comment --attach` instead.
+UPLOAD_HOST = "https://uploads.github.com"
+GITHUB_API = "https://api.github.com"
+UPLOAD_ORG = os.environ.get("UPLOAD_ORG", "ONE-F-M")
+VIDEO_MAX_BYTES = 100 * 1024 * 1024
+_REPO = re.compile(r"\A[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}\Z")
+_REFUSED = (401, 403, 404)  # the endpoint answers 404, not 403, when a token may not write
+_DEFAULT_COMMENT = "Testing Agent test videos"
+
+
+def _http(method, url, token, data=None, headers=None, timeout=300):
+    """One request to GitHub. Returns (status, json); status 0 means it never reached the server."""
+    request = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": f"token {token}", "Accept": "application/vnd.github+json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        return exc.code, {"message": exc.read()[:300].decode(errors="replace")}
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        return 0, {"message": f"{type(exc).__name__}: {exc}"}
+
+
+def _videos_by_criterion(run_dir):
+    """criterion -> the video to send: the desktop run's, when it left one. None when run_specs has not run."""
+    try:
+        with open(os.path.join(run_dir, "results-head.json")) as fh:
+            results = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    chosen = {}
+    for entry in sorted(results, key=lambda r: r.get("viewport") != "desktop"):
+        video = entry.get("video")
+        key = entry.get("criterion") or entry.get("file")
+        if key and video and os.path.isfile(video) and os.path.getsize(video) > 0 and key not in chosen:
+            chosen[key] = video
+    return chosen
+
+
+def _delete_videos(run_dir):
+    removed = 0
+    for folder in (d for d in os.listdir(run_dir) if d.startswith("out-")):
+        for root, _dirs, files in os.walk(os.path.join(run_dir, folder)):
+            for name in files:
+                if name.endswith(".webm"):
+                    with contextlib.suppress(OSError):
+                        os.remove(os.path.join(root, name))
+                        removed += 1
+    return removed
+
+
+def _comment_with_gh(repo, pr_number, body, videos, token):
+    """The fallback: the machine user posts the whole comment through gh, which uploads the files itself."""
+    args = ["gh", "pr", "comment", str(pr_number), "--repo", repo, "--body", body]
+    for video in videos:
+        args += ["--attach", video]
+    return _exec(args, env={**os.environ, "GH_TOKEN": token}, timeout=900)
+
+
+def upload_videos(target_app, args):
+    """Upload one video per criterion to the PR's repository and return the user-attachments URLs. Deletes the local videos
+    only when every upload worked; a failed upload is reported for its criterion and never counted as a success."""
+    run_id, repo, number, token = args.get("run_id"), args.get("repository"), args.get("pr_number"), args.get("token")
+    error = _check_run_id(run_id) or _check_pr_number(number) or _check_app(target_app)
+    if not error and (not isinstance(repo, str) or not _REPO.match(repo) or repo.split("/")[0] != UPLOAD_ORG):
+        error = f"repository {repo!r} must be {UPLOAD_ORG}/<repo>."
+    if not error and (not isinstance(token, str) or not token or token != token.strip() or len(token) > 255):
+        error = "token is missing or malformed."
+    if error:
+        return _failed("validate", error)
+    run_dir = _spec_run_dir(run_id)
+    videos = _videos_by_criterion(run_dir) if os.path.isdir(run_dir) else None
+    if not videos:
+        return _failed("no_videos", "there are no videos for this run: call run_specs first, and check the specs recorded video")
+    body = args.get("comment_body") if isinstance(args.get("comment_body"), str) and args.get("comment_body").strip() else _DEFAULT_COMMENT
+
+    status, repository = _http("GET", f"{GITHUB_API}/repos/{repo}", token, timeout=60)
+    if status == 200 and repository.get("id"):
+        uploads, errors, refused = [], [], False
+        for criterion, path in videos.items():
+            size = os.path.getsize(path)
+            if size > VIDEO_MAX_BYTES:
+                errors.append({"criterion": criterion, "error": f"video is {size // (1024 * 1024)} MB, over the 100 MB limit"})
+                continue
+            query = urllib.parse.urlencode({"name": re.sub(r"[^A-Za-z0-9_.-]", "-", str(criterion)) + ".webm", "content_type": "video/webm",
+                                            "repository_id": repository["id"]})
+            with open(path, "rb") as fh:
+                code, answer = _http("POST", f"{UPLOAD_HOST}/user-attachments/assets?{query}", token, data=fh,
+                                     headers={"Content-Type": "application/octet-stream", "Content-Length": str(size)})
+            if code == 200 and answer.get("url"):
+                uploads.append({"criterion": criterion, "url": answer["url"]})
+            elif code in _REFUSED:
+                refused = True
+                break
+            else:
+                errors.append({"criterion": criterion, "error": f"upload failed ({code}): {str(answer.get('message'))[:200]}".replace(token, "***")})
+        if not refused:
+            if errors:
+                return _failed("upload", f"{len(errors)} of {len(videos)} videos did not upload", uploads=uploads, errors=errors, path="upload_endpoint")
+            return {"status": "videos_uploaded", "run_id": run_id, "path": "upload_endpoint", "uploads": uploads, "deleted": _delete_videos(run_dir)}
+    elif status not in _REFUSED:
+        return _failed("repository", f"could not look up {repo} on GitHub ({status})", detail=str(repository.get("message"))[:200].replace(token, "***"))
+
+    posted = _comment_with_gh(repo, number, body, list(videos.values()), token)  # the endpoint refused the token
+    if posted.returncode != 0:
+        return _failed("fallback", "the upload endpoint refused the token and gh could not post the comment", path="gh_pr_comment",
+                       detail=_tail(posted, token))
+    url = next((w for w in (posted.stdout or "").split() if w.startswith("https://github.com/")), None)
+    return {"status": "videos_uploaded", "run_id": run_id, "path": "gh_pr_comment", "comment_url": url,
+            "criteria": sorted(videos), "deleted": _delete_videos(run_dir)}
 
 
 SPEC_TOOLS = {"write_spec": write_spec, "browser_snapshot": browser_snapshot, "trigger_job": trigger_job}
