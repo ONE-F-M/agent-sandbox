@@ -128,6 +128,7 @@ class Session:
             handler = {
                 "tool": self._tool, "run_tests": self._run_tests, "finalize": self._finalize, "close": self._close,
                 "prepare_site": self._prepare_site, "checkout_pr_head": self._checkout_pr_head,
+                "run_specs": self._run_specs, "run_specs_on_base": self._run_specs_on_base,
             }[command["kind"]]
             status, result = handler(command, timings)
         except Exception as exc:  # noqa: BLE001 - reported to Processa as the command's result
@@ -136,6 +137,10 @@ class Session:
 
     def _tool(self, command, timings):
         args = command["payload"].get("args") or {}
+        if command["action"] in srv.SPEC_TOOLS:  # fast spec tools: never touch the checkout, so nothing is committed
+            with timings.span("tool"):
+                result = srv.SPEC_TOOLS[command["action"]](self.target_app, args)
+            return ("error" if result.get("error") else "ok"), result
         with timings.span("tool"):
             result, changed = srv._apply_tool(self.app_dir, self.target_app, command["action"], args)
         if changed:
@@ -168,6 +173,14 @@ class Session:
     def _checkout_pr_head(self, command, timings):
         with timings.span("checkout_pr_head"):
             return "ok", srv.checkout_pr_head(self.target_app, self._args(command))
+
+    def _run_specs(self, command, timings):
+        with timings.span("run_specs"):
+            return "ok", srv.run_specs(self.target_app, self._args(command))
+
+    def _run_specs_on_base(self, command, timings):
+        with timings.span("run_specs_on_base"):
+            return "ok", srv.run_specs_on_base(self.target_app, self._args(command))
 
     @staticmethod
     def _args(command):
