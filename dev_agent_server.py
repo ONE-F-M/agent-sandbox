@@ -511,7 +511,7 @@ _ROLE_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9 _-]{0,59}\Z")
 _SHA = re.compile(r"\A[0-9a-f]{40}\Z")
 _PASSWORD_MAX = 128
 # Where a change needs a Desk bundle rebuilt: the app's public/ assets, plus its own frontend folder.
-_FRONTEND_DIRS = {"one_bpmn": ("spiff/",)}
+_FRONTEND_DIRS = {"processa": ("frontend/",)}
 
 
 def _exec(args, env=None, cwd=None, timeout=None):

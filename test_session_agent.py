@@ -542,14 +542,14 @@ class TestCheckoutPrHead(TestingAgentCase):
     def test_frontend_or_public_changes_trigger_one_build_and_backend_only_does_not(self):
         self.assertFalse(self.checkout()[1]["built_assets"])
         self.assertEqual(self.argv("bench", "build"), [])
-        for path in ("spiff/src/App.vue", "one_bpmn/public/js/x.js"):
+        for path in ("frontend/src/App.vue", "processa/public/js/x.js"):
             self.calls.clear()
             self.pinged[:] = [False, True]
             self._repoint_pr(path, "x\n")
             _status, result = self.checkout()
-            self.assertEqual(self.argv("bench", "build"), [["bench", "build", "--app", "one_bpmn"]], path)
+            self.assertEqual(self.argv("bench", "build"), [["bench", "build", "--app", "processa"]], path)
             self.assertTrue(result["built_assets"])
-        for path in ("one_bpmn/api/x.py", "docs/public.md", "one_bpmn/publicity/x.js", "spiffy/x.js"):
+        for path in ("processa/api/x.py", "docs/public.md", "processa/publicity/x.js", "frontend-old/x.js"):
             self.calls.clear()
             self.pinged[:] = [False, True]
             self._repoint_pr(path, "x\n")
@@ -557,7 +557,7 @@ class TestCheckoutPrHead(TestingAgentCase):
             self.assertEqual(self.argv("bench", "build"), [], path)
 
     def test_a_failing_build_stops_before_migrate(self):
-        self._repoint_pr("spiff/src/App.vue", "x\n")
+        self._repoint_pr("frontend/src/App.vue", "x\n")
         self.broken = {"build"}
         _status, result = self.checkout()
         self.assertEqual((result["status"], result["step"]), ("failed", "build"))
@@ -632,7 +632,7 @@ class TestPing(unittest.TestCase):
 class TestNoWritesToGit(TestingAgentCase):
     def test_neither_command_ever_commits_pushes_or_merges(self):
         self.prepare()
-        self._repoint_pr("spiff/src/App.vue", "x\n")
+        self._repoint_pr("frontend/src/App.vue", "x\n")
         self.checkout()
         verbs = {a[1] for a, _ in self.calls if a[0] == "git"}
         self.assertFalse(verbs & {"commit", "push", "merge", "reset", "rebase", "tag"}, verbs)
@@ -642,7 +642,7 @@ class TestNoWritesToGit(TestingAgentCase):
         with patch.object(srv, "prepare_site", return_value={"status": "prepared"}) as prep, patch.object(srv, "checkout_pr_head", return_value={"status": "ready"}) as head:
             self.assertEqual(self.session.execute(self._command(1, "prepare_site", run_id="r"))[1]["status"], "prepared")
             self.assertEqual(self.session.execute(self._command(2, "checkout_pr_head", run_id="r"))[1]["status"], "ready")
-        self.assertEqual((prep.call_args.args[0], head.call_args.args[0]), ("one_bpmn", "one_bpmn"))
+        self.assertEqual((prep.call_args.args[0], head.call_args.args[0]), ("processa", "processa"))
         with patch.object(srv, "_tests_for_tree", return_value=(True, "", "", [])):
             self.assertEqual(self.session.execute(self._command(3, "run_tests", "run_tests", args={}))[1]["status"], "tests_passed")
 
