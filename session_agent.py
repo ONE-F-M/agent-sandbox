@@ -163,11 +163,17 @@ class Session:
     # the same shape run_tests uses, so Processa's park/resume handles them like any other slow command.
     def _prepare_site(self, command, timings):
         with timings.span("prepare_site"):
-            return "ok", srv.prepare_site(self.target_app, command["payload"])
+            return "ok", srv.prepare_site(self.target_app, self._args(command))
 
     def _checkout_pr_head(self, command, timings):
         with timings.span("checkout_pr_head"):
-            return "ok", srv.checkout_pr_head(self.target_app, command["payload"])
+            return "ok", srv.checkout_pr_head(self.target_app, self._args(command))
+
+    @staticmethod
+    def _args(command):
+        """Processa puts a slow action's arguments under payload["args"]; a bare payload is accepted too."""
+        payload = command["payload"]
+        return payload.get("args") or payload
 
     def _finalize(self, command, timings):
         with timings.span("git"):

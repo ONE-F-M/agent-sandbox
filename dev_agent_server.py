@@ -645,6 +645,8 @@ def _validate_prepare_site(target_app, payload):
 def prepare_site(target_app, payload):
     """AC1: base branch checked out, site migrated, one test user per role plus one with none, mute_emails on,
     then a mysqldump of the site DB under SNAPSHOT_DIR. Returns a result dict; never contains the password."""
+    if isinstance(payload.get("roles"), str):  # a Processa text field: one role per line or comma-separated
+        payload = {**payload, "roles": [r.strip() for r in re.split(r"[,\n]", payload["roles"]) if r.strip()]}
     error = _validate_prepare_site(target_app, payload)
     if error:
         return _failed("validate", error)
