@@ -395,6 +395,9 @@ class TestingAgentCase(SessionCase):
         if args[0].endswith("python") and "JOB_METHOD" in (env or {}):
             ok = env["JOB_METHOD"] in self.scheduled
             return done("JOB_JSON=" + json.dumps({"ran": True} if ok else {"refused": True}))
+        if args[0].endswith("python") and "SEED_PAYLOAD" in (env or {}):
+            self.seed_env = env
+            return done("SEED_JSON=" + json.dumps(self.seed_answer))
         if args[0].endswith("python"):
             key = "users"
         elif args[0] == "mysqldump":
@@ -872,6 +875,91 @@ class TestSpecs(TestingAgentCase):
         for bad in ("rm -rf /", "a", "a..b", "", None, "x.y; import os"):
             self.assertIn("error", srv.trigger_job("processa", {"method": bad}), bad)
         self.assertEqual(self.calls, [])  # a malformed method never reaches bench
+
+    seed_answer = [{"index": 0, "doctype": "ToDo", "name": "T1"}]
+
+    @staticmethod
+    def _named(doctype, name):
+        doc = MagicMock()
+        doc.doctype, doc.name = doctype, name
+        return doc
+
+    def test_seed_docs_validates_the_list_and_passes_it_to_bench_as_data_within_55_seconds(self):
+        docs = [{"doctype": "ToDo", "description": "x"}, {"factory": "one_fm.one_fm.tests.utils.make_employee", "args": {"first_name": "A"}}]
+        result = srv.seed_docs("processa", {"run_id": "run-1", "docs": docs})
+        self.assertEqual((result["inserted"], result["failed"]), (1, 0))
+        self.assertEqual(json.loads(self.seed_env["SEED_PAYLOAD"]), docs)
+        self.assertEqual(self.timeouts[f"{self.bench}/env/bin/python"], 55)
+        bad = [None, [], "x", [{"doctype": "ToDo"}] * 51, ["x"], [{}], [{"doctype": "A", "factory": "a.b"}], [{"doctype": "x; drop"}],
+               [{"factory": "a b"}], [{"factory": "os.system('x')"}], [{"factory": "a.b", "args": []}]]
+        self.calls.clear()
+        for b in bad:
+            self.assertIn("error", srv.seed_docs("processa", {"run_id": "run-1", "docs": b}), repr(b))
+        self.assertIn("prepare the site first", srv.seed_docs("processa", {"run_id": "never", "docs": docs})["error"])
+        self.assertEqual(self.calls, [])
+
+    def test_seed_docs_reports_each_documents_error_and_the_script_keeps_going(self):
+        self.seed_answer = [{"index": 0, "error": "Mandatory: a"}, {"index": 1, "doctype": "ToDo", "name": "T2"}]
+        result = srv.seed_docs("processa", {"run_id": "run-1", "docs": [{"doctype": "ToDo"}] * 2})
+        self.assertEqual((result["inserted"], result["failed"], result["results"][0]["error"]), (1, 1, "Mandatory: a"))
+        fake = MagicMock()
+        fake.get_doc.side_effect = [MagicMock(**{"insert.side_effect": Exception("bad")}),
+                                    MagicMock(**{"insert.return_value": self._named("ToDo", "T2")})]
+        fake.get_attr.return_value = lambda **kw: "EMP-1"
+        env = {"SANDBOX_SITE": "s", "SEED_FACTORIES": json.dumps(["a.make"]), "SEED_FACTORY_HINTS": "{}",
+               "SEED_PAYLOAD": json.dumps([{"doctype": "ToDo"}, {"doctype": "ToDo"}, {"factory": "a.make"}, {"factory": "os.system"},
+                                           {"doctype": "Server Script"}])}
+        with patch.dict("sys.modules", {"frappe": fake}), patch.dict(os.environ, env), patch("builtins.print") as printed:
+            exec(compile(srv._SEED_DOCS_SCRIPT, "script", "exec"), {})
+        out = json.loads(printed.call_args.args[0].split("=", 1)[1])
+        self.assertEqual([r.get("name") or r["error"][:20] for r in out], ["bad", "T2", "EMP-1", "factory os.system is", "documents of type Se"])
+        fake.set_user.assert_called_with("Administrator")
+        fake.get_attr.assert_called_once_with("a.make")  # the refused factory was never looked up
+        self.assertEqual(fake.db.rollback.call_count, 3)
+
+    def test_the_seed_factory_allow_list_defaults_and_can_be_set_but_only_to_dotted_paths(self):
+        self.assertEqual(srv._seed_factories(), set(srv.SEED_FACTORIES_DEFAULT))
+        with patch.dict(os.environ, {"SEED_FACTORIES": '["a.b.make"]'}):
+            self.assertEqual(srv._seed_factories(), {"a.b.make"})
+        with patch.dict(os.environ, {"SEED_FACTORIES": '["a.b; x"]'}):
+            self.assertEqual(srv._seed_factories(), set(srv.SEED_FACTORIES_DEFAULT))
+
+    def test_no_seed_script_evaluates_a_payload(self):
+        for text in (srv._SEED_DOCS_SCRIPT, srv._SEED_CONTEXT_SCRIPT):
+            for word in ("eval(", "exec(", "compile(", "__import__", "safe_eval"):
+                self.assertNotIn(word, text)
+
+    def test_seed_context_returns_the_dependency_order_and_what_each_doctype_needs(self):
+        self.seed_answer = {"order": ["Customer", "Sales Order"], "doctypes": {}, "problems": {}, "factories": []}
+        self.assertEqual(srv.seed_context("processa", {"run_id": "run-1", "doctypes": ["Sales Order"]})["order"], ["Customer", "Sales Order"])
+        for bad in (None, [], ["x; y"], ["A"] * 11, [1]):
+            self.assertIn("error", srv.seed_context("processa", {"run_id": "run-1", "doctypes": bad}), repr(bad))
+        meta = lambda **kw: MagicMock(**kw)
+        field = lambda name, ft, **kw: MagicMock(fieldname=name, fieldtype=ft, options=kw.get("options"), reqd=kw.get("reqd", 0),
+                                                 mandatory_depends_on=kw.get("mdo"))
+        fields = {"Sales Order": [field("customer", "Link", options="Customer", reqd=1), field("status", "Select", options="Draft\nOpen"),
+                                  field("sb", "Section Break"), field("tax", "Data", mdo="eval:doc.x")], "Customer": []}
+        fake = MagicMock()
+        fake.get_meta.side_effect = lambda d: meta(fields=fields[d])
+        class Controller:
+            def validate(self):
+                return "checked"
+        fake.get_controller.return_value = Controller
+        runner = MagicMock()
+        runner.get_dependencies.side_effect = lambda d: ["Customer"] if d == "Sales Order" else []
+        env = {"SANDBOX_SITE": "s", "SEED_FACTORIES": json.dumps(["a.make"]), "SEED_FACTORY_HINTS": json.dumps({"a.make": "Customer"}),
+               "SEED_PAYLOAD": json.dumps(["Sales Order"])}
+        with patch.dict("sys.modules", {"frappe": fake, "frappe.test_runner": runner}), patch.dict(os.environ, env), patch("builtins.print") as printed:
+            exec(compile(srv._SEED_CONTEXT_SCRIPT, "script", "exec"), {})
+        out = json.loads(printed.call_args.args[0].split("=", 1)[1])
+        so = out["doctypes"]["Sales Order"]
+        self.assertEqual(out["order"], ["Customer", "Sales Order"])
+        self.assertEqual(so["required"][0]["fieldname"], "customer")
+        self.assertEqual(so["links"], [{"fieldname": "customer", "target": "Customer"}])
+        self.assertEqual(so["selects"], {"status": ["Draft", "Open"]})
+        self.assertEqual(so["mandatory_depends_on"], {"tax": "eval:doc.x"})
+        self.assertIn("checked", so["validate"])
+        self.assertEqual(out["doctypes"]["Customer"]["factories"], ["a.make"])
 
     def test_the_scheduler_check_reads_every_kind_of_scheduler_event_of_the_target_app(self):
         fake = MagicMock()
