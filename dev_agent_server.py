@@ -855,6 +855,82 @@ _METHOD = re.compile(r"\A[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+\Z")
 
 # Written by the sandbox, not by the model, so a spec file cannot weaken it. Every spec runs in Chromium with a 1280x720
 # webm; specs tagged @ui also run at 390x844. A spec that fails and then passes on the one rerun is reported "flaky".
+# Written into every run folder by the sandbox, so a spec the model writes calls these instead of inventing its own login and
+# waits. They follow Frappe v15's own Playwright helpers (frappe/playwright/support): log in with POST /api/method/login and
+# keep the session, wait for frappe.request.ajax_count === 0 and body[data-ajax-state="complete"], select fields with
+# [data-fieldname=...], type into Link fields with pressSequentially and wait for the dropdown, wait for a dialog to finish
+# fading in, and blur a field before clicking Save. Plain JavaScript: it needs no Playwright import of its own.
+_FRAPPE_HELPERS = """// frappe-helpers.js: written by the sandbox before every run. Do not edit it; use it:
+//   const h = require('./frappe-helpers');
+//   await h.loginAs(page, '<a test user email from prepare_site>');
+//   await h.openForm(page, 'Work Item');  await h.fillField(page, 'title', 'x');  await h.saveForm(page);
+const BASE = process.env.SPEC_BASE_URL;
+
+const slug = (doctype) => String(doctype).toLowerCase().replace(/ /g, '-');
+
+// Log in through the API; the page keeps the session cookie. The password comes from the environment, never from a spec.
+async function loginAs(page, email) {
+  const res = await page.request.post(BASE + '/api/method/login', { form: { usr: email, pwd: process.env.TEST_PASSWORD } });
+  if (!res.ok()) throw new Error('login as ' + email + ' failed: HTTP ' + res.status());
+}
+
+// Wait until Frappe has nothing in flight. Pages that are not Frappe's (no window.frappe) are treated as idle.
+async function waitForFrappeIdle(page) {
+  await page.waitForFunction(() => !window.frappe || !frappe.request ||
+    (frappe.request.ajax_count === 0 && document.body.getAttribute('data-ajax-state') !== 'running'), null, { timeout: 30000 });
+}
+
+async function openForm(page, doctype, name) {
+  await page.goto('/app/' + slug(doctype) + '/' + (name ? encodeURIComponent(name) : 'new'));
+  await waitForFrappeIdle(page);
+}
+
+async function openList(page, doctype) {
+  await page.goto('/app/' + slug(doctype));
+  await waitForFrappeIdle(page);
+}
+
+// The input of a form field, found by its data-fieldname.
+function field(page, fieldname) {
+  return page.locator('[data-fieldname="' + fieldname + '"] :is(input, textarea, select):visible').first();
+}
+
+async function fillField(page, fieldname, value) {
+  const input = field(page, fieldname);
+  await input.fill(String(value));
+  await input.blur();
+  await waitForFrappeIdle(page);
+}
+
+// Type into a Link field and pick from its dropdown once it has appeared.
+async function fillLink(page, fieldname, text) {
+  const input = field(page, fieldname);
+  await input.click();
+  await input.pressSequentially(String(text), { delay: 50 });
+  const option = page.locator('[data-fieldname="' + fieldname + '"] .awesomplete ul li:visible').filter({ hasText: String(text) }).first();
+  await option.waitFor({ state: 'visible', timeout: 15000 });
+  await option.click();
+  await waitForFrappeIdle(page);
+}
+
+// A dialog is ready only after its fade-in has finished.
+async function waitForDialog(page) {
+  await page.locator('.modal.show').last().waitFor({ state: 'visible', timeout: 15000 });
+  await page.waitForFunction(() => !document.querySelector('.modal.fade:not(.show)') || document.querySelector('.modal.show'), null, { timeout: 15000 });
+}
+
+// Blur whatever has focus, then click Save, then wait for Frappe to finish.
+async function saveForm(page) {
+  await page.evaluate(() => document.activeElement && document.activeElement.blur && document.activeElement.blur());
+  await waitForFrappeIdle(page);
+  await page.locator('.page-actions .primary-action:visible').first().click();
+  await waitForFrappeIdle(page);
+}
+
+module.exports = { loginAs, waitForFrappeIdle, openForm, openList, field, fillField, fillLink, waitForDialog, saveForm };
+"""
+
+
 _SPEC_CONFIG = """const { defineConfig } = require('@playwright/test');
 const out = process.env.SPEC_OUTPUT_DIR;
 module.exports = defineConfig({
@@ -1002,6 +1078,8 @@ def _run_playwright(run_id, run_dir, extra_args, code="head"):
     shutil.rmtree(out, ignore_errors=True)
     with open(os.path.join(run_dir, "playwright.config.js"), "w") as fh:
         fh.write(_SPEC_CONFIG)
+    with open(os.path.join(run_dir, "frappe-helpers.js"), "w") as fh:  # rewritten every run, so a spec cannot change it
+        fh.write(_FRAPPE_HELPERS)
     run = _exec(["npx", "playwright", "test", "--config", "playwright.config.js", *extra_args],
                 env=_spec_env(run_id, run_dir, code), cwd=run_dir, timeout=SPEC_TIMEOUT_SECONDS)
     report_path = os.path.join(out, "report.json")
