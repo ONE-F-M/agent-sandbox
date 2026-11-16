@@ -23,6 +23,6 @@ source /lib_pin_apps.sh
 source /lib_clone_functions.sh
 cd "$BENCH_PATH"
 
-clone_app processa https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/one_bpmn.git staging https://github.com/${GITHUB_ORG}/one_bpmn.git
+clone_app processa https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/processa.git staging https://github.com/${GITHUB_ORG}/processa.git
 clone_app onefm_mcp https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/onefm_mcp.git staging https://github.com/${GITHUB_ORG}/onefm_mcp.git
 clone_app frappe_agile https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/frappe_agile.git staging https://github.com/${GITHUB_ORG}/frappe_agile.git
