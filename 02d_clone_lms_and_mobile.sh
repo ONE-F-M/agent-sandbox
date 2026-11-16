@@ -27,3 +27,5 @@ clone_app one_lms https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/one_lms.git v
 
 # --- Non-Frappe target apps (plain git clone, never bench-installed) ---
 clone_plain_repo mobile_app_ionic https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/mobile_app_ionic.git version-15 https://github.com/${GITHUB_ORG}/mobile_app_ionic.git
+# This repository itself, so agents can work on the sandbox code. The folder is agent_sandbox: app names take no hyphen.
+clone_plain_repo agent_sandbox https://${GITHUB_TOKEN}@github.com/${GITHUB_ORG}/agent-sandbox.git staging https://github.com/${GITHUB_ORG}/agent-sandbox.git

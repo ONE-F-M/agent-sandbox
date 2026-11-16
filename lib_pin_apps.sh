@@ -33,6 +33,8 @@ declare -A PINNED_SHA=(
     # others above, since none of them were ever installed here.
     [one_lms]="bb501383b9f6b1c6baa590b3005ded599661886d"
     [mobile_app_ionic]="c7dfa063fe88533cc18469a4c54ce0f2678b9dcc"
+    # The sandbox repository itself, as a target app: its staging branch when it was first added.
+    [agent_sandbox]="7ab63fc50bd629732f45047f75b46a2963ac88eb"
     # one_lms's own pyproject.toml describes it as extending Frappe LMS, and
     # its __init__.py does `from lms import plugins` — a real Python-level
     # dependency on frappe/lms that one_lms's hooks.py required_apps never
