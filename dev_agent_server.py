@@ -794,6 +794,8 @@ def _start_services():
 # (createWebHistory(import.meta.env.VITE_BASE_URL)), which every .env file keeps as "/": it is not an address, and a
 # site URL there breaks every route, so only VITE_BASE_API_URL points at the sandbox.
 MOBILE_APP = "mobile_app_ionic"
+# Target apps that are plain Python projects: their tests are run with unittest, not bench.
+PYTHON_TEST_APPS = ("agent_sandbox",)
 MOBILE_PORT = 8100
 MOBILE_URL = f"http://127.0.0.1:{MOBILE_PORT}"
 MOBILE_API_PREFIX = "/api/method/one_fm.api."
@@ -1824,6 +1826,13 @@ def _run_tests(target_app, base_branch=None):
         stderr = (build.stderr + test.stderr)[-4000:]
         return test.returncode == 0, stdout, stderr, _extract_failing_tests(stdout, stderr)
 
+    # agent_sandbox is this repository: a plain Python project with unittest tests at its top level and no Frappe site. bench run-tests
+    # cannot run them, and the test-module matching below would find nothing and report a pass, so its suite is run as it is.
+    if target_app in PYTHON_TEST_APPS:
+        app_dir = f"{BENCH_DIR}/apps/{target_app}"
+        run = _run(f"cd {shlex.quote(app_dir)} && python3 -m unittest discover -s . -p 'test_*.py'", timeout=900)
+        return run.returncode == 0, run.stdout[-4000:], run.stderr[-4000:], _extract_failing_tests(run.stdout, run.stderr)
+
     # --skip-before-tests: erpnext's before_tests hook creates a default
     # Company on any fresh site, which cascades into Warehouse creation and
     # a genuine, pre-existing one_fm bug (before_insert_warehouse assumes a
@@ -2003,6 +2012,43 @@ def _repo_for_local_clone(target_app):
         return None
     match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", result.stdout.strip())
     return match.group(1) if match else None
+
+
+_GITHUB_REMOTE = re.compile(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?\Z")
+
+
+def installed_apps():
+    """Every app this sandbox holds: {"app": its folder in apps/, "repository": "owner/name"}. Processa is told this when a session
+    registers, so the apps it accepts follow the image and nobody keeps a second list by hand. A folder that is not a git clone, or whose
+    name is not a safe app name, is left out."""
+    root = f"{BENCH_DIR}/apps"
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        path = os.path.join(root, name)
+        if not _SAFE_APP.match(name) or not os.path.isdir(os.path.join(path, ".git")):
+            continue
+        remote = _exec(["git", "-C", path, "remote", "get-url", "origin"], timeout=15)
+        match = _GITHUB_REMOTE.search((remote.stdout or "").strip()) if remote.returncode == 0 else None
+        found.append({"app": name, "repository": match.group(1) if match else ""})
+    return found
+
+
+def app_dir_name(target_app):
+    """The folder in apps/ for a target app that may be given as a repository name: a Work Item names the GitHub repository
+    (password_management, agent-sandbox), while the folder can differ (one_fm_password_management, agent_sandbox). The name is
+    returned unchanged when nothing matches, so the usual "not found" errors still say what was asked for."""
+    name = str(target_app or "")
+    if _SAFE_APP.match(name) and os.path.isdir(f"{BENCH_DIR}/apps/{name}"):
+        return name
+    for entry in installed_apps():
+        repo_name = entry["repository"].split("/")[-1]
+        if name and (repo_name == name or entry["app"] == name.replace("-", "_")):
+            return entry["app"]
+    return name
 
 
 def _open_pr(

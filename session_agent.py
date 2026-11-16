@@ -79,7 +79,8 @@ def check_processa_url(url):
 class Session:
     def __init__(self, client, settings):
         self.client = client
-        self.target_app = settings["target_app"]
+        # The Work Item names a GitHub repository; every later step needs the app folder it was cloned into.
+        self.target_app = srv.app_dir_name(settings["target_app"])
         self.git_branch = settings["git_branch"]
         self.work_item = settings["work_item"]
         self.agent_name = (settings.get("agent_name") or "Dev Agent").strip() or "Dev Agent"
@@ -242,6 +243,14 @@ class Session:
         self.last_push = time.monotonic()
 
 
+def reported_apps():
+    """The apps this sandbox holds, sent to Processa when the session registers. A failure here must never stop a session."""
+    try:
+        return srv.installed_apps()
+    except Exception:  # noqa: BLE001 - the report is a convenience; registering is not
+        return []
+
+
 def main():
     session_id, token, url = (os.environ.get(name, "").strip() for name in ("SESSION_ID", "SESSION_TOKEN", "PROCESSA_URL"))
     if not (session_id and token and url):
@@ -249,7 +258,7 @@ def main():
         return 2
     check_processa_url(url)
     client = Processa(url, session_id)
-    settings = client.call("register", {"token": token})
+    settings = client.call("register", {"token": token, "apps": reported_apps()})
     if not settings.get("accepted"):
         print("[session_agent] Processa refused the registration.")
         return 1
