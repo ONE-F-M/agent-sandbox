@@ -495,6 +495,47 @@ class TestPrepareSite(TestingAgentCase):
         with patch.dict("sys.modules", {"frappe": fake}), patch.dict(os.environ, ghost), self.assertRaisesRegex(Exception, "role does not exist"):
             exec(compile(srv._ENSURE_USERS_SCRIPT, "script", "exec"), {})
 
+    def _run_setup_script(self, existing_companies, installed_apps=("frappe", "erpnext"), insert_error=None):
+        """Runs the ensure-users script against a fake frappe; returns (fake, the SETUP_JSON dict)."""
+        fake = MagicMock()
+        fake.get_installed_apps.return_value = list(installed_apps)
+        fake.db.get_all.return_value = list(existing_companies)
+        fake.db.exists.side_effect = lambda doctype, name: doctype == "Role"
+        if insert_error:
+            fake.get_doc.return_value.insert.side_effect = insert_error
+        else:
+            fake.get_doc.return_value.insert.return_value.name = "One Facilities Management"
+        env = {"SANDBOX_TEST_USERS": "[]", "SANDBOX_TEST_PASSWORD": PASSWORD, "SANDBOX_SITE": "sandbox"}
+        with patch.dict("sys.modules", {"frappe": fake}), patch.dict(os.environ, env), patch("builtins.print") as out:
+            exec(compile(srv._ENSURE_USERS_SCRIPT, "script", "exec"), {})
+        lines = [c.args[0] for c in out.call_args_list]
+        return fake, json.loads(next(l for l in lines if l.startswith("SETUP_JSON=")).split("=", 1)[1])
+
+    def test_a_fresh_site_gets_setup_marked_complete_and_the_local_company(self):
+        fake, setup = self._run_setup_script([])
+        fake.db.set_value.assert_called_once_with("Installed Application", {"app_name": ["in", ["frappe", "erpnext"]]}, "is_setup_complete", 1)
+        doc = fake.get_doc.call_args.args[0]
+        self.assertEqual((doc["company_name"], doc["abbr"], doc["default_currency"], doc["country"]), ("One Facilities Management", "ONEFM", "KWD", "Kuwait"))
+        self.assertTrue(fake.flags.ignore_chart_of_accounts)
+        fake.db.set_default.assert_called_once_with("company", "One Facilities Management")
+        self.assertEqual(setup, {"setup_complete": True, "company": "One Facilities Management", "company_error": None})
+
+    def test_an_existing_company_is_kept_and_no_second_one_is_made(self):
+        fake, setup = self._run_setup_script(["Existing Co"])
+        fake.get_doc.assert_not_called()
+        self.assertEqual(setup["company"], "Existing Co")
+
+    def test_a_company_that_cannot_be_created_is_reported_but_setup_is_still_marked_complete(self):
+        fake, setup = self._run_setup_script([], insert_error=ValueError("boom"))
+        fake.db.set_value.assert_called_once()
+        self.assertIsNone(setup["company"])
+        self.assertIn("boom", setup["company_error"])
+
+    def test_without_erpnext_only_the_flag_is_set(self):
+        fake, setup = self._run_setup_script([], installed_apps=("frappe",))
+        fake.get_doc.assert_not_called()
+        self.assertEqual(setup["company"], None)
+
     def test_mute_emails_is_set_before_the_snapshot(self):
         self.prepare()
         self.assertEqual(len(self.argv("bench", "--site", "sandbox", "set-config", "mute_emails", "1")), 1)
