@@ -1219,6 +1219,32 @@ class TestUploadVideos(TestingAgentCase):
         self.assertNotIn(TOKEN, " ".join(args))
         self.assertEqual(self.left(), [])
 
+    def test_a_201_created_answer_counts_as_uploaded_and_the_url_may_be_href_or_under_asset(self):
+        self.make_videos([("AC1", "desktop", 500), ("AC2", "desktop", 700)])
+        self.replies["user-attachments"] = lambda n: (201, {"asset": {"href": f"https://github.com/user-attachments/assets/{n}"}})
+        result = self.upload()
+        self.assertEqual((result["status"], result["path"]), ("videos_uploaded", "upload_endpoint"))
+        self.assertEqual([u["criterion"] for u in result["uploads"]], ["AC1", "AC2"])
+        self.assertTrue(all(u["url"].startswith("https://github.com/user-attachments/assets/") for u in result["uploads"]))
+        self.assertEqual([a for a, _ in self.calls if a[0] == "gh"], [])
+
+    def test_a_201_with_no_url_we_know_falls_back_to_gh_and_reports_the_answers_keys(self):
+        # This is what the real endpoint did: HTTP 201, a body with no url, so every upload used to be reported as failed.
+        self.make_videos([("AC1", "desktop", 500), ("AC2", "desktop", 700)])
+        self.replies["user-attachments"] = (201, {"id": 7, "name": "AC1.webm"})
+        result = self.upload(comment_body="Acceptance test: 2 of 2 criteria passed")
+        self.assertEqual((result["status"], result["path"]), ("videos_uploaded", "gh_pr_comment"))
+        self.assertEqual(result["upload_response_keys"], ["id", "name"])
+        self.assertEqual(next(a for a, _ in self.calls if a[0] == "gh").count("--attach"), 2)
+        self.assertEqual(self.left(), [])
+
+    def test_a_server_error_is_still_a_failed_upload_for_its_criterion(self):
+        self.make_videos([("AC1", "desktop", 500)])
+        self.replies["user-attachments"] = (500, {"message": "boom"})
+        result = self.upload()
+        self.assertEqual((result["status"], result["step"]), ("failed", "upload"))
+        self.assertEqual([a for a, _ in self.calls if a[0] == "gh"], [])
+
     def test_a_refused_token_on_the_repository_lookup_also_takes_the_gh_path_and_a_gh_failure_is_a_failure(self):
         self.make_videos([("AC1", "desktop", 500)])
         self.replies["/repos/"] = (401, {"message": "Bad credentials"})

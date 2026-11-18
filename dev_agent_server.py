@@ -1511,6 +1511,15 @@ def _http(method, url, token, data=None, headers=None, timeout=300):
         return 0, {"message": f"{type(exc).__name__}: {exc}"}
 
 
+def _asset_url(answer):
+    """The https URL in an upload answer: its url, href or html_url, or the same under asset. None when there is none."""
+    for holder in (answer, answer.get("asset") if isinstance(answer.get("asset"), dict) else {}):
+        for key in ("url", "href", "html_url"):
+            if isinstance(holder.get(key), str) and holder[key].startswith("https://"):
+                return holder[key]
+    return None
+
+
 def _videos_by_criterion(run_dir):
     """criterion -> the video to send: the desktop run's, when it left one. None when run_specs has not run."""
     try:
@@ -1565,6 +1574,7 @@ def upload_videos(target_app, args):
     body = args.get("comment_body") if isinstance(args.get("comment_body"), str) and args.get("comment_body").strip() else _DEFAULT_COMMENT
 
     status, repository = _http("GET", f"{GITHUB_API}/repos/{repo}", token, timeout=60)
+    unreadable = None
     if status == 200 and repository.get("id"):
         uploads, errors, refused = [], [], False
         for criterion, path in videos.items():
@@ -1577,14 +1587,17 @@ def upload_videos(target_app, args):
             with open(path, "rb") as fh:
                 code, answer = _http("POST", f"{UPLOAD_HOST}/user-attachments/assets?{query}", token, data=fh,
                                      headers={"Content-Type": "application/octet-stream", "Content-Length": str(size)})
-            if code == 200 and answer.get("url"):
-                uploads.append({"criterion": criterion, "url": answer["url"]})
+            if code in (200, 201) and _asset_url(answer):
+                uploads.append({"criterion": criterion, "url": _asset_url(answer)})
             elif code in _REFUSED:
                 refused = True
                 break
+            elif code in (200, 201):  # GitHub accepted it but the answer has no URL we know: let gh post the files instead
+                unreadable = sorted(answer)
+                break
             else:
                 errors.append({"criterion": criterion, "error": f"upload failed ({code}): {str(answer.get('message'))[:200]}".replace(token, "***")})
-        if not refused:
+        if not (refused or unreadable):
             if errors:
                 return _failed("upload", f"{len(errors)} of {len(videos)} videos did not upload", uploads=uploads, errors=errors, path="upload_endpoint")
             return {"status": "videos_uploaded", "run_id": run_id, "path": "upload_endpoint", "uploads": uploads, "deleted": _delete_videos(run_dir)}
@@ -1596,8 +1609,9 @@ def upload_videos(target_app, args):
         return _failed("fallback", "the upload endpoint refused the token and gh could not post the comment", path="gh_pr_comment",
                        detail=_tail(posted, token))
     url = next((w for w in (posted.stdout or "").split() if w.startswith("https://github.com/")), None)
+    extra = {"upload_response_keys": unreadable} if unreadable else {}  # what the endpoint answered with, for the next fix
     return {"status": "videos_uploaded", "run_id": run_id, "path": "gh_pr_comment", "comment_url": url,
-            "criteria": sorted(videos), "deleted": _delete_videos(run_dir)}
+            "criteria": sorted(videos), "deleted": _delete_videos(run_dir), **extra}
 
 
 # --- Testing Agent: seed test data through the controllers --------------------------------------
