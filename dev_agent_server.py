@@ -1126,6 +1126,11 @@ _SNAPSHOT_SCRIPT = """const { chromium } = require('@playwright/test');
     const page = await context.newPage();
     page.setDefaultTimeout(45000);
     await page.goto(process.env.SNAP_URL);
+    // ajax_count is already 0 before the desk has made its first request, so it cannot say the page is drawn. Wait for the
+    // network to settle and for the routed page's header, then for nothing in flight. Each wait is best effort: a page that is
+    // not a desk page is still snapshotted as it is.
+    await page.waitForLoadState('networkidle').catch(() => {});
+    await page.locator('.page-head:visible').first().waitFor({ timeout: 20000 }).catch(() => {});
     await page.waitForFunction(() => !window.frappe || !frappe.request || frappe.request.ajax_count === 0).catch(() => {});
     const snapshot = await page.locator('body').ariaSnapshot();
     const shot = await page.screenshot({ type: 'jpeg', quality: 60 });

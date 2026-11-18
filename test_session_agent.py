@@ -901,6 +901,13 @@ class TestSpecs(TestingAgentCase):
         self.assertNotIn(PASSWORD, " ".join(args))
         self.assertEqual(self.timeouts["node"], 60)
 
+    def test_the_snapshot_script_waits_for_the_page_to_be_drawn_before_it_looks(self):
+        # ajax_count is 0 before the desk makes its first request, so it alone gave a blank page.
+        script = srv._SNAPSHOT_SCRIPT
+        waits = [script.index(w) for w in ("waitForLoadState('networkidle')", ".page-head:visible", "ajax_count === 0")]
+        self.assertEqual(waits, sorted(waits))
+        self.assertLess(waits[-1], script.index("ariaSnapshot()"))
+
     def test_browser_snapshot_refuses_other_hosts_unknown_roles_and_an_unprepared_run(self):
         for url in ("https://evil.example/x", "//evil.example/x", "http://127.0.0.1:8001/x", "javascript:alert(1)", "app/home", None):
             self.assertIn("error", srv.browser_snapshot("processa", {"run_id": "run-1", "url": url, "role": "Sales User"}), url)
