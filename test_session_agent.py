@@ -901,12 +901,16 @@ class TestSpecs(TestingAgentCase):
         self.assertNotIn(PASSWORD, " ".join(args))
         self.assertEqual(self.timeouts["node"], 60)
 
-    def test_the_snapshot_script_waits_for_the_page_to_be_drawn_before_it_looks(self):
-        # ajax_count is 0 before the desk makes its first request, so it alone gave a blank page.
+    def test_the_snapshot_script_waits_until_the_page_stops_changing_and_stays_inside_the_time_limit(self):
+        # The page header appears at once and the form later, so neither ajax_count nor a header selector can say it is drawn.
         script = srv._SNAPSHOT_SCRIPT
-        waits = [script.index(w) for w in ("waitForLoadState('networkidle')", ".page-head:visible", "ajax_count === 0")]
-        self.assertEqual(waits, sorted(waits))
-        self.assertLess(waits[-1], script.index("ariaSnapshot()"))
+        self.assertIn("waitForLoadState('networkidle', { timeout: 8000 })", script)
+        self.assertNotIn("ajax_count", script)
+        loop = script.index("unchanged < 4")  # four equal half-second samples in a row
+        self.assertLess(script.index("networkidle"), loop)
+        self.assertLess(loop, script.index("const snapshot = await page.locator('body').ariaSnapshot()"))
+        # login + goto, up to 8 s of network, up to 15 s of settling and the screenshot must fit in the command's limit
+        self.assertLessEqual(8 + 15 + 20, srv.SNAPSHOT_TIMEOUT_SECONDS)
 
     def test_browser_snapshot_refuses_other_hosts_unknown_roles_and_an_unprepared_run(self):
         for url in ("https://evil.example/x", "//evil.example/x", "http://127.0.0.1:8001/x", "javascript:alert(1)", "app/home", None):

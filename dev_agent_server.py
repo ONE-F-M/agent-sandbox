@@ -1126,12 +1126,17 @@ _SNAPSHOT_SCRIPT = """const { chromium } = require('@playwright/test');
     const page = await context.newPage();
     page.setDefaultTimeout(45000);
     await page.goto(process.env.SNAP_URL);
-    // ajax_count is already 0 before the desk has made its first request, so it cannot say the page is drawn. Wait for the
-    // network to settle and for the routed page's header, then for nothing in flight. Each wait is best effort: a page that is
-    // not a desk page is still snapshotted as it is.
-    await page.waitForLoadState('networkidle').catch(() => {});
-    await page.locator('.page-head:visible').first().waitFor({ timeout: 20000 }).catch(() => {});
-    await page.waitForFunction(() => !window.frappe || !frappe.request || frappe.request.ajax_count === 0).catch(() => {});
+    // The desk draws a page in steps (header first, then the form after its document loads), so no single selector or
+    // request count says it is done. Let the network settle, then sample the page every half second until it has not changed
+    // for two seconds (at most 15 s). Each wait is best effort: a page that never settles is still snapshotted as it is.
+    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+    let last = '', unchanged = 0;
+    for (let waited = 0; waited < 15000 && unchanged < 4; waited += 500) {
+      const now = await page.locator('body').ariaSnapshot().catch(() => '');
+      unchanged = now === last && now ? unchanged + 1 : 0;
+      last = now;
+      await page.waitForTimeout(500);
+    }
     const snapshot = await page.locator('body').ariaSnapshot();
     const shot = await page.screenshot({ type: 'jpeg', quality: 60 });
     process.stdout.write('SNAPSHOT_JSON=' + JSON.stringify({ snapshot: snapshot.slice(0, 200000), screenshot_base64: shot.toString('base64') }));
