@@ -592,6 +592,25 @@ frappe.init(site=os.environ["SANDBOX_SITE"], sites_path=".")
 frappe.connect()
 try:
     frappe.set_user("Administrator")
+    # A fresh site never ran ERPNext's setup wizard, so every desk page redirects to it and no spec can load a form,
+    # and no Company exists, so any test that creates a Project fails with "company: mandatory".
+    frappe.db.set_value("Installed Application", {"app_name": ["in", ["frappe", "erpnext"]]}, "is_setup_complete", 1)
+    setup = {"setup_complete": True, "company": None, "company_error": None}
+    if "erpnext" in frappe.get_installed_apps():
+        try:
+            existing = frappe.db.get_all("Company", pluck="name", limit=1)
+            if not existing:
+                # ignore_chart_of_accounts skips the default accounts and warehouses, which hit a known one_fm Warehouse bug.
+                frappe.flags.ignore_chart_of_accounts = True
+                company = frappe.get_doc({"doctype": "Company", "company_name": "One Facilities Management", "abbr": "ONEFM",
+                                          "default_currency": "KWD", "country": "Kuwait"}).insert(ignore_permissions=True)
+                frappe.db.set_default("company", company.name)
+                existing = [company.name]
+            setup["company"] = existing[0]
+        except Exception as exc:  # the wizard flag above is what unblocks the forms, so a Company problem is reported, not fatal
+            frappe.db.rollback()
+            setup["company_error"] = f"{type(exc).__name__}: {exc}"[:300]
+    frappe.db.commit()
     out = []
     for u in users:
         if u["role"] and not frappe.db.exists("Role", u["role"]):
@@ -612,6 +631,7 @@ try:
     frappe.db.commit()
 finally:
     frappe.destroy()
+print("SETUP_JSON=" + json.dumps(setup))
 print("USERS_JSON=" + json.dumps(out))
 """
 
@@ -645,8 +665,8 @@ def _validate_prepare_site(target_app, payload):
 
 
 def prepare_site(target_app, payload):
-    """AC1: base branch checked out, site migrated, one test user per role plus one with none, mute_emails on,
-    then a mysqldump of the site DB under SNAPSHOT_DIR. Returns a result dict; never contains the password."""
+    """AC1: base branch checked out, site migrated, ERPNext setup marked complete with one default Company,
+    one test user per role plus one with none, mute_emails on, then a mysqldump of the site DB under SNAPSHOT_DIR. Returns a result dict; never contains the password."""
     if isinstance(payload.get("roles"), str):  # a Processa text field: one role per line or comma-separated
         payload = {**payload, "roles": [r.strip() for r in re.split(r"[,\n]", payload["roles"]) if r.strip()]}
     error = _validate_prepare_site(target_app, payload)
@@ -675,6 +695,8 @@ def prepare_site(target_app, payload):
     if users.returncode != 0 or not marker:
         return _failed("create_users", "creating the test users failed", detail=_tail(users, password))
     created = json.loads(marker[len("USERS_JSON="):])
+    setup_line = next((l for l in (users.stdout or "").splitlines() if l.startswith("SETUP_JSON=")), None)
+    setup = json.loads(setup_line[len("SETUP_JSON="):]) if setup_line else None
 
     muted = _exec(["bench", "--site", SITE_NAME, "set-config", "mute_emails", "1"], cwd=BENCH_DIR, timeout=120)
     if muted.returncode != 0:
@@ -706,7 +728,7 @@ def prepare_site(target_app, payload):
     with os.fdopen(os.open(sql_path[:-4] + ".pw", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
         fh.write(password)
     return {"status": "prepared", "run_id": run_id, "base_branch": base_branch, "base_sha": base_sha, "users": created,
-            "mute_emails": True, "snapshot_path": sql_path, "snapshot_bytes": size}
+            "mute_emails": True, "setup": setup, "snapshot_path": sql_path, "snapshot_bytes": size}
 
 
 def _frontend_changed(target_app, paths):
