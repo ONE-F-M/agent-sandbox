@@ -1049,14 +1049,24 @@ async function waitForFrappeIdle(page) {
     (frappe.request.ajax_count === 0 && document.body.getAttribute('data-ajax-state') !== 'running'), null, { timeout: 30000 });
 }
 
+// Wait until the Desk has drawn something: two animation frames and a visible page head. The video starts before the first
+// paint, so a spec that moved on the moment Frappe was idle recorded a blank white page. Best effort: a page that never
+// shows a page head is not failed here, the spec's own assertions decide that.
+async function waitForPaint(page) {
+  await page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+  await page.waitForFunction(() => !!document.querySelector('.page-head, .layout-main'), null, { timeout: 10000 }).catch(() => {});
+}
+
 async function openForm(page, doctype, name) {
   await page.goto('/app/' + slug(doctype) + '/' + (name ? encodeURIComponent(name) : 'new'));
   await waitForFrappeIdle(page);
+  await waitForPaint(page);
 }
 
 async function openList(page, doctype) {
   await page.goto('/app/' + slug(doctype));
   await waitForFrappeIdle(page);
+  await waitForPaint(page);
 }
 
 // The input of a form field, found by its data-fieldname.
@@ -1096,7 +1106,7 @@ async function saveForm(page) {
   await waitForFrappeIdle(page);
 }
 
-module.exports = { loginAs, waitForFrappeIdle, openForm, openList, field, fillField, fillLink, waitForDialog, saveForm };
+module.exports = { loginAs, waitForFrappeIdle, waitForPaint, openForm, openList, field, fillField, fillLink, waitForDialog, saveForm };
 """
 
 
@@ -1343,6 +1353,33 @@ def _native_device_results(run_dir):
     return found
 
 
+_VIDEO_HOLD_MS = 1500
+_HOLD_MARKER = "// sandbox: hold the last frame"
+
+
+def _hold_last_frame(run_dir):
+    """Append a pause after every test to each spec, so the video ends on the finished screen instead of stopping the instant the
+    last check passes (a 2-second test left a 2-second video). Done at run time, not in write_spec, so the spec the model wrote
+    is stored as sent. Idempotent: the marker keeps a second run from adding it again. afterEach runs before the page closes, so
+    the pause is inside the recording."""
+    # the try keeps a test that closed its own page from failing in the hook; the pause is never a reason to fail a spec
+    hold = f"test.afterEach(async ({{ page }}) => {{ try {{ await page.waitForTimeout({_VIDEO_HOLD_MS}); }} catch (e) {{}} }});"
+    for name in sorted(os.listdir(run_dir)):
+        path = os.path.join(run_dir, name)
+        if not SPEC_FILE.match(name) or not os.path.isfile(path):
+            continue
+        with open(path) as fh:
+            text = fh.read()
+        if _HOLD_MARKER in text:
+            continue
+        if name.endswith(".js"):
+            footer = f"\n{_HOLD_MARKER}\nrequire('@playwright/test').{hold}\n"
+        else:  # .mjs and .ts load the package with import
+            footer = f"\n{_HOLD_MARKER}\nimport {{ test as __holdTest }} from '@playwright/test';\n__holdTest.{hold[len('test.'):]}\n"
+        with open(path, "w") as fh:
+            fh.write(text.rstrip("\n") + "\n" + footer)
+
+
 def _run_playwright(run_id, run_dir, extra_args, code="head"):
     """Run the run folder's specs. Returns (results, error). The head and the base each keep their own output folder and
     results file, so running the base never deletes the head's videos that upload_videos still has to send."""
@@ -1356,6 +1393,7 @@ def _run_playwright(run_id, run_dir, extra_args, code="head"):
         for name, text in (("mobile-helpers.js", _MOBILE_HELPERS), ("mobile-smoke.spec.js", _MOBILE_SMOKE)):
             with open(os.path.join(run_dir, name), "w") as fh:
                 fh.write(text)
+    _hold_last_frame(run_dir)
     native = _native_device_results(run_dir)
     run = _exec(["npx", "playwright", "test", "--config", "playwright.config.js", "--grep-invert", _NATIVE_TAG, *extra_args],
                 env=_spec_env(run_id, run_dir, code), cwd=run_dir, timeout=SPEC_TIMEOUT_SECONDS)
@@ -1526,14 +1564,16 @@ def _asset_url(answer):
 
 
 def _videos_by_criterion(run_dir):
-    """criterion -> the video to send: the desktop run's, when it left one. None when run_specs has not run."""
+    """criterion -> the video to send: the desktop run's, when it left one, and of those the longest. A criterion often has several
+    specs; the first one is usually the shortest check, so the video that shows the most work is the better evidence. None when
+    run_specs has not run."""
     try:
         with open(os.path.join(run_dir, "results-head.json")) as fh:
             results = json.load(fh)
     except (OSError, ValueError):
         return None
     chosen = {}
-    for entry in sorted(results, key=lambda r: r.get("viewport") != "desktop"):
+    for entry in sorted(results, key=lambda r: (r.get("viewport") != "desktop", -(r.get("duration_ms") or 0))):
         video = entry.get("video")
         key = entry.get("criterion") or entry.get("file")
         if key and video and os.path.isfile(video) and os.path.getsize(video) > 0 and key not in chosen:

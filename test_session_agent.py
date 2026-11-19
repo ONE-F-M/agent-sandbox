@@ -822,6 +822,46 @@ class TestSpecs(TestingAgentCase):
             self.assertIn(needle, config)
         self.assertNotIn("trace: 'on'", config)
 
+    def test_the_helpers_wait_for_the_first_paint_after_opening_a_form_or_a_list(self):
+        helpers = srv._FRAPPE_HELPERS
+        self.assertIn("async function waitForPaint(page)", helpers)
+        for name in ("openForm", "openList"):
+            body = helpers.split(f"async function {name}(")[1].split("\n}\n")[0]
+            self.assertIn("await waitForPaint(page);", body, name)
+        self.assertIn("waitForPaint,", helpers)  # exported for specs that navigate by hand
+
+    def test_every_spec_gets_a_pause_after_each_test_so_the_video_ends_on_the_result(self):
+        self.write("ac1.spec.js", content="const { test } = require('@playwright/test');\ntest('x', async () => {});\n")
+        self.write("ac2.spec.mjs", content="import { test } from '@playwright/test';\ntest('y', async () => {});\n")
+        self.write("ac3.spec.ts", content="import { test } from '@playwright/test';\ntest('z', async () => {});\n")
+        self.report = pw_report(("ac1.spec.js", "AC1 x", "desktop", "expected", [("passed", None, None)]))
+        srv.run_specs("processa", {"run_id": "run-1"})
+        srv.run_specs("processa", {"run_id": "run-1"})  # a second run must not add the pause again
+        read = lambda name: open(os.path.join(self.run_dir, name)).read()
+        js = read("ac1.spec.js")
+        self.assertTrue(js.startswith("const { test } = require('@playwright/test');\ntest('x', async () => {});\n"))  # as written
+        self.assertEqual(js.count(srv._HOLD_MARKER), 1)
+        self.assertIn("require('@playwright/test').test.afterEach", js)
+        self.assertIn("waitForTimeout(1500)", js)
+        for name in ("ac2.spec.mjs", "ac3.spec.ts"):
+            text = read(name)
+            self.assertEqual(text.count(srv._HOLD_MARKER), 1, name)
+            self.assertIn("import { test as __holdTest } from '@playwright/test';", text)
+            self.assertIn("__holdTest.afterEach", text)
+        for name in ("playwright.config.js", "frappe-helpers.js"):
+            self.assertNotIn(srv._HOLD_MARKER, read(name), name)
+
+    def test_the_pause_is_added_only_to_spec_files_and_never_fails_a_test(self):
+        os.makedirs(self.run_dir, exist_ok=True)
+        for name, text in (("playwright.config.js", "cfg\n"), ("notes.txt", "n\n"), ("a.spec.js", "t()\n")):
+            with open(os.path.join(self.run_dir, name), "w") as fh:
+                fh.write(text)
+        srv._hold_last_frame(self.run_dir)
+        read = lambda name: open(os.path.join(self.run_dir, name)).read()
+        self.assertEqual((read("playwright.config.js"), read("notes.txt")), ("cfg\n", "n\n"))
+        self.assertIn(srv._HOLD_MARKER, read("a.spec.js"))
+        self.assertIn("try { await page.waitForTimeout(", read("a.spec.js"))  # a closed page must not fail the hook
+
     def test_a_spec_that_fails_once_and_passes_on_the_rerun_is_flaky(self):
         self.write()
         self.report = pw_report(("ac1.spec.js", "AC1 flaky", "desktop", "flaky", [("failed", "timed out", "/o/a.webm"), ("passed", None, "/o/b.webm")]))
@@ -1085,7 +1125,7 @@ class TestSpecs(TestingAgentCase):
     def test_the_helper_is_valid_javascript_that_loads_without_playwright_and_exports_the_documented_functions(self):
         run = self._node("const h = require('./frappe-helpers'); console.log(Object.keys(h).sort().join(','))")
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(run.stdout.strip(), "field,fillField,fillLink,loginAs,openForm,openList,saveForm,waitForDialog,waitForFrappeIdle")
+        self.assertEqual(run.stdout.strip(), "field,fillField,fillLink,loginAs,openForm,openList,saveForm,waitForDialog,waitForFrappeIdle,waitForPaint")
 
     def test_login_posts_to_the_api_with_the_password_from_the_environment_and_a_refusal_never_shows_it(self):
         run = self._node(self.STUB_PAGE + "(async () => { await h.loginAs(page, 'a@b.test'); console.log(JSON.stringify(calls)); })();")
@@ -1188,6 +1228,16 @@ class TestUploadVideos(TestingAgentCase):
             self.assertIn(part, first["url"])
         self.assertEqual((first["body"], second["body"]), (b"w" * 500, b"w" * 700))  # the desktop video, not the mobile one
         self.assertEqual(first["headers"]["Content-Type"], "application/octet-stream")
+
+    def test_the_longest_desktop_video_of_a_criterion_is_the_one_uploaded(self):
+        results = self.make_videos([("AC1", "desktop", 500), ("AC1", "desktop", 800), ("AC1", "mobile", 900)])
+        for entry, ms in zip(results, (2300, 5300, 9000)):
+            entry["duration_ms"] = ms
+        with open(os.path.join(self.run_dir, "results-head.json"), "w") as fh:
+            json.dump(results, fh)
+        result = self.upload()
+        self.assertEqual([u["criterion"] for u in result["uploads"]], ["AC1"])
+        self.assertEqual(self.http[1]["body"], b"w" * 800)  # the 5.3 s desktop video: not the 2.3 s one, not the longer mobile one
 
     def test_the_local_videos_are_deleted_only_after_every_upload_worked(self):
         self.make_videos([("AC1", "desktop", 500), ("AC2", "desktop", 700), ("AC2", "mobile", 800)])
