@@ -1168,10 +1168,10 @@ class TestWorkItemIdThreading(unittest.TestCase):
             if method == "GET" and "/git/ref/heads/" in url:
                 return {"object": {"sha": "base-sha"}}
             if method == "POST" and url.endswith("/pulls"):
-                return {"html_url": "https://github.com/ONE-F-M/one_bpmn/pull/9", "number": 9}
+                return {"html_url": "https://github.com/ONE-F-M/processa/pull/9", "number": 9}
             return {}
 
-        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/one_bpmn"), patch.object(
+        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/processa"), patch.object(
             srv, "_github_request", side_effect=fake_request
         ), patch.object(srv, "_pending_paths", return_value={"a.py"}):
             pr_url, err = srv._open_pr(
@@ -1179,7 +1179,7 @@ class TestWorkItemIdThreading(unittest.TestCase):
                 work_item_id="WI-002322",
             )
         self.assertIsNone(err)
-        self.assertEqual(pr_url, "https://github.com/ONE-F-M/one_bpmn/pull/9")
+        self.assertEqual(pr_url, "https://github.com/ONE-F-M/processa/pull/9")
         ref = next(b for m, u, b in sent if m == "POST" and u.endswith("/git/refs"))
         self.assertEqual(ref["ref"], "refs/heads/WI-002322")
         pr = next(b for m, u, b in sent if m == "POST" and u.endswith("/pulls"))
@@ -1196,10 +1196,10 @@ class TestWorkItemIdThreading(unittest.TestCase):
             if method == "GET" and "/git/ref/heads/" in url:
                 return {"object": {"sha": "base-sha"}}
             if method == "POST" and url.endswith("/pulls"):
-                return {"html_url": "https://github.com/ONE-F-M/one_bpmn/pull/9", "number": 9}
+                return {"html_url": "https://github.com/ONE-F-M/processa/pull/9", "number": 9}
             return {}
 
-        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/one_bpmn"), patch.object(
+        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/processa"), patch.object(
             srv, "_github_request", side_effect=fake_request
         ):
             srv._open_pr("processa", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "r")
@@ -1583,10 +1583,10 @@ class TestAgentNameThreading(unittest.TestCase):
             if method == "GET" and "/git/ref/heads/" in url:
                 return {"object": {"sha": "base-sha"}}
             if method == "POST" and url.endswith("/pulls"):
-                return {"html_url": "https://github.com/ONE-F-M/one_bpmn/pull/9", "number": 9}
+                return {"html_url": "https://github.com/ONE-F-M/processa/pull/9", "number": 9}
             return {}
 
-        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/one_bpmn"), patch.object(
+        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/processa"), patch.object(
             srv, "_github_request", side_effect=fake_request
         ):
             srv._open_pr(
@@ -1604,10 +1604,10 @@ class TestAgentNameThreading(unittest.TestCase):
             if method == "GET" and "/git/ref/heads/" in url:
                 return {"object": {"sha": "base-sha"}}
             if method == "POST" and url.endswith("/pulls"):
-                return {"html_url": "https://github.com/ONE-F-M/one_bpmn/pull/9", "number": 9}
+                return {"html_url": "https://github.com/ONE-F-M/processa/pull/9", "number": 9}
             return {}
 
-        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/one_bpmn"), patch.object(
+        with patch.object(srv, "_repo_for_local_clone", return_value="ONE-F-M/processa"), patch.object(
             srv, "_github_request", side_effect=fake_request
         ):
             srv._open_pr("processa", "staging", "Fix the thing.", {"a.py": "x"}, "gh-token", "corr-1", "r")
