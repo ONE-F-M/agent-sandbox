@@ -320,7 +320,7 @@ class TestingAgentCase(SessionCase):
                 json.dump(conf, fh)
         self.calls, self.broken, self.dump_bytes = [], set(), "-- dump\n"
         self.timeouts, self.report, self.npx_rc, self.restored, self.scheduled = {}, None, 0, None, {"processa.tasks.daily"}
-        self.gh_rc, self.gh_out = 0, "https://github.com/ONE-F-M/one_bpmn/pull/5#issuecomment-99\n"
+        self.gh_rc, self.gh_out = 0, "https://github.com/ONE-F-M/processa/pull/5#issuecomment-99\n"
         self.yarn_check_rc, self.yarn_install_rc, self.vite_rc, self.npx_out = 1, 0, 0, ""
         self.dist_text = "const api = 'http://127.0.0.1:8000'; const route = '/home';\n"
         self.pinged, self.stopped, self.popen = [False, True], [], []
@@ -330,7 +330,7 @@ class TestingAgentCase(SessionCase):
         pr = os.path.join(self.root, "pr")
         git(self.root, "clone", "-q", self.origin, pr)
         self.pr = pr
-        self._repoint_pr("one_bpmn/b.py", "backend\n")
+        self._repoint_pr("processa/b.py", "backend\n")
         for target, side_effect in (("_exec", self._fake_exec), ("_ping", lambda *a: self.pinged.pop(0) if self.pinged else True),
                                     ("_pid_alive", lambda pid: True), ("_stop_services", lambda pids: self.stopped.append(list(pids)))):
             patcher = patch.object(srv, target, side_effect=side_effect)
@@ -619,7 +619,7 @@ class TestCheckoutPrHead(TestingAgentCase):
         self.assertEqual(result["pr_head_sha"], self.pr_sha)
         self.assertEqual(git(self.app, "rev-parse", "HEAD"), self.pr_sha)
         # a later push to the PR does not move what was checked out: it is a commit, not a branch name
-        self._repoint_pr("one_bpmn/b.py", "moved\n")
+        self._repoint_pr("processa/b.py", "moved\n")
         self.assertNotEqual(git(self.app, "rev-parse", "HEAD"), self.pr_sha)
 
     def test_frontend_or_public_changes_trigger_one_build_and_backend_only_does_not(self):
@@ -1187,7 +1187,7 @@ class TestUploadVideos(TestingAgentCase):
         for needle, reply in self.replies.items():
             if needle in url:
                 return reply(len(self.http)) if callable(reply) else reply
-        if url.endswith("/repos/ONE-F-M/one_bpmn"):
+        if url.endswith("/repos/ONE-F-M/processa"):
             return 200, {"id": 424242}
         return 200, {"url": f"https://github.com/user-attachments/assets/{len(self.http)}"}
 
@@ -1209,7 +1209,7 @@ class TestUploadVideos(TestingAgentCase):
         return results
 
     def upload(self, **over):
-        args = {"run_id": "run-1", "repository": "ONE-F-M/one_bpmn", "pr_number": 5, "token": TOKEN, **over}
+        args = {"run_id": "run-1", "repository": "ONE-F-M/processa", "pr_number": 5, "token": TOKEN, **over}
         return srv.upload_videos("processa", args)
 
     def left(self):
@@ -1222,7 +1222,7 @@ class TestUploadVideos(TestingAgentCase):
         self.assertEqual([u["criterion"] for u in result["uploads"]], ["AC1", "AC2"])
         self.assertTrue(all(u["url"].startswith("https://github.com/user-attachments/assets/") for u in result["uploads"]))
         lookup, first, second = self.http
-        self.assertEqual((lookup["method"], lookup["url"]), ("GET", "https://api.github.com/repos/ONE-F-M/one_bpmn"))
+        self.assertEqual((lookup["method"], lookup["url"]), ("GET", "https://api.github.com/repos/ONE-F-M/processa"))
         self.assertTrue(first["url"].startswith("https://uploads.github.com/user-attachments/assets?"))
         for part in ("name=AC1.webm", "content_type=video%2Fwebm", "repository_id=424242"):
             self.assertIn(part, first["url"])
@@ -1264,9 +1264,9 @@ class TestUploadVideos(TestingAgentCase):
         self.replies["user-attachments"] = (404, {"message": "Not Found"})
         result = self.upload(comment_body="Acceptance test: 1 of 2 criteria passed")
         self.assertEqual((result["status"], result["path"]), ("videos_uploaded", "gh_pr_comment"))
-        self.assertEqual(result["comment_url"], "https://github.com/ONE-F-M/one_bpmn/pull/5#issuecomment-99")
+        self.assertEqual(result["comment_url"], "https://github.com/ONE-F-M/processa/pull/5#issuecomment-99")
         args, env = next((a, e) for a, e in self.calls if a[0] == "gh")
-        self.assertEqual(args[:7], ["gh", "pr", "comment", "5", "--repo", "ONE-F-M/one_bpmn", "--body"])
+        self.assertEqual(args[:7], ["gh", "pr", "comment", "5", "--repo", "ONE-F-M/processa", "--body"])
         self.assertEqual(args[7], "Acceptance test: 1 of 2 criteria passed")
         self.assertEqual(args.count("--attach"), 2)
         self.assertEqual(env["GH_TOKEN"], TOKEN)
@@ -1324,7 +1324,7 @@ class TestUploadVideos(TestingAgentCase):
                      {"token": ""}, {"token": " spaced "}, {"token": None}):
             self.assertEqual(self.upload(**over)["step"], "validate", over)
         self.assertEqual(self.http, [])
-        self.assertEqual(srv.upload_videos("processa", {"run_id": "other", "repository": "ONE-F-M/one_bpmn", "pr_number": 5, "token": TOKEN})["step"], "no_videos")
+        self.assertEqual(srv.upload_videos("processa", {"run_id": "other", "repository": "ONE-F-M/processa", "pr_number": 5, "token": TOKEN})["step"], "no_videos")
         self.make_videos([("AC1", "desktop", None)])
         self.assertEqual(self.upload()["step"], "no_videos")
 
@@ -1340,7 +1340,7 @@ class TestUploadVideos(TestingAgentCase):
 
     def test_the_session_dispatches_the_command_and_it_commits_nothing(self):
         self.make_videos([("AC1", "desktop", 500)])
-        status, result = self.session.execute(self._command(9, "upload_videos", "upload_videos", args={"run_id": "run-1", "repository": "ONE-F-M/one_bpmn", "pr_number": 5, "token": TOKEN}))
+        status, result = self.session.execute(self._command(9, "upload_videos", "upload_videos", args={"run_id": "run-1", "repository": "ONE-F-M/processa", "pr_number": 5, "token": TOKEN}))
         self.assertEqual((status, result["status"]), ("ok", "videos_uploaded"))
         self.assertNotIn(TOKEN, json.dumps(result) + json.dumps(self.client.sent))
         verbs = {a[1] for a, _ in self.calls if a[0] == "git"}
