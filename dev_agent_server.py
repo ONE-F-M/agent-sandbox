@@ -611,10 +611,13 @@ try:
             frappe.db.rollback()
             setup["company_error"] = f"{type(exc).__name__}: {exc}"[:300]
     frappe.db.commit()
-    out = []
+    out, missing = [], []
     for u in users:
         if u["role"] and not frappe.db.exists("Role", u["role"]):
-            raise Exception("role does not exist: " + u["role"])
+            # A role the site does not have (the app code names it but never creates it) is skipped and reported: failing here
+            # threw away the checkout and migrate, minutes of work, and the agent had no way to know which roles exist.
+            missing.append(u["role"])
+            continue
         created = not frappe.db.exists("User", u["email"])
         if created:
             doc = frappe.new_doc("User")
@@ -632,6 +635,7 @@ try:
 finally:
     frappe.destroy()
 print("SETUP_JSON=" + json.dumps(setup))
+print("MISSING_ROLES_JSON=" + json.dumps(missing))
 print("USERS_JSON=" + json.dumps(out))
 """
 
@@ -697,6 +701,8 @@ def prepare_site(target_app, payload):
     created = json.loads(marker[len("USERS_JSON="):])
     setup_line = next((l for l in (users.stdout or "").splitlines() if l.startswith("SETUP_JSON=")), None)
     setup = json.loads(setup_line[len("SETUP_JSON="):]) if setup_line else None
+    missing_line = next((l for l in (users.stdout or "").splitlines() if l.startswith("MISSING_ROLES_JSON=")), None)
+    roles_missing = json.loads(missing_line[len("MISSING_ROLES_JSON="):]) if missing_line else []
 
     muted = _exec(["bench", "--site", SITE_NAME, "set-config", "mute_emails", "1"], cwd=BENCH_DIR, timeout=120)
     if muted.returncode != 0:
@@ -727,8 +733,12 @@ def prepare_site(target_app, payload):
     # The spec steps log in as these users. The file is for this container only, owner-read, and never logged or returned.
     with os.fdopen(os.open(sql_path[:-4] + ".pw", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as fh:
         fh.write(password)
-    return {"status": "prepared", "run_id": run_id, "base_branch": base_branch, "base_sha": base_sha, "users": created,
-            "mute_emails": True, "setup": setup, "snapshot_path": sql_path, "snapshot_bytes": size}
+    result = {"status": "prepared", "run_id": run_id, "base_branch": base_branch, "base_sha": base_sha, "users": created,
+              "mute_emails": True, "setup": setup, "snapshot_path": sql_path, "snapshot_bytes": size}
+    if roles_missing:  # no user was made for these: tell the agent so it tests without them instead of retrying the whole step
+        result["roles_missing"] = roles_missing
+        result["note"] = "These roles do not exist on this site, so no user has them: " + ", ".join(roles_missing)
+    return result
 
 
 def _frontend_changed(target_app, paths):
