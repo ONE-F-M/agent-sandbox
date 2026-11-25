@@ -410,7 +410,9 @@ class TestingAgentCase(SessionCase):
             return done("out-line", 1, f"{key} blew up, db_password=dbsecret {PASSWORD}")
         if key == "users":
             plan = json.loads(env["SANDBOX_TEST_USERS"])
-            return done("noise\nUSERS_JSON=" + json.dumps([{**u, "created": True} for u in plan]) + "\n")
+            gone = list(getattr(self, "missing_roles", ()))
+            made = [{**u, "created": True} for u in plan if u["role"] not in gone]
+            return done("noise\nMISSING_ROLES_JSON=" + json.dumps(gone) + "\nUSERS_JSON=" + json.dumps(made) + "\n")
         if key == "mysqldump":
             with open(next(a.split("=", 1)[1] for a in args if a.startswith("--result-file=")), "w") as fh:
                 fh.write(self.dump_bytes)
@@ -442,6 +444,19 @@ class TestPrepareSite(TestingAgentCase):
         self.assertEqual(self.calls, [])
         _status, result = self.session.execute(self._command(3, "prepare_site", base_branch="staging"))
         self.assertEqual(result["step"], "validate")
+
+    def test_a_role_the_site_does_not_have_is_reported_and_the_step_still_succeeds(self):
+        self.missing_roles = ["HR Manager"]
+        status, result = self.prepare(roles=["Sales User", "HR Manager"])
+        self.assertEqual((status, result["status"]), ("ok", "prepared"))
+        self.assertEqual(result["roles_missing"], ["HR Manager"])
+        self.assertIn("HR Manager", result["note"])
+        self.assertEqual([u["role"] for u in result["users"]], ["Sales User", None])
+
+    def test_with_every_role_present_nothing_is_reported_missing(self):
+        _status, result = self.prepare()
+        self.assertNotIn("roles_missing", result)
+        self.assertNotIn("note", result)
 
     def test_it_checks_out_base_migrates_then_makes_one_user_per_role_plus_one_with_none(self):
         status, result = self.prepare(roles=["Sales User", "HR Manager", "Sales User"])
@@ -492,8 +507,12 @@ class TestPrepareSite(TestingAgentCase):
         self.assertEqual({u.new_password for u in db.values()}, {PASSWORD})
         self.assertFalse(json.loads(out.call_args.args[0].split("=", 1)[1])[0]["created"])
         ghost = {**env, "SANDBOX_TEST_USERS": json.dumps([{"email": "g@x.test", "role": "Ghost", "first_name": "G"}])}
-        with patch.dict("sys.modules", {"frappe": fake}), patch.dict(os.environ, ghost), self.assertRaisesRegex(Exception, "role does not exist"):
+        with patch.dict("sys.modules", {"frappe": fake}), patch.dict(os.environ, ghost), patch("builtins.print") as out:
             exec(compile(srv._ENSURE_USERS_SCRIPT, "script", "exec"), {})
+        lines = [c.args[0] for c in out.call_args_list]
+        self.assertIn('MISSING_ROLES_JSON=["Ghost"]', lines)  # a role the site lacks is skipped and reported, not fatal
+        self.assertEqual(lines[-1], "USERS_JSON=[]")
+        self.assertNotIn("g@x.test", db)
 
     def _run_setup_script(self, existing_companies, installed_apps=("frappe", "erpnext"), insert_error=None):
         """Runs the ensure-users script against a fake frappe; returns (fake, the SETUP_JSON dict)."""
