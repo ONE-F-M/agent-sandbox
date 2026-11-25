@@ -132,6 +132,16 @@ done
 echo ""
 echo "Stage 3 — Site initialization: $((SECONDS - T))s"
 
+# Stage 3b — browser smoke (WI-004006 AC4): serve the just-created site with
+# `bench serve`, open /login in Chromium, record a WebM. Fails the bake on error.
+T=$SECONDS
+if ! docker exec -u frappe $CONTAINER_NAME /opt/playwright-smoke/run_smoke.sh; then
+    echo "Error: browser smoke test failed."
+    docker stop $CONTAINER_NAME
+    exit 1
+fi
+echo "Stage 3b — Browser smoke: $((SECONDS - T))s"
+
 T=$SECONDS
 docker stop $CONTAINER_NAME
 echo "Stage 4a — Container stop: $((SECONDS - T))s"

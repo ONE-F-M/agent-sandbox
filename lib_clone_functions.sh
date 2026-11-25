@@ -93,6 +93,46 @@ clone_app() {
     fi
 }
 
+# clone_app_pinned_first() — clone_app's order is get-app (clone the branch TIP
+# and install it) THEN pin_app. That breaks when the tip stops installing on
+# this image's Python while our pinned commit still does: frappe/lms `develop`
+# now declares requires-python >=3.14 (this image is 3.11), so the install
+# failed on all 3 attempts, before the pin was ever applied. Here the order is
+# clone -> pin -> install, so what gets installed is always the pinned commit.
+# Does by hand the two things `bench get-app` would: the editable install into
+# the bench env (same uv command bench runs) and the sites/apps.txt entry.
+clone_app_pinned_first() {
+    local app_name=$1
+    local repo_url=$2
+    local branch=$3
+    local clean_url=${4:-$repo_url}
+    local max_retries=3
+    local attempt=1
+
+    if [ ! -d "apps/$app_name" ]; then
+        echo "Cloning $app_name from $repo_url (branch: $branch), pin first, then install..."
+        until [ $attempt -gt $max_retries ]
+        do
+            echo "Attempt $attempt of $max_retries..."
+            rm -rf "apps/$app_name"
+            if git clone --branch "$branch" --single-branch "$repo_url" "apps/$app_name"; then
+                pin_app "$app_name"
+                uv pip install --quiet -e "apps/$app_name" --python env/bin/python
+                [ -z "$(tail -c1 sites/apps.txt)" ] || echo >> sites/apps.txt
+                grep -qx "$app_name" sites/apps.txt || echo "$app_name" >> sites/apps.txt
+                echo "Successfully cloned and installed $app_name."
+                _normalize_remote "$app_name" "$clean_url"
+                return 0
+            fi
+            echo "Failed to clone $app_name. Retrying in 5 seconds..."
+            attempt=$((attempt + 1))
+            sleep 5
+        done
+        echo "ERROR: Failed to clone $app_name after $max_retries attempts."
+        exit 1
+    fi
+}
+
 # clone_plain_repo() — for a target_app that isn't a Frappe app at all (no
 # hooks.py, never bench-installed): mobile_app_ionic is a standalone Vue/
 # Ionic/Capacitor project. `bench get-app` would fail on it (it expects a

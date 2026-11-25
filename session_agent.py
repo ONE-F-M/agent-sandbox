@@ -21,7 +21,7 @@ import urllib.request
 
 import dev_agent_server as srv
 
-API = "/api/method/one_bpmn.api.sandbox_session"
+API = "/api/method/processa.api.sandbox_session"
 POLL_MIN_SECONDS = 0.3
 POLL_MAX_SECONDS = 2.0
 CHECKPOINT_SECONDS = 300
@@ -79,7 +79,8 @@ def check_processa_url(url):
 class Session:
     def __init__(self, client, settings):
         self.client = client
-        self.target_app = settings["target_app"]
+        # The Work Item names a GitHub repository; every later step needs the app folder it was cloned into.
+        self.target_app = srv.app_dir_name(settings["target_app"])
         self.git_branch = settings["git_branch"]
         self.work_item = settings["work_item"]
         self.agent_name = (settings.get("agent_name") or "Dev Agent").strip() or "Dev Agent"
@@ -125,7 +126,12 @@ class Session:
         """(status, result) for one command. An exception becomes an error result, so Processa always gets an answer."""
         timings = srv._Timings()
         try:
-            handler = {"tool": self._tool, "run_tests": self._run_tests, "finalize": self._finalize, "close": self._close}[command["kind"]]
+            handler = {
+                "tool": self._tool, "run_tests": self._run_tests, "finalize": self._finalize, "close": self._close,
+                "prepare_site": self._prepare_site, "checkout_pr_head": self._checkout_pr_head,
+                "run_specs": self._run_specs, "run_specs_on_base": self._run_specs_on_base,
+                "upload_videos": self._upload_videos,
+            }[command["kind"]]
             status, result = handler(command, timings)
         except Exception as exc:  # noqa: BLE001 - reported to Processa as the command's result
             status, result = "error", {"error": f"{type(exc).__name__}: {str(exc)[:400]}"}
@@ -133,6 +139,10 @@ class Session:
 
     def _tool(self, command, timings):
         args = command["payload"].get("args") or {}
+        if command["action"] in srv.SPEC_TOOLS:  # fast spec tools: never touch the checkout, so nothing is committed
+            with timings.span("tool"):
+                result = srv.SPEC_TOOLS[command["action"]](self.target_app, args)
+            return ("error" if result.get("error") else "ok"), result
         with timings.span("tool"):
             result, changed = srv._apply_tool(self.app_dir, self.target_app, command["action"], args)
         if changed:
@@ -155,6 +165,34 @@ class Session:
             "stdout_tail": stdout, "stderr_tail": stderr, "failing_tests": failing,
             "commit": srv._head_commit(self.target_app),
         }
+
+    # Slow commands for the Testing Agent: the command is "ok" and the result's own status says how it went,
+    # the same shape run_tests uses, so Processa's park/resume handles them like any other slow command.
+    def _prepare_site(self, command, timings):
+        with timings.span("prepare_site"):
+            return "ok", srv.prepare_site(self.target_app, self._args(command))
+
+    def _checkout_pr_head(self, command, timings):
+        with timings.span("checkout_pr_head"):
+            return "ok", srv.checkout_pr_head(self.target_app, self._args(command))
+
+    def _run_specs(self, command, timings):
+        with timings.span("run_specs"):
+            return "ok", srv.run_specs(self.target_app, self._args(command))
+
+    def _upload_videos(self, command, timings):
+        with timings.span("upload_videos"):
+            return "ok", srv.upload_videos(self.target_app, self._args(command))
+
+    def _run_specs_on_base(self, command, timings):
+        with timings.span("run_specs_on_base"):
+            return "ok", srv.run_specs_on_base(self.target_app, self._args(command))
+
+    @staticmethod
+    def _args(command):
+        """Processa puts a slow action's arguments under payload["args"]; a bare payload is accepted too."""
+        payload = command["payload"]
+        return payload.get("args") or payload
 
     def _finalize(self, command, timings):
         with timings.span("git"):
@@ -205,6 +243,14 @@ class Session:
         self.last_push = time.monotonic()
 
 
+def reported_apps():
+    """The apps this sandbox holds, sent to Processa when the session registers. A failure here must never stop a session."""
+    try:
+        return srv.installed_apps()
+    except Exception:  # noqa: BLE001 - the report is a convenience; registering is not
+        return []
+
+
 def main():
     session_id, token, url = (os.environ.get(name, "").strip() for name in ("SESSION_ID", "SESSION_TOKEN", "PROCESSA_URL"))
     if not (session_id and token and url):
@@ -212,7 +258,7 @@ def main():
         return 2
     check_processa_url(url)
     client = Processa(url, session_id)
-    settings = client.call("register", {"token": token})
+    settings = client.call("register", {"token": token, "apps": reported_apps()})
     if not settings.get("accepted"):
         print("[session_agent] Processa refused the registration.")
         return 1
